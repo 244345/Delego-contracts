@@ -972,10 +972,7 @@ impl EscrowContract {
         env.storage().persistent().set(&votes_key, &votes);
 
         // Compute live tallies so the event reflects the state *after* this vote.
-        let votes_for = votes
-            .iter()
-            .filter(|v| v.release_to_seller)
-            .count() as u32;
+        let votes_for = votes.iter().filter(|v| v.release_to_seller).count() as u32;
 
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("vote")),
@@ -2674,8 +2671,7 @@ impl EscrowContract {
             .get(&DataKey::EscrowYieldConfig(escrow_id));
         let apy_bps = yield_config.as_ref().map(|c| c.apr_bps).unwrap_or(0);
         let snapshot_ledger = env.ledger().sequence();
-        let (accrued, held_seconds) =
-            Self::compute_yield(&record, yield_config.as_ref(), &env);
+        let (accrued, held_seconds) = Self::compute_yield(&record, yield_config.as_ref(), &env);
 
         let remaining = record.amount - record.released_amount;
 

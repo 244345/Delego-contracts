@@ -417,6 +417,7 @@ dependencies = [
  "delego-escrow",
  "delego-permissions",
  "delego-reputation",
+ "ed25519-dalek",
  "soroban-sdk",
 ]
 
