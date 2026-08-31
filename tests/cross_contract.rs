@@ -23,7 +23,11 @@ fn test_keypair(env: &Env, seed: u8) -> (SigningKey, BytesN<32>) {
 
 /// Sign a `RelayedSpendMessage` over its canonical XDR encoding — the exact
 /// bytes `execute_spend_via_relayer` re-derives and verifies.
-fn sign_relayed_spend(env: &Env, signing_key: &SigningKey, message: RelayedSpendMessage) -> BytesN<64> {
+fn sign_relayed_spend(
+    env: &Env,
+    signing_key: &SigningKey,
+    message: RelayedSpendMessage,
+) -> BytesN<64> {
     let message_bytes = message.to_xdr(env);
     let len = message_bytes.len() as usize;
     let mut buf = [0u8; 512];
@@ -710,14 +714,12 @@ fn test_multi_owner_spend_enforces_quorum() {
     // A single signer cannot satisfy a 2-of-3 threshold.
     let mut one_signer = Vec::<Address>::new(&t.env);
     one_signer.push_back(t.buyer.clone());
-    let under_quorum = perm_client.try_execute_spend_multi(
-        &t.buyer,
-        &t.agent,
-        &one_signer,
-        &100,
-        &t.seller,
+    let under_quorum =
+        perm_client.try_execute_spend_multi(&t.buyer, &t.agent, &one_signer, &100, &t.seller);
+    assert_eq!(
+        under_quorum,
+        Err(Ok(PermissionError::InsufficientSignatures))
     );
-    assert_eq!(under_quorum, Err(Ok(PermissionError::InsufficientSignatures)));
 
     // Two of the three registered owners satisfies the threshold.
     let mut two_signers = Vec::<Address>::new(&t.env);

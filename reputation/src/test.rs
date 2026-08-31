@@ -844,3 +844,306 @@ fn test_accept_admin_no_pending_transfer() {
     let res = client.try_accept_admin(&stranger);
     assert_eq!(res, Err(Ok(ReputationError::Unauthorized)));
 }
+
+// ========================================================================
+// Property tests for `recency_weight_bps` (Issue #130)
+// ========================================================================
+//
+// These tests exercise broad deterministic input ranges to verify
+// mathematical invariants of the time-decay weight function.
+//
+// The function computes: 10_000 × 2^(-elapsed / decay_window)
+// via integer bit-shift halving with linear interpolation.
+//
+// Invariants under test:
+//   1. Output is always within [0, BPS_SCALE] (bounds)
+//   2. Monotonically non-increasing as elapsed increases (monotonicity)
+//   3. elapsed = 0 returns BPS_SCALE (zero elapsed)
+//   4. Large elapsed values never panic and return 0 (saturation)
+//   5. Boundary transitions at half-life multiples are correct
+// ========================================================================
+
+/// Helper: independent mathematical oracle for the recency weight.
+/// Computes `floor(10_000 × 2^(-elapsed / decay_window))` using
+/// arbitrary-precision arithmetic to avoid overflow.
+fn oracle_recency_weight_bps(elapsed: u64, decay_window: u64) -> i128 {
+    if decay_window == 0 {
+        return 10_000;
+    }
+    let halvings = elapsed / decay_window;
+    if halvings >= 20 {
+        return 0;
+    }
+    // 10_000 / 2^halvings using i128
+    let base: i128 = 10_000_i128 >> halvings;
+    let remainder = elapsed % decay_window;
+    // Linear interpolation: subtract (base × remainder) / (2 × decay_window)
+    let dec = (base * remainder as i128) / (2 * decay_window as i128);
+    (base - dec).max(0)
+}
+
+const BPS_SCALE_I128: i128 = 10_000;
+
+// ---- PROPERTY 1: BOUNDS ----
+// For all tested (elapsed, decay_window) pairs,
+// 0 <= recency_weight_bps(elapsed, decay_window) <= 10_000.
+#[test]
+fn property_recency_bounds() {
+    let decay_windows: &[u64] = &[
+        1,
+        2,
+        5,
+        10,
+        60,
+        3600,
+        86_400,            // 1 day
+        90 * 24 * 60 * 60, // default config decay window (~7776000)
+        u64::MAX / 2,      // near max
+        u64::MAX,
+    ];
+
+    for &dw in decay_windows {
+        // Test a broad range of elapsed values: 0..=100 plus key boundary values.
+        for e in 0..=100u64 {
+            let w = crate::recency_weight_bps(e, dw);
+            assert!(
+                w >= 0 && w <= BPS_SCALE_I128,
+                "bounds violated: recency_weight_bps({}, {}) = {}",
+                e,
+                dw,
+                w
+            );
+        }
+        // Additional boundary values derived from the decay window.
+        let extra: &[u64] = &[
+            dw.saturating_sub(1),
+            dw,
+            dw.saturating_add(1),
+            2_u64.saturating_mul(dw),
+            3_u64.saturating_mul(dw),
+            10_u64.saturating_mul(dw),
+            19_u64.saturating_mul(dw),
+            20_u64.saturating_mul(dw),
+            21_u64.saturating_mul(dw),
+            100_u64.saturating_mul(dw),
+            u64::MAX,
+        ];
+        for &e in extra {
+            let w = crate::recency_weight_bps(e, dw);
+            assert!(
+                w >= 0 && w <= BPS_SCALE_I128,
+                "bounds violated: recency_weight_bps({}, {}) = {}",
+                e,
+                dw,
+                w
+            );
+        }
+    }
+}
+
+// ---- PROPERTY 2: MONOTONICITY ----
+// For any fixed decay_window, if e1 <= e2 then
+// recency_weight_bps(e2, dw) <= recency_weight_bps(e1, dw).
+#[test]
+fn property_recency_monotonicity() {
+    let decay_windows: &[u64] = &[1, 2, 5, 10, 60, 3600, 86_400, 90 * 24 * 60 * 60];
+
+    for &dw in decay_windows {
+        // Sweep elapsed from 0 through 21 * dw in small steps,
+        // verifying the weight never increases.
+        let max_elapsed = 21_u64.saturating_mul(dw);
+        let step = if dw > 100 { dw / 50 } else { 1 };
+
+        let mut prev_weight = i128::MAX;
+        let mut e = 0u64;
+        while e <= max_elapsed {
+            let w = crate::recency_weight_bps(e, dw);
+            assert!(
+                w <= prev_weight,
+                "monotonicity violated at elapsed={} (decay_window={}): \
+                 weight={} > prev_weight={}",
+                e,
+                dw,
+                w,
+                prev_weight
+            );
+            prev_weight = w;
+            e = e.saturating_add(step);
+        }
+    }
+}
+
+// ---- PROPERTY 3: ZERO ELAPSED ----
+// recency_weight_bps(0, dw) == BPS_SCALE for any valid dw > 0.
+#[test]
+fn property_recency_zero_elapsed() {
+    let decay_windows: &[u64] = &[1, 2, 10, 60, 86_400, 90 * 24 * 60 * 60];
+
+    for &dw in decay_windows {
+        let w = crate::recency_weight_bps(0, dw);
+        assert_eq!(
+            w, BPS_SCALE_I128,
+            "recency_weight_bps(0, {}) should be {} but got {}",
+            dw, BPS_SCALE_I128, w
+        );
+    }
+}
+
+// ---- PROPERTY 4: ZERO DECAY WINDOW ----
+// recency_weight_bps(e, 0) == BPS_SCALE for any elapsed.
+// (The function treats zero decay_window as "no decay".)
+#[test]
+fn property_recency_zero_decay_window() {
+    let elapsed_values: &[u64] = &[0, 1, 100, u64::MAX / 2, u64::MAX];
+
+    for &e in elapsed_values {
+        let w = crate::recency_weight_bps(e, 0);
+        assert_eq!(
+            w, BPS_SCALE_I128,
+            "recency_weight_bps({}, 0) should be {} but got {}",
+            e, BPS_SCALE_I128, w
+        );
+    }
+}
+
+// ---- PROPERTY 5: LARGE ELAPSED ----
+// For very large elapsed values (near u64::MAX), the function returns 0
+// and does not panic.
+#[test]
+fn property_recency_large_elapsed() {
+    let decay_windows: &[u64] = &[1, 60, 86_400, 90 * 24 * 60 * 60];
+
+    let large_elapsed: &[u64] = &[
+        u64::MAX,
+        u64::MAX - 1,
+        u64::MAX / 2,
+        u64::MAX / 3,
+        1_000_000_000_000, // ~31,700 years in seconds
+        31_536_000_000,    // ~1000 years in seconds
+    ];
+
+    for &dw in decay_windows {
+        for &e in large_elapsed {
+            let w = crate::recency_weight_bps(e, dw);
+            assert!(
+                w >= 0 && w <= BPS_SCALE_I128,
+                "large elapsed: recency_weight_bps({}, {}) = {} out of bounds",
+                e,
+                dw,
+                w
+            );
+            // With any reasonable decay_window and very large elapsed,
+            // the weight should be 0 (since full_halvings >= 20)
+            if dw > 0 && e / dw >= 20 {
+                assert_eq!(
+                    w, 0,
+                    "should saturate to 0: recency_weight_bps({}, {}) = {}",
+                    e, dw, w
+                );
+            }
+        }
+    }
+}
+
+// ---- PROPERTY 6: DECAY BOUNDARIES ----
+// Test exact half-life multiples and their neighbours.
+// At elapsed = k * decay_window:
+//   base = 10_000 >> k
+//   remainder = 0, so decrement = 0
+//   result = base
+#[test]
+fn property_recency_decay_boundaries() {
+    let dw: u64 = 100;
+
+    for k in 0..20u64 {
+        let e = k * dw;
+        let w = crate::recency_weight_bps(e, dw);
+        let expected = BPS_SCALE_I128 >> k;
+        assert_eq!(
+            w, expected,
+            "half-life boundary: recency_weight_bps({}, {}) = {}, expected {}",
+            e, dw, w, expected
+        );
+    }
+
+    // Test boundary - 1 and boundary + 1
+    for k in 1..10u64 {
+        let e_before = k * dw - 1;
+        let e_at = k * dw;
+        let e_after = k * dw + 1;
+
+        let w_before = crate::recency_weight_bps(e_before, dw);
+        let w_at = crate::recency_weight_bps(e_at, dw);
+        let w_after = crate::recency_weight_bps(e_after, dw);
+
+        assert!(
+            w_before >= w_at,
+            "should decrease at boundary: w({})={} >= w({})={}",
+            e_before,
+            w_before,
+            e_at,
+            w_at
+        );
+        assert!(
+            w_at >= w_after,
+            "should decrease after boundary: w({})={} >= w({})={}",
+            e_at,
+            w_at,
+            e_after,
+            w_after
+        );
+    }
+}
+
+// ---- PROPERTY 7: AGREEMENT WITH ORACLE ----
+// For a broad sweep of inputs, verify the implementation matches
+// an independent mathematical oracle.
+#[test]
+fn property_recency_matches_oracle() {
+    let decay_windows: &[u64] = &[1, 2, 5, 10, 60, 3600, 86_400, 90 * 24 * 60 * 60];
+
+    for &dw in decay_windows {
+        // Sweep elapsed from 0 to 30 half-lives worth of seconds
+        let max_elapsed = 30_u64.saturating_mul(dw);
+        let step = if dw > 100 { dw / 100 } else { 1 };
+
+        let mut e = 0u64;
+        while e <= max_elapsed {
+            let actual = crate::recency_weight_bps(e, dw);
+            let expected = oracle_recency_weight_bps(e, dw);
+            assert_eq!(
+                actual, expected,
+                "oracle mismatch: recency_weight_bps({}, {}) = {}, expected {}",
+                e, dw, actual, expected
+            );
+            e = e.saturating_add(step);
+        }
+    }
+}
+
+// ---- PROPERTY 8: CROSS-DECAY-WINDOW CONSISTENCY ----
+// A larger decay_window should produce higher (or equal) weight
+// for the same elapsed, because the half-life is longer.
+#[test]
+fn property_recency_larger_window_higher_weight() {
+    let elapsed_values: &[u64] = &[0, 1, 10, 100, 1000, 10_000, 100_000];
+    let windows: &[u64] = &[10, 60, 3600, 86_400, 90 * 24 * 60 * 60];
+
+    for &e in elapsed_values {
+        for w_idx in 1..windows.len() {
+            let w_small = crate::recency_weight_bps(e, windows[w_idx - 1]);
+            let w_large = crate::recency_weight_bps(e, windows[w_idx]);
+            assert!(
+                w_large >= w_small,
+                "larger window should give higher weight: \
+                 recency_weight_bps({}, {})={} < recency_weight_bps({}, {})={}",
+                e,
+                windows[w_idx],
+                w_large,
+                e,
+                windows[w_idx - 1],
+                w_small
+            );
+        }
+    }
+}

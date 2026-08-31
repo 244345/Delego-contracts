@@ -354,6 +354,7 @@ pub struct RelayerKeyChangedEvent {
     pub delegate: Address,
     pub old_key: Option<BytesN<32>>,
     pub new_key: BytesN<32>,
+}
 /// Emitted by `renew_permission` when a renewal's requested extension would
 /// overflow `u32` and is instead capped at `u32::MAX`, so callers get an
 /// explicit signal rather than a silently saturated expiry.
@@ -363,6 +364,7 @@ pub struct PermissionExpiryCappedEvent {
     pub owner: Address,
     pub delegate: Address,
     pub capped_at: u32,
+}
 /// Emitted by `propose_admin` when the current admin proposes a successor
 /// as part of the two-step admin transfer.
 #[contracttype]

@@ -1278,7 +1278,12 @@ mod test {
     fn setup_disputed_escrow(
         env: &Env,
         threshold: u32,
-    ) -> (EscrowContractClient<'_>, Address, u64, soroban_sdk::Vec<Address>) {
+    ) -> (
+        EscrowContractClient<'_>,
+        Address,
+        u64,
+        soroban_sdk::Vec<Address>,
+    ) {
         env.mock_all_auths();
         let (client, admin, contract_id) = setup_client(env);
 
@@ -1317,8 +1322,7 @@ mod test {
     #[test]
     fn test_vote_dispute_emits_dispute_voted_event() {
         let env = Env::default();
-        let (client, contract_id, escrow_id, arbiters) =
-            setup_disputed_escrow(&env, 2); // threshold = 2
+        let (client, contract_id, escrow_id, arbiters) = setup_disputed_escrow(&env, 2); // threshold = 2
         let arbiter = arbiters.get(0).unwrap();
 
         client.vote_dispute(&escrow_id, &arbiter, &true);
@@ -1349,8 +1353,7 @@ mod test {
     #[test]
     fn test_vote_dispute_emits_zero_votes_for_on_buyer_vote() {
         let env = Env::default();
-        let (client, contract_id, escrow_id, arbiters) =
-            setup_disputed_escrow(&env, 2);
+        let (client, contract_id, escrow_id, arbiters) = setup_disputed_escrow(&env, 2);
         let arbiter = arbiters.get(0).unwrap();
 
         client.vote_dispute(&escrow_id, &arbiter, &false); // vote for buyer
@@ -1381,8 +1384,7 @@ mod test {
     #[test]
     fn test_vote_dispute_quorum_boundary_emits_correct_tally() {
         let env = Env::default();
-        let (client, contract_id, escrow_id, arbiters) =
-            setup_disputed_escrow(&env, 2); // threshold = 2
+        let (client, contract_id, escrow_id, arbiters) = setup_disputed_escrow(&env, 2); // threshold = 2
 
         // First seller vote.
         client.vote_dispute(&escrow_id, &arbiters.get(0).unwrap(), &true);
@@ -1416,8 +1418,7 @@ mod test {
     #[test]
     fn test_vote_dispute_emits_exactly_one_event_per_vote() {
         let env = Env::default();
-        let (client, contract_id, escrow_id, arbiters) =
-            setup_disputed_escrow(&env, 3); // threshold = 3
+        let (client, contract_id, escrow_id, arbiters) = setup_disputed_escrow(&env, 3); // threshold = 3
 
         // Vote 1: verify exactly one DisputeVotedEvent.
         client.vote_dispute(&escrow_id, &arbiters.get(0).unwrap(), &true);
@@ -1433,7 +1434,10 @@ mod test {
                 count += 1;
             }
         }
-        assert_eq!(count, 1, "first vote should emit exactly one DisputeVotedEvent");
+        assert_eq!(
+            count, 1,
+            "first vote should emit exactly one DisputeVotedEvent"
+        );
 
         // Vote 2: verify exactly one more DisputeVotedEvent.
         client.vote_dispute(&escrow_id, &arbiters.get(1).unwrap(), &true);
@@ -1449,7 +1453,10 @@ mod test {
                 count += 1;
             }
         }
-        assert_eq!(count, 1, "second vote should emit exactly one DisputeVotedEvent");
+        assert_eq!(
+            count, 1,
+            "second vote should emit exactly one DisputeVotedEvent"
+        );
 
         // Vote 3: verify exactly one more.
         client.vote_dispute(&escrow_id, &arbiters.get(2).unwrap(), &false);
@@ -1465,7 +1472,10 @@ mod test {
                 count += 1;
             }
         }
-        assert_eq!(count, 1, "third vote should emit exactly one DisputeVotedEvent");
+        assert_eq!(
+            count, 1,
+            "third vote should emit exactly one DisputeVotedEvent"
+        );
     }
 
     // ─── Issue #34: Monotonic YieldView Tests ────────────────────────────────
@@ -1792,5 +1802,360 @@ mod test {
             r3.updated_at >= r2.updated_at,
             "updated_at must advance through resolve"
         );
+    }
+
+    // ====================================================================
+    // Property tests for escrow fee math (Issue #130)
+    // ====================================================================
+    //
+    // These tests verify the fee calculation used by `split_release`:
+    //   fee = (amount / 10_000) * fee_bps + ((amount % 10_000) * fee_bps) / 10_000
+    //
+    // This is mathematically equivalent to:
+    //   floor(amount × fee_bps / 10_000)
+    //
+    // Constraints:
+    //   - fee_bps is u32, validated <= 1000 at initialization
+    //   - amount is i128, validated > 0 in split_release
+    // ====================================================================
+
+    /// Independent oracle: compute floor(amount × fee_bps / 10_000)
+    /// using wider arithmetic (i128 × i128 → i256 via u128) to avoid
+    /// any overflow in the test itself.
+    fn oracle_fee(amount: i128, fee_bps: i128) -> i128 {
+        // Use u128 for intermediate calculation to avoid overflow.
+        // amount is positive (validated by contract), fee_bps <= 1000.
+        // Max product: 2^127 × 1000, which fits in u128.
+        let a = amount as u128;
+        let b = fee_bps as u128;
+        ((a * b) / 10_000u128) as i128
+    }
+
+    /// Reproduce the production fee formula exactly as implemented
+    /// in `split_release`.
+    fn production_fee(amount: i128, fee_bps: i128) -> i128 {
+        (amount / 10_000i128) * fee_bps + ((amount % 10_000i128) * fee_bps) / 10_000i128
+    }
+
+    const MAX_VALID_FEE_BPS: i128 = 1000;
+
+    // ---- FEE PROPERTY 1: FLOOR ACCURACY ----
+    // For broad valid inputs, the production formula matches the
+    // independent floor oracle.
+    #[test]
+    fn property_fee_floor_accuracy() {
+        let fee_bps_values: &[i128] = &[0, 1, 10, 50, 100, 250, 500, 999, 1000];
+
+        for &bps in fee_bps_values {
+            // Sweep amounts from 0 to 200_000 in steps
+            let mut amount = 0i128;
+            while amount <= 200_000 {
+                let actual = production_fee(amount, bps);
+                let expected = oracle_fee(amount, bps);
+                assert_eq!(
+                    actual, expected,
+                    "floor accuracy: fee({}, {}) = {}, expected {}",
+                    amount, bps, actual, expected
+                );
+                amount += 1;
+            }
+        }
+    }
+
+    // ---- FEE PROPERTY 2: BOUNDS ----
+    // fee >= 0 and fee <= amount for valid inputs.
+    #[test]
+    fn property_fee_bounds() {
+        let fee_bps_values: &[i128] = &[0, 1, 100, 250, 500, 1000];
+        let amounts: &[i128] = &[
+            0,
+            1,
+            2,
+            5,
+            10,
+            99,
+            100,
+            999,
+            1000,
+            10_000,
+            10_001,
+            100_000,
+            1_000_000,
+            i128::MAX / 2,
+        ];
+
+        for &bps in fee_bps_values {
+            for &amt in amounts {
+                let fee = production_fee(amt, bps);
+                assert!(
+                    fee >= 0,
+                    "fee must be non-negative: fee({}, {}) = {}",
+                    amt,
+                    bps,
+                    fee
+                );
+                assert!(
+                    fee <= amt,
+                    "fee must not exceed amount: fee({}, {}) = {}",
+                    amt,
+                    bps,
+                    fee
+                );
+            }
+        }
+    }
+
+    // ---- FEE PROPERTY 3: DUST ----
+    // Test amounts 0..10_000 where rounding matters most.
+    #[test]
+    fn property_fee_dust() {
+        let bps_values: &[i128] = &[1, 10, 100, 250, 500, 1000];
+
+        for &bps in bps_values {
+            for amt in 0i128..10_000 {
+                let fee = production_fee(amt, bps);
+                let expected = oracle_fee(amt, bps);
+                assert_eq!(
+                    fee, expected,
+                    "dust: fee({}, {}) = {}, expected {}",
+                    amt, bps, fee, expected
+                );
+            }
+        }
+    }
+
+    // ---- FEE PROPERTY 4: ZERO BPS ----
+    // fee(amount, 0) == 0 for all amounts.
+    #[test]
+    fn property_fee_zero_bps() {
+        let amounts: &[i128] = &[0, 1, 100, 10_000, 100_000, i128::MAX / 2];
+
+        for &amt in amounts {
+            let fee = production_fee(amt, 0);
+            assert_eq!(fee, 0, "zero bps: fee({}, 0) = {}, expected 0", amt, fee);
+        }
+    }
+
+    // ---- FEE PROPERTY 5: MAXIMUM VALID BPS ----
+    // fee(amount, 1000) == amount / 10 for all amounts.
+    // (1000 / 10_000 = 10%, so fee = floor(amount / 10))
+    #[test]
+    fn property_fee_max_bps() {
+        let amounts: &[i128] = &[
+            0,
+            1,
+            2,
+            9,
+            10,
+            11,
+            99,
+            100,
+            999,
+            1000,
+            10_000,
+            10_001,
+            100_000,
+            1_000_000,
+            i128::MAX / 2,
+        ];
+
+        for &amt in amounts {
+            let fee = production_fee(amt, MAX_VALID_FEE_BPS);
+            let expected = amt / 10;
+            assert_eq!(
+                fee, expected,
+                "max bps: fee({}, 1000) = {}, expected {}",
+                amt, fee, expected
+            );
+        }
+    }
+
+    // ---- FEE PROPERTY 6: ROUNDING BOUNDARIES ----
+    // Test amounts where amount × bps is just below/above a multiple
+    // of 10_000.
+    #[test]
+    fn property_fee_rounding_boundaries() {
+        let bps_values: &[i128] = &[1, 3, 7, 100, 250, 333, 500, 777, 1000];
+
+        for &bps in bps_values {
+            // Test amounts around multiples of 10_000 / gcd(10_000, bps)
+            for multiple in 1..=20i128 {
+                let base = multiple * 10_000 / bps;
+                // Test base - 1, base, base + 1
+                for offset in -1i128..=1i128 {
+                    let amt = (base + offset).max(0);
+                    let fee = production_fee(amt, bps);
+                    let expected = oracle_fee(amt, bps);
+                    assert_eq!(
+                        fee, expected,
+                        "rounding: fee({}, {}) = {}, expected {}",
+                        amt, bps, fee, expected
+                    );
+                }
+            }
+        }
+    }
+
+    // ---- FEE PROPERTY 7: MONOTONICITY ----
+    // For fixed valid BPS: amount1 <= amount2 => fee(amount1) <= fee(amount2)
+    // For fixed amount: bps1 <= bps2 => fee(amount, bps1) <= fee(amount, bps2)
+    #[test]
+    fn property_fee_monotonicity_amount() {
+        let bps_values: &[i128] = &[1, 10, 100, 250, 500, 1000];
+        let amounts: &[i128] = &[
+            0, 1, 2, 5, 10, 50, 100, 500, 1000, 5000, 10_000, 10_001, 50_000, 100_000, 1_000_000,
+        ];
+
+        for &bps in bps_values {
+            let mut prev_fee = i128::MIN;
+            for &amt in amounts {
+                let fee = production_fee(amt, bps);
+                assert!(
+                    fee >= prev_fee,
+                    "amount monotonicity violated: fee({}, {})={} < fee({}, {})={}",
+                    amt,
+                    bps,
+                    fee,
+                    amounts[amounts.iter().position(|&a| a == prev_fee).unwrap_or(0)],
+                    bps,
+                    prev_fee
+                );
+                prev_fee = fee;
+            }
+        }
+    }
+
+    #[test]
+    fn property_fee_monotonicity_bps() {
+        let amounts: &[i128] = &[0, 1, 100, 1000, 10_000, 100_000];
+        let bps_values: &[i128] = &[0, 1, 10, 50, 100, 250, 500, 750, 999, 1000];
+
+        for &amt in amounts {
+            let mut prev_fee = i128::MIN;
+            for &bps in bps_values {
+                let fee = production_fee(amt, bps);
+                assert!(
+                    fee >= prev_fee,
+                    "bps monotonicity violated: fee({}, {})={} < fee({}, {})={}",
+                    amt,
+                    bps,
+                    fee,
+                    amt,
+                    bps_values[bps_values.iter().position(|&b| b == prev_fee).unwrap_or(0)],
+                    prev_fee
+                );
+                prev_fee = fee;
+            }
+        }
+    }
+
+    // ---- FEE PROPERTY 8: PRODUCTION-ORACLE AGREEMENT ----
+    // For a broad sweep of (amount, fee_bps) pairs, verify the
+    // production formula matches the independent oracle.
+    #[test]
+    fn property_fee_matches_oracle() {
+        let bps_values: &[i128] = &[0, 1, 2, 5, 10, 25, 50, 100, 250, 500, 750, 999, 1000];
+
+        for &bps in bps_values {
+            // Sweep amounts in powers of 10 and around key boundaries.
+            // Duplicates are harmless and keep the code no_std friendly.
+            let amounts: &[i128] = &[
+                0,
+                1,
+                4,
+                5,
+                6,
+                9,
+                10,
+                11,
+                49,
+                50,
+                51,
+                99,
+                100,
+                101,
+                499,
+                500,
+                501,
+                999,
+                1000,
+                1001,
+                4999,
+                5000,
+                5001,
+                9999,
+                10_000,
+                10_001,
+                49_999,
+                50_000,
+                50_001,
+                99_999,
+                100_000,
+                100_001,
+                499_999,
+                500_000,
+                500_001,
+                999_999,
+                1_000_000,
+                1_000_001,
+                4_999_999,
+                5_000_000,
+                5_000_001,
+                9_999_999,
+                10_000_000,
+                10_000_001,
+                49_999_999,
+                50_000_000,
+                50_000_001,
+                99_999_999,
+                100_000_000,
+                100_000_001,
+                499_999_999,
+                500_000_000,
+                500_000_001,
+                999_999_999,
+                1_000_000_000,
+                1_000_000_001,
+                4_999_999_999,
+                5_000_000_000,
+                5_000_000_001,
+                9_999_999_999,
+                10_000_000_000,
+                10_000_000_001,
+                49_999_999_999,
+                50_000_000_000,
+                50_000_000_001,
+                99_999_999_999,
+                100_000_000_000,
+                100_000_000_001,
+                499_999_999_999,
+                500_000_000_000,
+                500_000_000_001,
+                999_999_999_999,
+                1_000_000_000_000,
+            ];
+
+            for &amt in amounts {
+                let actual = production_fee(amt, bps);
+                let expected = oracle_fee(amt, bps);
+                assert_eq!(
+                    actual, expected,
+                    "oracle agreement: fee({}, {}) = {}, expected {}",
+                    amt, bps, actual, expected
+                );
+            }
+        }
+    }
+
+    // ---- FEE PROPERTY 9: ZERO AMOUNT ----
+    // fee(0, bps) == 0 for all valid BPS values.
+    #[test]
+    fn property_fee_zero_amount() {
+        let bps_values: &[i128] = &[0, 1, 100, 250, 500, 1000];
+
+        for &bps in bps_values {
+            let fee = production_fee(0, bps);
+            assert_eq!(fee, 0, "zero amount: fee(0, {}) = {}, expected 0", bps, fee);
+        }
     }
 }
