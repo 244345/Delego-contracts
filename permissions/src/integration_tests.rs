@@ -380,6 +380,7 @@ fn test_decrease_allowance_timelock_defaults_to_one_day() {
 fn test_set_decrease_allowance_timelock_custom_value() {
     let t = TestEnv::setup();
     let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    client.set_admin(&t.admin);
 
     assert_eq!(
         client.try_set_decrease_timelock_secs(&t.admin, &0),

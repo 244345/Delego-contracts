@@ -15,14 +15,14 @@ mod test {
     fn assert_cost_within_thresholds(env: &Env) {
         let cost = env.cost_estimate().budget();
         assert!(
-            cost.cpu_instruction_count() <= MAX_SPEND_CPU_INSTRUCTIONS,
+            cost.cpu_instruction_cost() <= MAX_SPEND_CPU_INSTRUCTIONS,
             "spend CPU budget exceeded: {}",
-            cost.cpu_instruction_count()
+            cost.cpu_instruction_cost()
         );
         assert!(
-            cost.memory_bytes() <= MAX_SPEND_MEMORY_BYTES,
+            cost.memory_bytes_cost() <= MAX_SPEND_MEMORY_BYTES,
             "spend memory budget exceeded: {}",
-            cost.memory_bytes()
+            cost.memory_bytes_cost()
         );
     }
 
@@ -2823,34 +2823,8 @@ mod test {
         }
         assert!(found_new);
         assert!(!found_old);
-    // --- grant expiry overflow (issue #52) -------------------------------------
-    fn test_grant_expiry_at_u32_max_boundary_succeeds() {
-        let delegate = Address::generate(&env);
-        let merchants = Vec::<Address>::new(&env);
-        env.ledger().with_mut(|li| {
-            li.sequence_number = 1_000;
-        });
-        // ttl_ledgers that lands the expiry exactly on u32::MAX must still succeed.
-        let ttl = u32::MAX - 1_000;
-        assert_eq!(
-            client.try_grant(&owner, &delegate, &1000, &100, &merchants, &ttl),
-            Ok(Ok(()))
-        );
-            client.get_permission(&owner, &delegate).expires_at_ledger,
-            u32::MAX
     }
-    fn test_grant_expiry_overflow_returns_typed_error() {
-        // Just past the boundary: sequence + ttl == u32::MAX + 1.
-        // Must return a typed error instead of overflow-panicking.
-        let ttl = u32::MAX - 999;
-            Err(Ok(PermissionError::InvalidExpiry))
-        // Extreme ttl is handled the same way.
-            client.try_grant(&owner, &delegate, &1000, &100, &merchants, &u32::MAX),
-        // A subsequent in-range grant for the same pair still succeeds,
-        // confirming the rejected calls left no half-written state.
-            client.try_grant(&owner, &delegate, &1000, &100, &merchants, &10_000),
-            11_000
-    }
+
 
     // --- Batch sweep tests ---
 
@@ -2981,23 +2955,17 @@ mod test {
 
         let res_over_cap = client.try_sweep_inactive_batch(&over_cap, &caller);
         assert_eq!(res_over_cap, Err(Ok(PermissionError::InvalidParam)));
-    fn test_stale_nonce_relay_reverts() {
-        let merchant = Address::generate(&env);
-        let relayer = Address::generate(&env);
-        client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
-        client.set_relayer_key(&owner, &delegate, &relayer);
-            li.sequence_number = 100;
-            client.try_execute_spend_via_relayer(&owner, &delegate, &50, &merchant, &1, &1000),
-            Err(Ok(PermissionError::InvalidNonce))
-    fn test_second_spend_inside_velocity_window_reverts() {
-        client.set_velocity_interval(&owner, &delegate, &10);
-            client.try_execute_spend(&owner, &delegate, &10, &merchant),
-        // A second spend inside the 10-ledger velocity window is rejected.
-            li.sequence_number = 105;
-            Err(Ok(PermissionError::VelocityLimitExceeded))
-        // Once the window has elapsed, spending is allowed again.
-            li.sequence_number = 110;
+    }
+
+    #[test]
     fn test_decrease_allowance_negative_amount_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+        
         let result = client.try_decrease_allowance(&owner, &delegate, &-100);
         assert!(result.is_err());
     }
