@@ -1305,3 +1305,41 @@ fn test_relayed_spend_respects_parent_budget_cap() {
         Err(Ok(PermissionError::ExceedsTotalLimit))
     );
 }
+
+#[test]
+fn test_validate_chain_prevents_mutation_on_exceeds_parent_limit() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let child_delegate = Address::generate(&t.env);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+
+    // Parent: 100 total; child: 100 total.
+    client.grant(&t.buyer, &t.agent, &100i128, &100i128, &merchants, &3600u32);
+    client.grant_child(
+        &t.buyer,
+        &t.agent,
+        &child_delegate,
+        &100i128,
+        &100i128,
+        &merchants,
+        &3600u32,
+    );
+
+    // Spend 50 directly on the parent. Parent remaining = 50.
+    client.execute_spend(&t.buyer, &t.agent, &50, &t.seller);
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 50);
+
+    // Child attempts to spend 60. Child has 100 limit, so child check passes.
+    // Parent only has 50 remaining, so parent check fails.
+    assert_eq!(
+        client.try_execute_spend(&t.agent, &child_delegate, &60, &t.seller),
+        Err(Ok(PermissionError::ExceedsParentLimit))
+    );
+
+    // Child state should not be mutated (spent is 0, remaining is 100)
+    assert_eq!(client.get_remaining_allowance(&t.agent, &child_delegate), 100);
+    // Parent state should not be further mutated (spent is 50, remaining is 50)
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 50);
+}

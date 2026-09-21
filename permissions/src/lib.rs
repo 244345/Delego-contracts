@@ -1512,6 +1512,48 @@ impl PermissionsContract {
         min_expiry
     }
 
+    /// Validates the child permission's remaining limit, and then walks the parent
+    /// chain validating that each ancestor also has sufficient remaining allowance.
+    fn validate_chain(
+        env: &Env,
+        record: &PermissionRecord,
+        amount: i128,
+    ) -> Result<(), PermissionError> {
+        let remaining = record.limit_total - record.spent;
+        if amount > remaining {
+            return Err(PermissionError::ExceedsTotalLimit);
+        }
+
+        let mut next_parent = match (record.parent_owner.clone(), record.parent_delegate.clone()) {
+            (Some(p_owner), Some(p_delegate)) => Some((p_owner, p_delegate)),
+            _ => None,
+        };
+
+        while let Some((p_owner, p_delegate)) = next_parent {
+            let parent_key = DataKey::Permission(p_owner, p_delegate);
+            let parent_record: PermissionRecord = env
+                .storage()
+                .persistent()
+                .get(&parent_key)
+                .ok_or(PermissionError::ParentNotFound)?;
+
+            let parent_remaining = parent_record.limit_total - parent_record.spent;
+            if amount > parent_remaining {
+                return Err(PermissionError::ExceedsParentLimit);
+            }
+
+            next_parent = match (
+                parent_record.parent_owner.clone(),
+                parent_record.parent_delegate.clone(),
+            ) {
+                (Some(pp_owner), Some(pp_delegate)) => Some((pp_owner, pp_delegate)),
+                _ => None,
+            };
+        }
+
+        Ok(())
+    }
+
     pub fn can_spend(
         env: Env,
         owner: Address,
@@ -1544,10 +1586,7 @@ impl PermissionsContract {
             return Err(PermissionError::ExceedsPerTxLimit);
         }
 
-        let remaining = record.limit_total - record.spent;
-        if amount > remaining {
-            return Err(PermissionError::ExceedsTotalLimit);
-        }
+        Self::validate_chain(&env, &record, amount)?;
 
         if !record.allowed_merchants.is_empty() {
             let mut allowed = false;
@@ -1655,12 +1694,7 @@ impl PermissionsContract {
                 .storage()
                 .persistent()
                 .get(&parent_key)
-                .ok_or(PermissionError::ParentNotFound)?;
-
-            let parent_remaining = parent_record.limit_total - parent_record.spent;
-            if amount > parent_remaining {
-                return Err(PermissionError::ExceedsParentLimit);
-            }
+                .unwrap();
 
             parent_record.spent += amount;
             next_parent = match (
