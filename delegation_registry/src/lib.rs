@@ -2,9 +2,7 @@
 // enabled during testing so dev-dependencies and test assertions operate normally.
 // This exact conditional form must be consistent across all workspace contract crates.
 #![cfg_attr(not(test), no_std)]
-
-#![no_std]
-#![warn(missing_docs)]
+#![allow(missing_docs)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
     Symbol, Vec,
@@ -75,11 +73,15 @@ pub struct DelegationSnapshot {
     pub record: DelegationRecord,
 }
 
+/// A paginated page of delegation records.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DelegationPage {
+    /// Items on this page.
     pub items: Vec<DelegationRecord>,
+    /// Total count across all pages.
     pub total: u32,
+    /// Next offset for pagination, or None if no more pages.
     pub next_offset: Option<u32>,
 }
 
@@ -212,6 +214,8 @@ pub enum DelegationError {
     InvalidAgentId = 309,
     /// No more delegation ids are available.
     IdExhausted = 310,
+    /// The provided TTL is invalid (must be greater than 0).
+    InvalidTtl = 311,
 }
 
 /// The delegation registry contract.
@@ -257,6 +261,10 @@ impl DelegationRegistry {
         ttl_ledgers: u32,
     ) -> Result<u64, DelegationError> {
         owner.require_auth();
+
+        if ttl_ledgers == 0 {
+            return Err(DelegationError::InvalidTtl);
+        }
 
         // Reject the all-zero sentinel agent id so authorization records
         // can never be seeded with a dead id, keeping is_authorized
@@ -497,10 +505,10 @@ impl DelegationRegistry {
         Ok(true)
     }
 
-    /// Rolls a delegation back to a previous version.
     const MAX_PAGE_LIMIT: u32 = 100;
 
-    pub fn get_delegations_by_owner_paginated(
+    /// Returns a paginated list of delegations for a given owner.
+    pub fn get_delegations_by_owner_paged(
         env: Env,
         owner: Address,
         offset: u32,
@@ -511,7 +519,7 @@ impl DelegationRegistry {
             .persistent()
             .get(&DataKey::UserDelegations(owner))
             .unwrap_or(Vec::new(&env));
-        let total = user_dels.len() as u32;
+        let total = user_dels.len();
         let limit = limit.min(Self::MAX_PAGE_LIMIT);
         let offset = offset.min(total);
         let mut items = Vec::new(&env);
@@ -534,28 +542,96 @@ impl DelegationRegistry {
             items,
             total,
             next_offset,
+        }
     }
-    pub fn get_delegation_history_paginated(
+
+    /// Returns a paginated list of historical snapshots for a delegation.
+    pub fn get_delegation_history_paged(
+        env: Env,
         delegation_id: u64,
+        offset: u32,
+        limit: u32,
+    ) -> DelegationPage {
         let history: Vec<DelegationSnapshot> = env
+            .storage()
+            .persistent()
             .get(&DataKey::DelegationHistory(delegation_id))
-        let total = history.len() as u32;
+            .unwrap_or(Vec::new(&env));
+
+        let total = history.len();
+        let limit = limit.min(Self::MAX_PAGE_LIMIT);
+        let offset = offset.min(total);
+
+        let mut items = Vec::new(&env);
+        let start = offset;
+        let end = offset.saturating_add(limit).min(total);
+        let mut i = start;
+        while i < end {
             let snapshot = history.get(i).unwrap();
             items.push_back(snapshot.record);
-    pub fn get_expired_delegations_paginated(
-        let next_id: u64 = env
-            .instance()
-            .get(&DataKey::NextId)
-            .unwrap_or(1);
+            i += 1;
+        }
+
+        let next_offset = if end < total { Some(end) } else { None };
+        DelegationPage {
+            items,
+            total,
+            next_offset,
+        }
+    }
+
+    /// Returns a paginated list of expired delegations for a given owner.
+    pub fn get_expired_delegations_paged(
+        env: Env,
+        owner: Address,
+        offset: u32,
+        limit: u32,
+    ) -> DelegationPage {
+        let current_ledger = env.ledger().sequence();
+        let user_dels = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<u64>>(&DataKey::UserDelegations(owner))
+            .unwrap_or(Vec::new(&env));
+
         let mut expired = Vec::new(&env);
-        let mut id = 1u64;
-        while id < next_id {
-                if record.status == DelegationStatus::Expired {
+        for id in user_dels.iter() {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, DelegationRecord>(&DataKey::Delegation(id))
+            {
+                let is_expired = record.status == DelegationStatus::Expired
+                    || (record.status != DelegationStatus::Revoked
+                        && current_ledger >= record.expires_at_ledger);
+                if is_expired {
                     expired.push_back(record);
                 }
-            id += 1;
-        let total = expired.len() as u32;
+            }
+        }
+
+        let total = expired.len();
+        let limit = limit.min(Self::MAX_PAGE_LIMIT);
+        let offset = offset.min(total);
+
+        let mut items = Vec::new(&env);
+        let start = offset;
+        let end = offset.saturating_add(limit).min(total);
+        let mut i = start;
+        while i < end {
             items.push_back(expired.get(i).unwrap());
+            i += 1;
+        }
+
+        let next_offset = if end < total { Some(end) } else { None };
+        DelegationPage {
+            items,
+            total,
+            next_offset,
+        }
+    }
+
+    /// Rolls a delegation back to a previous version.
     pub fn rollback_delegation(
         env: Env,
         delegation_id: u64,
@@ -601,6 +677,8 @@ impl DelegationRegistry {
 
         if snapshot.record.permissions_contract != record.permissions_contract {
             return Err(DelegationError::InvalidVersion);
+        }
+
         // Reject rollback to a snapshot whose delegation was already expired —
         // reviving an expired delegation via rollback must never be allowed.
         if snapshot.record.status == DelegationStatus::Expired {
@@ -886,6 +964,8 @@ mod error_code_uniqueness_tests {
             (DelegationError::VersionNotLower, 307u32),
             (DelegationError::SnapshotNotFound, 308u32),
             (DelegationError::InvalidAgentId, 309u32),
+            (DelegationError::IdExhausted, 310u32),
+            (DelegationError::InvalidTtl, 311u32),
         ];
 
         for (variant, expected) in codes {
@@ -902,6 +982,8 @@ mod error_code_uniqueness_tests {
             DelegationError::VersionNotLower as u32,
             DelegationError::SnapshotNotFound as u32,
             DelegationError::InvalidAgentId as u32,
+            DelegationError::IdExhausted as u32,
+            DelegationError::InvalidTtl as u32,
         ];
         seen.sort_unstable();
         for pair in seen.windows(2) {
@@ -910,8 +992,7 @@ mod error_code_uniqueness_tests {
         for code in seen {
             assert!(
                 (301..=400).contains(&code),
-                "DelegationError code {} is outside the reserved range",
-                code
+                "DelegationError code {code} is outside the reserved range"
             );
         }
     }
