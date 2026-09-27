@@ -2,8 +2,6 @@
 // enabled during testing so dev-dependencies and test assertions operate normally.
 // This exact conditional form must be consistent across all workspace contract crates.
 #![cfg_attr(not(test), no_std)]
-
-#![no_std]
 #![warn(missing_docs)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
@@ -497,10 +495,14 @@ impl DelegationRegistry {
         Ok(true)
     }
 
-    /// Rolls a delegation back to a previous version.
     const MAX_PAGE_LIMIT: u32 = 100;
 
-    pub fn get_delegations_by_owner_paginated(
+    /// Returns a page of the delegations owned by `owner`.
+    ///
+    /// `offset` is clamped to the number of delegations the owner has and
+    /// `limit` is clamped to MAX_PAGE_LIMIT. `next_offset` is `None` once the
+    /// final page has been returned.
+    pub fn get_delegations_by_owner_paged(
         env: Env,
         owner: Address,
         offset: u32,
@@ -511,9 +513,11 @@ impl DelegationRegistry {
             .persistent()
             .get(&DataKey::UserDelegations(owner))
             .unwrap_or(Vec::new(&env));
+
         let total = user_dels.len() as u32;
         let limit = limit.min(Self::MAX_PAGE_LIMIT);
         let offset = offset.min(total);
+
         let mut items = Vec::new(&env);
         let start = offset;
         let end = offset.saturating_add(limit).min(total);
@@ -529,33 +533,105 @@ impl DelegationRegistry {
             }
             i += 1;
         }
+
         let next_offset = if end < total { Some(end) } else { None };
         DelegationPage {
             items,
             total,
             next_offset,
+        }
     }
-    pub fn get_delegation_history_paginated(
+
+    /// Returns a page of the version history for `delegation_id`.
+    ///
+    /// `offset` is clamped to the history length and `limit` is clamped to
+    /// MAX_PAGE_LIMIT; `next_offset` is `None` on the final page.
+    pub fn get_delegation_history_paged(
+        env: Env,
         delegation_id: u64,
+        offset: u32,
+        limit: u32,
+    ) -> DelegationPage {
         let history: Vec<DelegationSnapshot> = env
+            .storage()
+            .persistent()
             .get(&DataKey::DelegationHistory(delegation_id))
+            .unwrap_or(Vec::new(&env));
+
         let total = history.len() as u32;
+        let limit = limit.min(Self::MAX_PAGE_LIMIT);
+        let offset = offset.min(total);
+
+        let mut items = Vec::new(&env);
+        let start = offset;
+        let end = offset.saturating_add(limit).min(total);
+        let mut i = start;
+        while i < end {
             let snapshot = history.get(i).unwrap();
             items.push_back(snapshot.record);
-    pub fn get_expired_delegations_paginated(
+            i += 1;
+        }
+
+        let next_offset = if end < total { Some(end) } else { None };
+        DelegationPage {
+            items,
+            total,
+            next_offset,
+        }
+    }
+
+    /// Returns a page of every delegation currently in `Expired` status.
+    ///
+    /// Walks the `1..NextId` id range, collects records whose stored status is
+    /// `Expired`, then pages the result. `next_offset` is `None` on the final
+    /// page.
+    pub fn get_expired_delegations_paged(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> DelegationPage {
         let next_id: u64 = env
+            .storage()
             .instance()
             .get(&DataKey::NextId)
             .unwrap_or(1);
         let mut expired = Vec::new(&env);
         let mut id = 1u64;
         while id < next_id {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, DelegationRecord>(&DataKey::Delegation(id))
+            {
                 if record.status == DelegationStatus::Expired {
                     expired.push_back(record);
                 }
+            }
             id += 1;
+        }
+
         let total = expired.len() as u32;
+        let limit = limit.min(Self::MAX_PAGE_LIMIT);
+        let offset = offset.min(total);
+
+        let mut items = Vec::new(&env);
+        let start = offset;
+        let end = offset.saturating_add(limit).min(total);
+        let mut i = start;
+        while i < end {
             items.push_back(expired.get(i).unwrap());
+            i += 1;
+        }
+
+        let next_offset = if end < total { Some(end) } else { None };
+        DelegationPage {
+            items,
+            total,
+            next_offset,
+        }
+    }
+
+    /// Rolls a delegation back to a previous version.
     pub fn rollback_delegation(
         env: Env,
         delegation_id: u64,
@@ -601,6 +677,8 @@ impl DelegationRegistry {
 
         if snapshot.record.permissions_contract != record.permissions_contract {
             return Err(DelegationError::InvalidVersion);
+        }
+
         // Reject rollback to a snapshot whose delegation was already expired —
         // reviving an expired delegation via rollback must never be allowed.
         if snapshot.record.status == DelegationStatus::Expired {
@@ -703,6 +781,28 @@ impl DelegationRegistry {
             }
         }
         records
+    }
+
+    /// Returns every delegation owned by `owner` whose stored status is
+    /// `Active` and whose `expires_at_ledger` has not yet been reached.
+    ///
+    /// Paused, revoked, and expired delegations are excluded, and so are
+    /// still-`Active` records whose expiry has already passed but which have
+    /// not been swept yet. The result therefore matches the set of
+    /// delegations that `is_authorized` treats as live, so clients can
+    /// enumerate usable delegations without fetching and filtering every
+    /// record themselves.
+    pub fn get_active_delegations(env: Env, owner: Address) -> Vec<DelegationRecord> {
+        let current_ledger = env.ledger().sequence();
+        let mut active = Vec::new(&env);
+        for record in Self::get_delegations_by_owner(env, owner).iter() {
+            if record.status == DelegationStatus::Active
+                && current_ledger < record.expires_at_ledger
+            {
+                active.push_back(record.clone());
+            }
+        }
+        active
     }
 
     /// Returns whether the given agent is authorized for a delegation.
