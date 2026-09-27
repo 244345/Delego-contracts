@@ -398,6 +398,11 @@ impl DelegationRegistry {
     }
 
     /// Resumes a paused delegation.
+    ///
+    /// The expiry check runs before any state is written: when the delegation has
+    /// passed its `expires_at_ledger` the call returns `DelegationError::Expired`
+    /// and the stored record is left exactly as it was (still `Paused`).
+    /// Persisting the `Paused -> Expired` transition is `sweep_expired`'s job.
     pub fn resume_delegation(env: Env, delegation_id: u64) -> Result<bool, DelegationError> {
         let mut record: DelegationRecord = env
             .storage()
@@ -411,25 +416,8 @@ impl DelegationRegistry {
             return Err(DelegationError::NotPaused);
         }
 
+        // Fail fast: no version bump, no snapshot and no event when the call errors.
         if env.ledger().sequence() >= record.expires_at_ledger {
-            record.status = DelegationStatus::Expired;
-            record.version = Self::increment_version(&env, delegation_id);
-            record.updated_at = env.ledger().timestamp();
-            env.storage()
-                .persistent()
-                .set(&DataKey::Delegation(delegation_id), &record);
-            Self::store_snapshot(&env, delegation_id, &record);
-
-            env.events().publish(
-                (symbol_short!("deleg"), symbol_short!("expired")),
-                DelegationExpiredEvent {
-                    delegation_id,
-                    owner: record.owner.clone(),
-                    agent: record.agent_id.clone(),
-                    timestamp: env.ledger().timestamp(),
-                },
-            );
-
             return Err(DelegationError::Expired);
         }
 

@@ -871,3 +871,75 @@ fn test_get_expired_delegations_paged_paginates() {
     let page = client.get_expired_delegations_paged(&owner, &0u32, &(MAX_PAGE_LIMIT + 1));
     let next = client.get_expired_delegations_paged(&owner, &MAX_PAGE_LIMIT, &MAX_PAGE_LIMIT);
 }
+
+// ── #2 resume_delegation: expiry is validated before any mutation ────────────
+
+#[test]
+fn test_resume_expired_returns_error_and_leaves_state_untouched() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "Agent_RE");
+    // Created at ledger 100 with ttl 100 => expires at ledger 200.
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+    client.pause_delegation(&id);
+
+    let before = client.get_delegation(&id);
+    let version_before = client.get_delegation_version(&id);
+    let history_before = client.get_delegation_history(&id).len();
+    assert_eq!(before.status, DelegationStatus::Paused);
+
+    env.ledger().set_sequence_number(200);
+    let result = client.try_resume_delegation(&id);
+    assert_eq!(result, Err(Ok(DelegationError::Expired)));
+
+    // The failed call must not have written an expiry transition.
+    let after = client.get_delegation(&id);
+    assert_eq!(after.status, DelegationStatus::Paused);
+    assert_eq!(after.version, before.version);
+    assert_eq!(after.updated_at, before.updated_at);
+    assert_eq!(client.get_delegation_version(&id), version_before);
+    assert_eq!(client.get_delegation_history(&id).len(), history_before);
+}
+
+#[test]
+fn test_resume_expired_emits_no_expired_event() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "Agent_RE_EVT");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+    client.pause_delegation(&id);
+
+    env.ledger().set_sequence_number(200);
+    let _ = client.try_resume_delegation(&id);
+
+    let events = env.events().all();
+    let emitted_expired = events.iter().any(|(_, topics, _)| {
+        let t: soroban_sdk::Vec<soroban_sdk::Val> = topics;
+        t.len() >= 2
+            && Symbol::try_from_val(&env, &t.get(0).unwrap()).ok() == Some(symbol_short!("deleg"))
+            && Symbol::try_from_val(&env, &t.get(1).unwrap()).ok() == Some(symbol_short!("expired"))
+    });
+    assert!(!emitted_expired, "failed resume must not emit a deleg/expired event");
+}
+
+#[test]
+fn test_resume_paused_before_expiry_still_succeeds() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "Agent_ROK");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    client.pause_delegation(&id);
+
+    // Still one ledger inside the window: the pause is resumable.
+    env.ledger().set_sequence_number(1099);
+    assert!(client.resume_delegation(&id));
+    let record = client.get_delegation(&id);
+    assert_eq!(record.status, DelegationStatus::Active);
+    assert!(client.is_authorized(&id, &agent_id));
+}
