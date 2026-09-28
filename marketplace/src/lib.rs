@@ -40,6 +40,10 @@ pub struct Merchant {
     pub image_url: String,
     pub commission_rate_bps: u32,
     pub metadata: Option<String>,
+    /// Off-chain metadata URI (IPFS CIDv1 or HTTPS). Capped at
+    /// [`MAX_METADATA_URI_LEN`] bytes; `None` when not supplied at
+    /// registration time.
+    pub metadata_uri: Option<String>,
     pub status: MerchantStatus,
     pub verified: bool,
     pub created_at: u64,
@@ -135,6 +139,11 @@ pub struct RegisterParams {
     pub category: Symbol,
     pub image_url: String,
     pub metadata: Option<String>,
+    /// Optional URI pointing to off-chain merchant metadata (IPFS CID or HTTPS
+    /// URL). Stored as a `soroban_sdk::String` and capped at
+    /// [`MAX_METADATA_URI_LEN`] bytes to support both IPFS base58/base32 CIDv1
+    /// strings and HTTPS URIs without an arbitrary 32-byte truncation.
+    pub metadata_uri: Option<String>,
     pub required_verifications: u32,
 }
 
@@ -212,6 +221,8 @@ pub enum MarketplaceError {
     VerificationCountOverflow = 4017,
     DuplicateMerchantOwner = 4018,
     MerchantBanned = 4019,
+    /// `metadata_uri` field exceeds [`MAX_METADATA_URI_LEN`] bytes.
+    MetadataUriTooLong = 4020,
 }
 
 // --- Events ---
@@ -474,6 +485,13 @@ pub const MAX_NAME_LEN: u32 = 64;
 pub const MAX_DESCRIPTION_LEN: u32 = 512;
 pub const MAX_IMAGE_URL_LEN: u32 = 256;
 pub const MAX_METADATA_LEN: u32 = 1024;
+/// Maximum byte length for a `metadata_uri` value.
+///
+/// IPFS CIDv1 base58/base32 strings are at most ~60 bytes; HTTPS URIs
+/// pointing to off-chain metadata rarely exceed 128 bytes in practice.
+/// Keeping this cap tight prevents unbounded storage growth while still
+/// accommodating real-world IPFS and HTTPS URIs.
+pub const MAX_METADATA_URI_LEN: u32 = 128;
 
 // Largest of the caps above; used to size the stack buffer that string
 // normalization copies host bytes into. `#![no_std]` without the `alloc`
@@ -639,6 +657,7 @@ impl MarketplaceContract {
             image_url: params.image_url,
             commission_rate_bps: 0,
             metadata: params.metadata.clone(),
+            metadata_uri: params.metadata_uri.clone(),
             status: MerchantStatus::Registered,
             verified: false,
             created_at: now,
@@ -2432,12 +2451,26 @@ impl MarketplaceContract {
             None => None,
         };
 
+        // Validate metadata_uri length. We store it verbatim (no whitespace
+        // trimming — URIs must not be altered) but reject anything that
+        // exceeds MAX_METADATA_URI_LEN bytes to prevent storage bloat.
+        let metadata_uri = match &p.metadata_uri {
+            Some(uri) => {
+                if uri.len() > MAX_METADATA_URI_LEN {
+                    return Err(MarketplaceError::MetadataUriTooLong);
+                }
+                Some(uri.clone())
+            }
+            None => None,
+        };
+
         Ok(RegisterParams {
             name,
             description,
             category: p.category.clone(),
             image_url,
             metadata,
+            metadata_uri,
             required_verifications: p.required_verifications,
         })
     }
@@ -2466,6 +2499,7 @@ mod overflow_tests {
             category: symbol_short!("cate"),
             image_url: String::from_str(&env, "https://example.com/image.png"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         };
 
@@ -2650,6 +2684,7 @@ mod merchant_operational_view_tests {
             category: Symbol::new(&env, "general"),
             image_url: String::from_slice(&env, b"https://example.com/img.png"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         };
         let id = client.register_merchant(&owner, &params).unwrap();

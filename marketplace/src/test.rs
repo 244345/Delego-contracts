@@ -103,6 +103,7 @@ fn test_register_merchant_happy_path() {
         category: symbol_short!("tools"),
         image_url: String::from_str(&f.env, "https://cdn.example.com/logo.png"),
         metadata: Some(String::from_str(&f.env, "ipfs://Qm123")),
+        metadata_uri: None,
         required_verifications: 1,
     };
 
@@ -139,6 +140,7 @@ fn test_merchant_operational_view_combinations() {
             category: symbol_short!("tech"),
             image_url: String::from_str(&f.env, "url"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -168,6 +170,7 @@ fn test_merchant_operational_view_combinations() {
             category: symbol_short!("tech"),
             image_url: String::from_str(&f.env, "url"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -194,6 +197,7 @@ fn test_merchant_operational_view_combinations() {
             category: symbol_short!("tech"),
             image_url: String::from_str(&f.env, "url"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -213,6 +217,7 @@ fn test_merchant_operational_view_combinations() {
             category: symbol_short!("tech"),
             image_url: String::from_str(&f.env, "url"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -233,6 +238,7 @@ fn test_merchant_operational_view_combinations() {
             category: symbol_short!("tech"),
             image_url: String::from_str(&f.env, "url"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -254,6 +260,7 @@ fn test_register_merchant_event_schema() {
         category: symbol_short!("retail"),
         image_url: String::from_str(&f.env, "https://example.com/schema.png"),
         metadata: None,
+        metadata_uri: None,
         required_verifications: 1,
     };
 
@@ -289,6 +296,7 @@ fn test_register_merchant_duplicate_name_and_invalid_param() {
         category: symbol_short!("retail"),
         image_url: String::from_str(&f.env, "https://cdn.example.com/1.png"),
         metadata: None,
+        metadata_uri: None,
         required_verifications: 1,
     };
 
@@ -302,6 +310,7 @@ fn test_register_merchant_duplicate_name_and_invalid_param() {
         category: symbol_short!("retail"),
         image_url: String::from_str(&f.env, "https://cdn.example.com/2.png"),
         metadata: None,
+        metadata_uri: None,
         required_verifications: 1,
     };
 
@@ -318,6 +327,7 @@ fn test_register_merchant_duplicate_name_and_invalid_param() {
         category: symbol_short!("retail"),
         image_url: String::from_str(&f.env, ""),
         metadata: None,
+        metadata_uri: None,
         required_verifications: 1,
     };
 
@@ -334,6 +344,7 @@ fn test_register_merchant_duplicate_name_and_invalid_param() {
         category: symbol_short!("retail"),
         image_url: String::from_str(&f.env, ""),
         metadata: None,
+        metadata_uri: None,
         required_verifications: 1,
     };
 
@@ -350,6 +361,7 @@ fn test_register_merchant_duplicate_name_and_invalid_param() {
         category: symbol_short!("retail"),
         image_url: String::from_str(&f.env, ""),
         metadata: None,
+        metadata_uri: None,
         required_verifications: 1,
     };
 
@@ -366,6 +378,7 @@ fn test_register_merchant_duplicate_name_and_invalid_param() {
         category: symbol_short!("retail"),
         image_url: String::from_str(&f.env, ""),
         metadata: None,
+        metadata_uri: None,
         required_verifications: 1,
     };
 
@@ -390,6 +403,7 @@ fn test_update_merchant_profile() {
             category: symbol_short!("goods"),
             image_url: String::from_str(&f.env, "old.png"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -495,6 +509,7 @@ fn test_update_metadata_cooldown_and_admin_override() {
             category: symbol_short!("goods"),
             image_url: String::from_str(&f.env, "logo.png"),
             metadata: Some(String::from_str(&f.env, "ipfs://v1")),
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -551,6 +566,7 @@ fn test_update_metadata_change_detection_noop() {
             category: symbol_short!("goods"),
             image_url: String::from_str(&f.env, "logo.png"),
             metadata: initial_metadata.clone(),
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -589,6 +605,7 @@ fn test_update_metadata_change_detection_with_change() {
             category: symbol_short!("goods"),
             image_url: String::from_str(&f.env, "logo.png"),
             metadata: initial_metadata.clone(),
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -627,6 +644,7 @@ fn test_update_metadata_noop_with_none_values() {
             category: symbol_short!("goods"),
             image_url: String::from_str(&f.env, "logo.png"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -662,6 +680,7 @@ fn test_update_metadata_change_from_none_to_value() {
             category: symbol_short!("goods"),
             image_url: String::from_str(&f.env, "logo.png"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -698,6 +717,7 @@ fn test_update_metadata_change_from_value_to_none() {
             category: symbol_short!("goods"),
             image_url: String::from_str(&f.env, "logo.png"),
             metadata: initial_metadata.clone(),
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -810,6 +830,7 @@ fn test_multi_verifier_verification_and_revocation() {
             category: symbol_short!("tech"),
             image_url: String::from_str(&f.env, "tech.png"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 2,
         },
     );
@@ -874,6 +895,7 @@ fn test_verify_merchant_verified_count_overflow() {
             category: symbol_short!("goods"),
             image_url: String::from_str(&f.env, "img.png"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -906,6 +928,7 @@ fn test_commission_rate_configuration() {
             category: symbol_short!("goods"),
             image_url: String::from_str(&f.env, "img.png"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -947,6 +970,7 @@ fn test_merchant_stats_lifecycle() {
             category: symbol_short!("food"),
             image_url: String::from_str(&f.env, "alpha.png"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -958,6 +982,7 @@ fn test_merchant_stats_lifecycle() {
             category: symbol_short!("goods"),
             image_url: String::from_str(&f.env, "beta.png"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -1029,6 +1054,7 @@ fn test_suspension_closing_and_mutation_locking() {
             category: symbol_short!("food"),
             image_url: String::from_str(&f.env, "food.png"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -1120,6 +1146,7 @@ fn test_risk_oracle_freezes_trading_and_bans_are_permanent() {
             category: symbol_short!("food"),
             image_url: String::from_str(&f.env, "food.png"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -1164,6 +1191,7 @@ fn test_merchant_owner_can_register_only_one_open_profile() {
         category: symbol_short!("food"),
         image_url: String::from_str(&f.env, "food.png"),
         metadata: None,
+        metadata_uri: None,
         required_verifications: 1,
     };
     f.client.register_merchant(&owner, &params("Store One"));
@@ -1183,6 +1211,7 @@ fn test_paginated_discovery_cost_stays_within_thresholds() {
         category: symbol_short!("tech"),
         image_url: String::from_str(&f.env, "url"),
         metadata: None,
+        metadata_uri: None,
         required_verifications: 1,
     });
     let _ = f.client.get_merchants(&0, &10);
@@ -1217,6 +1246,7 @@ fn test_paginated_discovery() {
                 category,
                 image_url: String::from_str(&f.env, "url"),
                 metadata: None,
+                metadata_uri: None,
                 required_verifications: 1,
             },
         );
@@ -1289,6 +1319,7 @@ fn test_status_filtered_discovery() {
             category: symbol_short!("tech"),
             image_url: String::from_str(&f.env, "url"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -1301,6 +1332,7 @@ fn test_status_filtered_discovery() {
             category: symbol_short!("tech"),
             image_url: String::from_str(&f.env, "url"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -1313,6 +1345,7 @@ fn test_status_filtered_discovery() {
             category: symbol_short!("tech"),
             image_url: String::from_str(&f.env, "url"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -1325,6 +1358,7 @@ fn test_status_filtered_discovery() {
             category: symbol_short!("tech"),
             image_url: String::from_str(&f.env, "url"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -1410,6 +1444,7 @@ fn test_merchant_state_ttl_survives_repeated_reads() {
             category: symbol_short!("goods"),
             image_url: String::from_str(&f.env, "img.png"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -1481,6 +1516,7 @@ fn test_status_filtered_discovery_by_category() {
             category: symbol_short!("tech"),
             image_url: String::from_str(&f.env, "url"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -1493,6 +1529,7 @@ fn test_status_filtered_discovery_by_category() {
             category: symbol_short!("tech"),
             image_url: String::from_str(&f.env, "url"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -1505,6 +1542,7 @@ fn test_status_filtered_discovery_by_category() {
             category: symbol_short!("tech"),
             image_url: String::from_str(&f.env, "url"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -1517,6 +1555,7 @@ fn test_status_filtered_discovery_by_category() {
             category: symbol_short!("tech"),
             image_url: String::from_str(&f.env, "url"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -1595,6 +1634,7 @@ fn test_discovery_page_cursor_fields() {
                 category: symbol_short!("tech"),
                 image_url: String::from_str(&f.env, "url"),
                 metadata: None,
+                metadata_uri: None,
                 required_verifications: 1,
             },
         );
@@ -1865,6 +1905,7 @@ fn test_reputation_score_injection_with_contract() {
             category: symbol_short!("services"),
             image_url: String::from_str(&f.env, "url"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -1915,6 +1956,7 @@ fn test_reputation_resolution_states() {
             category: symbol_short!("test"),
             image_url: String::from_str(&f.env, "url"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -2012,6 +2054,7 @@ fn test_flight_merchant_lifecycle_and_discovery() {
             category: symbol_short!("crafts"),
             image_url: String::from_str(&f.env, "https://example.com/artisan.png"),
             metadata: Some(String::from_str(&f.env, "ipfs://bafybeicraft")),
+            metadata_uri: None,
             required_verifications: 2,
         },
     );
@@ -2077,6 +2120,7 @@ fn test_cursor_discovery_pagination() {
                 category: symbol_short!("tech"),
                 image_url: String::from_str(&f.env, "url"),
                 metadata: None,
+                metadata_uri: None,
                 required_verifications: 1,
             },
         );
@@ -2144,6 +2188,7 @@ fn test_update_merchant_profile_category_reindex() {
             description: String::from_str(&f.env, "Sells gadgets"),
             image_url: String::from_str(&f.env, "tech.png"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -2216,6 +2261,7 @@ fn test_category_reindex_shrinks_old_vec_correctly() {
             name: String::from_str(&f.env, "Tech A"),
             image_url: String::from_str(&f.env, "a.png"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -2645,12 +2691,14 @@ fn test_category_backward_compatibility_unnormalized_mixed_case_raw_index() {
             name: String::from_str(&f.env, "Tech B"),
             image_url: String::from_str(&f.env, "b.png"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
             name: String::from_str(&f.env, "Tech C"),
             image_url: String::from_str(&f.env, "c.png"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -2815,6 +2863,7 @@ fn test_update_merchant_profile_trims_and_bounds() {
             description: String::from_str(&f.env, "Old Desc"),
             image_url: String::from_str(&f.env, "old.png"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
     );
@@ -2856,6 +2905,7 @@ fn test_category_change_unauthorized() {
             category: symbol_short!("tech"),
             image_url: String::from_str(&f.env, "t.png"),
             metadata: None,
+            metadata_uri: None,
             required_verifications: 1,
         },
         &stranger,
