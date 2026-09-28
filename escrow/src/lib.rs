@@ -22,7 +22,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
-    InvokeError, Symbol, Vec,
+    InvokeError, Map, Symbol, Vec,
 };
 
 /// Lifecycle state of an escrow.
@@ -475,6 +475,22 @@ pub struct BatchDepositParams {
     pub schema: Option<Symbol>,
 }
 
+/// One item for an atomic batch of funded escrows.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchEscrowItem {
+    /// Seller receiving the funds after release.
+    pub seller: Address,
+    /// Whitelisted token to escrow.
+    pub token: Address,
+    /// Positive amount to escrow.
+    pub amount: i128,
+    /// Unique order identifier.
+    pub order_id: BytesN<32>,
+    /// Absolute ledger sequence when the escrow timeout expires.
+    pub timeout_ledger: u32,
+}
+
 /// One escrow's release request for `batch_release` (issue #317).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -821,6 +837,8 @@ pub enum EscrowError {
     InvalidMerkleProof = 402,
     /// A daily delivery Merkle root has already been published.
     MerkleRootAlreadyPublished = 403,
+    /// A batch contains more items than the bounded batch limit.
+    BatchLimitExceeded = 404,
 }
 
 /// Compact receipt returned to buyers after escrow creation via `get_receipt`.
@@ -2581,6 +2599,97 @@ impl EscrowContract {
                 order.schema,
             )?;
             escrow_ids.push_back(escrow_id);
+        }
+        Ok(escrow_ids)
+    }
+
+    /// Atomically create and fund multiple escrows for one buyer.
+    ///
+    /// The buyer approves this contract to spend the aggregate amount for
+    /// each token. Each token is pulled once with `transfer_from`, reducing
+    /// repeated transfer overhead. Any invalid item or failed allowance
+    /// reverts the complete batch. Timeouts in `items` are absolute ledger
+    /// sequence numbers.
+    pub fn batch_create_escrows(
+        env: Env,
+        buyer: Address,
+        items: Vec<BatchEscrowItem>,
+    ) -> Result<Vec<u64>, EscrowError> {
+        if is_zero_address(&env, &buyer) {
+            return Err(EscrowError::InvalidAddress);
+        }
+        if items.len() > MAX_PAGE_LIMIT {
+            return Err(EscrowError::BatchLimitExceeded);
+        }
+        buyer.require_auth();
+
+        let current_ledger = env.ledger().sequence();
+        let mut token_totals: Map<Address, i128> = Map::new(&env);
+        for item in items.iter() {
+            if is_zero_address(&env, &item.seller) || is_zero_address(&env, &item.token) {
+                return Err(EscrowError::InvalidAddress);
+            }
+            if buyer == item.seller {
+                return Err(EscrowError::InvalidEscrowParticipants);
+            }
+            item.timeout_ledger
+                .checked_sub(current_ledger)
+                .ok_or(EscrowError::InvalidExtension)?;
+            if item.amount <= 0 {
+                return Err(EscrowError::InvalidAmount);
+            }
+            let aggregate = token_totals.get(item.token.clone()).unwrap_or(0i128);
+            token_totals.set(
+                item.token,
+                aggregate
+                    .checked_add(item.amount)
+                    .ok_or(EscrowError::InvalidAmount)?,
+            );
+        }
+
+        let mut escrow_ids = Vec::new(&env);
+        for item in items.iter() {
+            let timeout_ledgers = item
+                .timeout_ledger
+                .checked_sub(current_ledger)
+                .ok_or(EscrowError::InvalidExtension)?;
+            let escrow_id = Self::create_internal(
+                env.clone(),
+                buyer.clone(),
+                item.seller,
+                item.token,
+                item.amount,
+                item.order_id,
+                timeout_ledgers,
+                None,
+                None,
+            )?;
+            let key = DataKey::Escrow(escrow_id);
+            let mut record: EscrowRecord = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .ok_or(EscrowError::NotFound)?;
+            record.status = EscrowStatus::Funded;
+            record.updated_at = env.ledger().timestamp();
+            env.storage().persistent().set(&key, &record);
+            env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+            escrow_ids.push_back(escrow_id);
+        }
+
+        let contract_address = env.current_contract_address();
+        for (token, amount) in token_totals.iter() {
+            let token_client = soroban_sdk::token::Client::new(&env, &token);
+            token_client.transfer_from(
+                &contract_address,
+                &buyer,
+                &contract_address,
+                &amount,
+            );
         }
         Ok(escrow_ids)
     }
@@ -4448,6 +4557,91 @@ mod merkle_delivery_tests {
             Err(Ok(EscrowError::InvalidMerkleProof))
         );
         assert_eq!(client.get_escrow(&escrow_id).status, EscrowStatus::Funded);
+    }
+
+    #[test]
+    fn batch_escrows_pull_aggregated_token_allowance_once() {
+        let env = Env::default();
+        let (client, _admin, buyer, seller, token, contract_id) = setup(&env);
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        let timeout = env.ledger().sequence() + 500;
+        token_client.approve(&buyer, &contract_id, &2_500, &(timeout + 100));
+        let items = Vec::from_array(
+            &env,
+            [
+                BatchEscrowItem {
+                    seller: seller.clone(),
+                    token: token.clone(),
+                    amount: 1_000,
+                    order_id: BytesN::from_array(&env, &[31; 32]),
+                    timeout_ledger: timeout,
+                },
+                BatchEscrowItem {
+                    seller,
+                    token: token.clone(),
+                    amount: 1_500,
+                    order_id: BytesN::from_array(&env, &[32; 32]),
+                    timeout_ledger: timeout,
+                },
+            ],
+        );
+
+        let ids = client.batch_create_escrows(&buyer, &items);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(token_client.balance(&buyer), 7_500);
+        assert_eq!(token_client.balance(&contract_id), 2_500);
+        assert_eq!(
+            client.get_escrow(&ids.get(0).unwrap()).timeout_ledger,
+            timeout
+        );
+        assert_eq!(
+            client.get_escrow(&ids.get(1).unwrap()).status,
+            EscrowStatus::Funded
+        );
+    }
+
+    #[test]
+    fn batch_escrow_allowance_failure_reverts_all_items() {
+        let env = Env::default();
+        let (client, admin, buyer, seller, token, contract_id) = setup(&env);
+        let token_admin = Address::generate(&env);
+        let second_token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let second_admin = soroban_sdk::token::StellarAssetClient::new(&env, &second_token);
+        second_admin.mint(&buyer, &10_000);
+        client.add_token(&admin, &second_token);
+
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        let second_client = soroban_sdk::token::Client::new(&env, &second_token);
+        let timeout = env.ledger().sequence() + 500;
+        token_client.approve(&buyer, &contract_id, &1_000, &(timeout + 100));
+        let items = Vec::from_array(
+            &env,
+            [
+                BatchEscrowItem {
+                    seller: seller.clone(),
+                    token: token.clone(),
+                    amount: 1_000,
+                    order_id: BytesN::from_array(&env, &[41; 32]),
+                    timeout_ledger: timeout,
+                },
+                BatchEscrowItem {
+                    seller,
+                    token: second_token.clone(),
+                    amount: 1_000,
+                    order_id: BytesN::from_array(&env, &[42; 32]),
+                    timeout_ledger: timeout,
+                },
+            ],
+        );
+
+        assert!(client.try_batch_create_escrows(&buyer, &items).is_err());
+        assert!(client.try_get_escrow(&1).is_err());
+        assert_eq!(token_client.balance(&buyer), 10_000);
+        assert_eq!(second_client.balance(&buyer), 10_000);
+        assert_eq!(token_client.balance(&contract_id), 0);
+        assert_eq!(second_client.balance(&contract_id), 0);
     }
 }
 

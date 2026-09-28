@@ -21,6 +21,7 @@ will reject the change.
 ### Unreleased
 
 - Add immutable daily delivery Merkle roots and order-bound inclusion-proof escrow release.
+- Add atomic batch escrow creation with per-token aggregate allowance transfers.
 
 ### 0.2.0 - 2026-08-29
 

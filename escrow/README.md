@@ -12,6 +12,7 @@ Soroban smart contract for holding purchase funds until fulfillment.
 | `fund` | buyer | Fund an existing `Created` escrow |
 | `cancel` | seller (merchant) | Cancel an unfunded `Created` escrow |
 | `deposit` | buyer | Lock buyer funds for an order (convenience `create` + `fund`) |
+| `batch_create_escrows` | buyer | Atomically create and fund up to 50 orders with aggregated token allowances |
 | `release` | buyer / admin | Transfer full remaining balance to seller |
 | `publish_merkle_root` | admin / co-admin | Anchor an immutable daily delivery Merkle root |
 | `release_with_merkle_proof` | buyer | Release funds after proving delivery inclusion |
@@ -174,6 +175,14 @@ leaf's zero-based position, and `proof` lists siblings from leaf level to root.
 A buyer can release a funded escrow with
 `release_with_merkle_proof(escrow_id, buyer, date, proof)` only when the proof
 matches both the published root and that escrow's order ID.
+
+## Batch escrow creation
+
+`batch_create_escrows(buyer, items)` accepts `BatchEscrowItem` values with an
+absolute `timeout_ledger`. The buyer must approve the escrow contract for the
+sum of each token's amounts; the contract makes one `transfer_from` call per
+distinct token. Batches are limited to 50 entries, and any validation or
+allowance failure reverts all created records and transfers.
 
 ## Development
 
