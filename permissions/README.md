@@ -32,6 +32,7 @@ pause/resume, and permission transfers.
 | `pause_grants` | admin | Pause all new grants |
 | `sweep_expired` / `sweep_expired_batch` | any | Sweep expired permissions into Expired status (single or bounded batch) |
 | `sweep_inactive` / `sweep_inactive_batch` | any | Auto-revoke inactive permissions idle past threshold (single or bounded batch) |
+| `get_audit_log_page` | — | Read up to 20 retained audit entries using a zero-based cursor |
 
 ## Events
 
@@ -63,3 +64,8 @@ cargo build --target wasm32-unknown-unknown --release
 > TypeScript types mirroring the on-chain records (e.g. the `PermissionGrant`
 > interface) ship in [`@delegolabs/types`](https://github.com/DelegoLabs/Delego-backend),
 > published from the Delego-backend repository.
+
+Audit entries are stored under individual indexed persistent keys in a
+200-entry ring buffer. `get_audit_log_page(owner, delegate, cursor)` returns
+`AuditTrailPage`; follow `next_cursor` until it is `None`. Queries deserialize
+at most 20 entries rather than the full trail.
