@@ -22,6 +22,7 @@ will reject the change.
 
 - Add immutable daily delivery Merkle roots and order-bound inclusion-proof escrow release.
 - Add atomic batch escrow creation with per-token aggregate allowance transfers.
+- Add admin split dispute settlements with buyer, seller, and mediator payouts.
 
 ### 0.2.0 - 2026-08-29
 

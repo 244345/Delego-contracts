@@ -282,6 +282,38 @@ pub struct MerkleDeliveryProof {
     pub index: u32,
 }
 
+/// Amounts and mediator recipient for a split dispute settlement.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeResolutionAward {
+    /// Amount returned to the buyer.
+    pub buyer_amount: i128,
+    /// Amount paid to the seller.
+    pub seller_amount: i128,
+    /// Mediator's fee.
+    pub mediator_fee: i128,
+    /// Recipient of the mediator fee.
+    pub mediator_address: Address,
+}
+
+/// Emitted after a disputed escrow is paid to the buyer, seller, and mediator.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct DisputeResolvedEvent {
+    /// Unique identifier for the escrow.
+    pub escrow_id: u64,
+    /// Amount returned to the buyer.
+    pub buyer_amount: i128,
+    /// Amount paid to the seller.
+    pub seller_amount: i128,
+    /// Mediator's fee.
+    pub mediator_fee: i128,
+    /// Recipient of the mediator's fee.
+    pub mediator_address: Address,
+    /// Admin that resolved the dispute.
+    pub resolved_by: Address,
+}
+
 /// Emitted on each arbiter vote during dispute resolution (#32).
 ///
 /// Reports live tallies so indexers and UIs can track quorum progress
@@ -839,6 +871,8 @@ pub enum EscrowError {
     MerkleRootAlreadyPublished = 403,
     /// A batch contains more items than the bounded batch limit.
     BatchLimitExceeded = 404,
+    /// Dispute award amounts are negative or do not sum to the escrow balance.
+    InvalidDisputeAward = 405,
 }
 
 /// Compact receipt returned to buyers after escrow creation via `get_receipt`.
@@ -1036,20 +1070,15 @@ pub struct EscrowContract;
 #[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl EscrowContract {
-    /// Constructor: Initialize the escrow contract at deploy time with atomic admin + config setup.
-    ///
-    /// The host guarantees this function runs exactly once during contract deployment,
-    /// eliminating the front-run vulnerability where the first mempool caller could seize admin
-    /// by calling `initialize` without authentication.
-    ///
-    /// # Arguments
-    /// * `env` - The contract environment
-    /// * `config` - Complete [`EscrowConfig`] containing admin, fee parameters, and amount limits
-    ///
-    /// # Errors
-    /// Returns [`EscrowError::InvalidFeeBps`] if fee_bps > 1000.
-    /// Returns [`EscrowError::InvalidLimits`] if min_amount <= 0 or max_amount < min_amount.
-    /// Returns [`EscrowError::InvalidAddress`] if treasury is a zero address.
+    /// Soroban constructor: initialize the escrow contract at deployment time with
+    /// atomic admin + config setup. The host invokes this exactly once, so a later
+    /// post-deploy `initialize` call cannot front-run a real deployer.
+    pub fn __constructor(env: Env, config: EscrowConfig) -> Result<(), EscrowError> {
+        Self::constructor(env, config)
+    }
+
+    /// Compatibility helper for tests and explicit deploy flows that call the
+    /// function by name rather than via Soroban's auto-constructor path.
     pub fn constructor(env: Env, config: EscrowConfig) -> Result<(), EscrowError> {
         // Validate configuration
         if config.fee_bps > 1000 {
@@ -1426,6 +1455,9 @@ impl EscrowContract {
         record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
         env.storage().persistent().remove(&votes_key);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::TimeoutExtensionVotes(escrow_id));
 
         env.events().publish(
             (
@@ -1588,7 +1620,6 @@ impl EscrowContract {
 
         if shares.len() > MAX_TREASURIES {
             return Err(EscrowError::MaxTreasuriesExceeded);
-            return Err(EscrowError::InvalidFeeBps);
         }
 
         let mut total_bps: u32 = 0;
@@ -1978,7 +2009,7 @@ impl EscrowContract {
             return Err(EscrowError::InvalidStatus);
         }
 
-        let remaining = record.amount - record.released_amount;
+        let remaining = record.amount - record.released_amount - record.refunded_amount;
         if remaining <= 0 {
             return Err(EscrowError::ZeroAmount);
         }
@@ -2002,7 +2033,7 @@ impl EscrowContract {
             .ok_or(EscrowError::InsufficientPoolBalance)?;
         env.storage().instance().set(&pool_key, &pool);
 
-        record.released_amount = record.amount;
+        record.released_amount += remaining;
         record.status = EscrowStatus::Released;
         record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
@@ -2036,11 +2067,11 @@ impl EscrowContract {
             .ok_or(EscrowError::PoolNotFound)
     }
 
-    /// Publish an immutable delivery Merkle root for a UTC date.
+    /// Publish a delivery Merkle root for a UTC date.
     ///
     /// Only the primary admin or a co-admin may publish roots. Dates are
-    /// represented as Unix epoch days. A root cannot be replaced after it is
-    /// published, preventing previously accepted proofs from being revoked.
+    /// represented as Unix epoch days. A stored root cannot be replaced;
+    /// reads and proof submissions refresh its persistent-storage TTL.
     pub fn publish_merkle_root(
         env: Env,
         caller: Address,
@@ -2071,7 +2102,16 @@ impl EscrowContract {
 
     /// Return the published delivery root for a UTC epoch date, if present.
     pub fn get_merkle_root(env: Env, date: u64) -> Option<BytesN<32>> {
-        env.storage().persistent().get(&DataKey::MerkleRoot(date))
+        let key = DataKey::MerkleRoot(date);
+        let root = env.storage().persistent().get(&key);
+        if root.is_some() {
+            env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+        root
     }
 
     /// Verify a Merkle path against the root carried in `proof`.
@@ -2109,6 +2149,11 @@ impl EscrowContract {
         let published_root: Option<BytesN<32>> =
             env.storage().persistent().get(&DataKey::MerkleRoot(date));
         let published_root = published_root.ok_or(EscrowError::InvalidMerkleProof)?;
+        env.storage().persistent().extend_ttl(
+            &DataKey::MerkleRoot(date),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         let expected_leaf: BytesN<32> = env
             .crypto()
             .sha256(&Bytes::from_array(&env, &record.order_id.to_array()))
@@ -2126,7 +2171,7 @@ impl EscrowContract {
             &key,
             record.clone(),
             buyer,
-            record.amount - record.released_amount,
+            record.amount - record.released_amount - record.refunded_amount,
         )?;
         Ok(true)
     }
@@ -2746,7 +2791,7 @@ impl EscrowContract {
     }
 
     /// Release a partial amount to the seller.
-    /// `release_amount` must be <= (record.amount - record.released_amount).
+    /// `release_amount` must not exceed the balance after prior releases and refunds.
     /// If release_amount equals the remaining balance, set status to Released.
     /// The platform fee is deducted from `release_amount` (issue #27).
     pub fn partial_release(
@@ -2822,7 +2867,7 @@ impl EscrowContract {
             return Err(EscrowError::ZeroAmount);
         }
 
-        let remaining = record.amount - record.released_amount;
+        let remaining = record.amount - record.released_amount - record.refunded_amount;
         if release_amount > remaining {
             return Err(EscrowError::InsufficientEscrowBalance);
         }
@@ -2838,7 +2883,7 @@ impl EscrowContract {
         );
 
         record.released_amount += release_amount;
-        let new_remaining = record.amount - record.released_amount;
+        let new_remaining = record.amount - record.released_amount - record.refunded_amount;
         let fully_released = new_remaining == 0;
         if fully_released {
             record.status = EscrowStatus::Released;
@@ -2905,7 +2950,7 @@ impl EscrowContract {
             return Err(EscrowError::InvalidReleaseRecipient);
         }
 
-        let remaining = record.amount - record.released_amount;
+        let remaining = record.amount - record.released_amount - record.refunded_amount;
         Self::partial_release(env, escrow_id, caller, remaining)?;
         Ok(true)
     }
@@ -3133,7 +3178,7 @@ impl EscrowContract {
             return Err(EscrowError::ConditionNotMet);
         }
 
-        let remaining = record.amount - record.released_amount;
+        let remaining = record.amount - record.released_amount - record.refunded_amount;
         Self::execute_release(&env, escrow_id, &key, record, caller, remaining)
     }
 
@@ -3232,6 +3277,96 @@ impl EscrowContract {
             },
         );
 
+        Ok(true)
+    }
+
+    /// Resolve a disputed escrow with an exact buyer, seller, and mediator split.
+    ///
+    /// Only the admin may call. The award amounts must all be non-negative
+    /// and sum exactly to the escrow amount. This resolution bypasses the
+    /// ordinary release fee because the mediator fee is explicit in the award.
+    pub fn resolve_dispute_split(
+        env: Env,
+        escrow_id: u64,
+        caller: Address,
+        award: DisputeResolutionAward,
+    ) -> Result<bool, EscrowError> {
+        caller.require_auth();
+        if !Self::is_admin(env.clone(), caller.clone()) {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        let key = DataKey::Escrow(escrow_id);
+        let mut record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+        if record.status != EscrowStatus::Disputed {
+            return Err(EscrowError::NotDisputed);
+        }
+        if record.released_amount != 0 || record.refunded_amount != 0 {
+            return Err(EscrowError::InvalidDisputeAward);
+        }
+        if award.buyer_amount < 0 || award.seller_amount < 0 || award.mediator_fee < 0 {
+            return Err(EscrowError::InvalidDisputeAward);
+        }
+        let total_award = award
+            .buyer_amount
+            .checked_add(award.seller_amount)
+            .and_then(|total| total.checked_add(award.mediator_fee))
+            .ok_or(EscrowError::InvalidDisputeAward)?;
+        if total_award != record.amount
+            || (award.mediator_fee > 0 && is_zero_address(&env, &award.mediator_address))
+        {
+            return Err(EscrowError::InvalidDisputeAward);
+        }
+        let seller_and_mediator = award
+            .seller_amount
+            .checked_add(award.mediator_fee)
+            .ok_or(EscrowError::InvalidDisputeAward)?;
+
+        let token_client = soroban_sdk::token::Client::new(&env, &record.token);
+        let contract_address = env.current_contract_address();
+        if award.buyer_amount > 0 {
+            token_client.transfer(&contract_address, &record.buyer, &award.buyer_amount);
+        }
+        if award.seller_amount > 0 {
+            token_client.transfer(&contract_address, &record.seller, &award.seller_amount);
+        }
+        if award.mediator_fee > 0 {
+            token_client.transfer(
+                &contract_address,
+                &award.mediator_address,
+                &award.mediator_fee,
+            );
+        }
+
+        record.refunded_amount = award.buyer_amount;
+        record.released_amount = seller_and_mediator;
+        record.status = if seller_and_mediator == 0 {
+            EscrowStatus::Refunded
+        } else {
+            EscrowStatus::Released
+        };
+        record.updated_at = env.ledger().timestamp();
+        env.storage().persistent().set(&key, &record);
+
+        env.events().publish(
+            (
+                symbol_short!("escrow"),
+                symbol_short!("dispsplit"),
+                escrow_id,
+            ),
+            DisputeResolvedEvent {
+                escrow_id,
+                buyer_amount: award.buyer_amount,
+                seller_amount: award.seller_amount,
+                mediator_fee: award.mediator_fee,
+                mediator_address: award.mediator_address,
+                resolved_by: caller,
+            },
+        );
         Ok(true)
     }
 
@@ -3456,7 +3591,7 @@ impl EscrowContract {
         let snapshot_ledger = env.ledger().sequence();
         let (accrued, held_seconds) = Self::compute_yield(&record, yield_config.as_ref(), &env);
 
-        let remaining = record.amount - record.released_amount;
+        let remaining = record.amount - record.released_amount - record.refunded_amount;
 
         Ok(YieldView {
             escrow_id,
@@ -3802,16 +3937,24 @@ impl EscrowContract {
     /// `escrow_id`, or [`EscrowError::MetadataNotSet`] when the escrow
     /// exists but no metadata was stored.
     pub fn get_escrow_metadata(env: Env, escrow_id: u64) -> Result<EscrowMetadata, EscrowError> {
-        let order_hash: BytesN<32> = env
+        let escrow: EscrowRecord = env
             .storage()
             .persistent()
-            .get(&DataKey::EscrowMetadataHash(escrow_id))
+            .get(&DataKey::Escrow(escrow_id))
             .ok_or(EscrowError::NotFound)?;
-        let schema: Symbol = env
+        let _ = escrow;
+
+        let order_hash: Option<BytesN<32>> = env
             .storage()
             .persistent()
-            .get(&DataKey::EscrowMetadataSchema(escrow_id))
-            .ok_or(EscrowError::NotFound)?;
+            .get(&DataKey::EscrowMetadataHash(escrow_id));
+        let schema: Option<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowMetadataSchema(escrow_id));
+
+        let order_hash = order_hash.ok_or(EscrowError::MetadataNotSet)?;
+        let schema = schema.ok_or(EscrowError::MetadataNotSet)?;
         Ok(EscrowMetadata { order_hash, schema })
     }
 
@@ -4016,8 +4159,8 @@ impl EscrowContract {
 
     /// Computes yield accrued on an escrow's remaining principal for the time
     /// it has been held, based on the given `YieldConfig` APR.  The principal
-    /// is `record.amount - record.released_amount` so partially released
-    /// escrows report honest yield (issue #33).  Returns
+    /// is `record.amount - record.released_amount - record.refunded_amount`
+    /// so partially settled escrows report honest yield (issue #33). Returns
     /// `(yield_amount, held_seconds)`; `(0, 0)` when no yield config is set.
     fn compute_yield(
         record: &EscrowRecord,
@@ -4027,7 +4170,8 @@ impl EscrowContract {
         match yield_config {
             Some(cfg) => {
                 let held_seconds = env.ledger().timestamp().saturating_sub(record.created_at);
-                let remaining = record.amount - record.released_amount;
+                let remaining =
+                    record.amount - record.released_amount - record.refunded_amount;
                 let yield_amount = (remaining * cfg.apr_bps as i128 * held_seconds as i128)
                     / (10_000i128 * SECONDS_PER_YEAR);
                 (yield_amount, held_seconds)
@@ -4084,7 +4228,7 @@ impl EscrowContract {
         }
 
         // Validate total split amount
-        let remaining = record.amount - record.released_amount;
+        let remaining = record.amount - record.released_amount - record.refunded_amount;
         let mut total: i128 = 0;
         for (_, amount) in shares.iter() {
             if amount <= 0 {
@@ -4114,7 +4258,7 @@ impl EscrowContract {
         Self::distribute_fee(&env, &token_client, total_fee)?;
 
         record.released_amount += total_released;
-        let new_remaining = record.amount - record.released_amount;
+        let new_remaining = record.amount - record.released_amount - record.refunded_amount;
         if new_remaining == 0 {
             record.status = EscrowStatus::Released;
         }
@@ -4445,9 +4589,13 @@ impl EscrowContract {
 }
 
 #[cfg(test)]
-mod merkle_delivery_tests {
+mod escrow_feature_tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, token::StellarAssetClient};
+    use soroban_sdk::{
+        testutils::{Address as _, Events},
+        token::StellarAssetClient,
+        TryIntoVal,
+    };
 
     fn setup(env: &Env) -> (
         EscrowContractClient<'_>,
@@ -4472,9 +4620,8 @@ mod merkle_delivery_tests {
             min_amount: 100,
             max_amount: 1_000_000,
         };
-        let contract_id = env.register(EscrowContract, ());
+        let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(env, &contract_id);
-        client.constructor(&config);
         StellarAssetClient::new(env, &token).mint(&buyer, &10_000);
         client.add_token(&admin, &token);
         (client, admin, buyer, seller, token, contract_id)
@@ -4557,6 +4704,34 @@ mod merkle_delivery_tests {
             Err(Ok(EscrowError::InvalidMerkleProof))
         );
         assert_eq!(client.get_escrow(&escrow_id).status, EscrowStatus::Funded);
+    }
+
+    #[test]
+    fn merkle_release_settles_only_the_unrefunded_balance() {
+        let env = Env::default();
+        let (client, admin, buyer, seller, token, contract_id) = setup(&env);
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        let order_id = BytesN::from_array(&env, &[13; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000, &order_id, &1_000, &None, &None,
+        );
+        client.partial_refund(&escrow_id, &seller, &200);
+        let date = 22u64;
+        let leaf = order_leaf(&env, &order_id);
+        client.publish_merkle_root(&admin, &date, &leaf);
+        let proof = MerkleDeliveryProof {
+            root: leaf.clone(),
+            leaf,
+            proof: Vec::new(&env),
+            index: 0,
+        };
+
+        assert!(client.release_with_merkle_proof(&escrow_id, &buyer, &date, &proof));
+        let record = client.get_escrow(&escrow_id);
+        assert_eq!(record.released_amount, 800);
+        assert_eq!(record.refunded_amount, 200);
+        assert_eq!(record.status, EscrowStatus::Released);
+        assert_eq!(token_client.balance(&contract_id), 0);
     }
 
     #[test]
@@ -4643,6 +4818,92 @@ mod merkle_delivery_tests {
         assert_eq!(token_client.balance(&contract_id), 0);
         assert_eq!(second_client.balance(&contract_id), 0);
     }
+
+    #[test]
+    fn split_dispute_pays_all_award_recipients_and_emits_event() {
+        let env = Env::default();
+        let (client, admin, buyer, seller, token, contract_id) = setup(&env);
+        let mediator = Address::generate(&env);
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        let escrow_id = client.deposit(
+            &buyer,
+            &seller,
+            &token,
+            &1_000,
+            &BytesN::from_array(&env, &[51; 32]),
+            &1_000,
+            &None,
+            &None,
+        );
+        client.dispute(&escrow_id, &buyer);
+
+        let award = DisputeResolutionAward {
+            buyer_amount: 700,
+            seller_amount: 250,
+            mediator_fee: 50,
+            mediator_address: mediator.clone(),
+        };
+        assert!(client.resolve_dispute_split(&escrow_id, &admin, &award));
+
+        let events = env.events().all();
+        let mut found_event = false;
+        for (event_contract, topics, data) in events.iter() {
+            if event_contract != contract_id || topics.len() != 3 {
+                continue;
+            }
+            let topic: Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            if topic == symbol_short!("dispsplit") {
+                let event: DisputeResolvedEvent = data.try_into_val(&env).unwrap();
+                assert_eq!(event.escrow_id, escrow_id);
+                assert_eq!(event.buyer_amount, 700);
+                assert_eq!(event.seller_amount, 250);
+                assert_eq!(event.mediator_fee, 50);
+                assert_eq!(event.mediator_address, mediator);
+                found_event = true;
+            }
+        }
+        assert!(found_event);
+
+        assert_eq!(token_client.balance(&buyer), 9_700);
+        assert_eq!(token_client.balance(&seller), 250);
+        assert_eq!(token_client.balance(&mediator), 50);
+        assert_eq!(token_client.balance(&contract_id), 0);
+        let record = client.get_escrow(&escrow_id);
+        assert_eq!(record.status, EscrowStatus::Released);
+        assert_eq!(record.released_amount, 300);
+        assert_eq!(record.refunded_amount, 700);
+    }
+
+    #[test]
+    fn split_dispute_rejects_awards_that_do_not_match_escrow_amount() {
+        let env = Env::default();
+        let (client, admin, buyer, seller, token, contract_id) = setup(&env);
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        let escrow_id = client.deposit(
+            &buyer,
+            &seller,
+            &token,
+            &1_000,
+            &BytesN::from_array(&env, &[52; 32]),
+            &1_000,
+            &None,
+            &None,
+        );
+        client.dispute(&escrow_id, &buyer);
+        let award = DisputeResolutionAward {
+            buyer_amount: 700,
+            seller_amount: 250,
+            mediator_fee: 49,
+            mediator_address: Address::generate(&env),
+        };
+
+        assert_eq!(
+            client.try_resolve_dispute_split(&escrow_id, &admin, &award),
+            Err(Ok(EscrowError::InvalidDisputeAward))
+        );
+        assert_eq!(client.get_escrow(&escrow_id).status, EscrowStatus::Disputed);
+        assert_eq!(token_client.balance(&contract_id), 1_000);
+    }
 }
 
 #[cfg(test)]
@@ -4706,7 +4967,7 @@ mod fee_distribution_tests {
         }
 
         let res = client.try_set_fee_distribution(&admin, &shares);
-        assert_eq!(res, Err(Ok(EscrowError::InvalidFeeBps)));
+        assert_eq!(res, Err(Ok(EscrowError::MaxTreasuriesExceeded)));
     }
 
     #[test]
@@ -4741,11 +5002,17 @@ mod batch_flow_tests {
     fn batch_release_missing_escrow_returns_not_found() {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register(EscrowContract, ());
-        let client = EscrowContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
-        client.initialize(&admin, &250u32, &treasury, &100i128, &1_000_000i128);
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 250u32,
+            treasury: treasury.clone(),
+            min_amount: 100i128,
+            max_amount: 1_000_000i128,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(&env, &contract_id);
 
         let caller = Address::generate(&env);
         let releases = soroban_sdk::vec![
@@ -4771,9 +5038,15 @@ mod metadata_tests {
     fn setup(env: &Env) -> (EscrowContractClient<'_>, Address, Address) {
         let admin = Address::generate(env);
         let treasury = Address::generate(env);
-        let contract_id = env.register(EscrowContract, ());
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 250u32,
+            treasury: treasury.clone(),
+            min_amount: 100i128,
+            max_amount: 1_000_000i128,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(env, &contract_id);
-        client.initialize(&admin, &250u32, &treasury, &100i128, &1_000_000i128);
         (client, admin, contract_id)
     }
 
@@ -4948,10 +5221,16 @@ mod quorum_cleanup_tests {
         let token_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
         token_client.mint(&buyer, &1000i128);
 
-        let contract_id = env.register_contract(None, EscrowContract);
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 0u32,
+            treasury: treasury.clone(),
+            min_amount: 1i128,
+            max_amount: 1000i128,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(&env, &contract_id);
 
-        client.initialize(&admin, &0u32, &treasury, &1i128, &1000i128);
         client.add_token(&admin, &token);
 
         let arbiters = soroban_sdk::vec![&env, arbiter1.clone(), arbiter2.clone()];
@@ -4975,11 +5254,15 @@ mod quorum_cleanup_tests {
         client.vote_dispute(&escrow_id, &arbiter2, &true);
 
         let votes_key = DataKey::DisputeVotes(escrow_id);
-        assert!(env.storage().persistent().has(&votes_key));
+        assert!(env.as_contract(&contract_id, || {
+            env.storage().persistent().has(&votes_key)
+        }));
 
         client.resolve_dispute_quorum(&escrow_id, &arbiter1);
 
-        assert!(!env.storage().persistent().has(&votes_key));
+        assert!(!env.as_contract(&contract_id, || {
+            env.storage().persistent().has(&votes_key)
+        }));
     }
 }
 
