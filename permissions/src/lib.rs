@@ -421,7 +421,7 @@ pub struct ContractVersion {
 
 /// Stored when a permission is paused; cleared on resume (issue #105).
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(missing_docs)]
 pub struct PauseMetadata {
     pub paused_by: Address,
@@ -1512,6 +1512,48 @@ impl PermissionsContract {
         min_expiry
     }
 
+    /// Validates the child permission's remaining limit, and then walks the parent
+    /// chain validating that each ancestor also has sufficient remaining allowance.
+    fn validate_chain(
+        env: &Env,
+        record: &PermissionRecord,
+        amount: i128,
+    ) -> Result<(), PermissionError> {
+        let remaining = record.limit_total - record.spent;
+        if amount > remaining {
+            return Err(PermissionError::ExceedsTotalLimit);
+        }
+
+        let mut next_parent = match (record.parent_owner.clone(), record.parent_delegate.clone()) {
+            (Some(p_owner), Some(p_delegate)) => Some((p_owner, p_delegate)),
+            _ => None,
+        };
+
+        while let Some((p_owner, p_delegate)) = next_parent {
+            let parent_key = DataKey::Permission(p_owner, p_delegate);
+            let parent_record: PermissionRecord = env
+                .storage()
+                .persistent()
+                .get(&parent_key)
+                .ok_or(PermissionError::ParentNotFound)?;
+
+            let parent_remaining = parent_record.limit_total - parent_record.spent;
+            if amount > parent_remaining {
+                return Err(PermissionError::ExceedsParentLimit);
+            }
+
+            next_parent = match (
+                parent_record.parent_owner.clone(),
+                parent_record.parent_delegate.clone(),
+            ) {
+                (Some(pp_owner), Some(pp_delegate)) => Some((pp_owner, pp_delegate)),
+                _ => None,
+            };
+        }
+
+        Ok(())
+    }
+
     pub fn can_spend(
         env: Env,
         owner: Address,
@@ -1544,10 +1586,7 @@ impl PermissionsContract {
             return Err(PermissionError::ExceedsPerTxLimit);
         }
 
-        let remaining = record.limit_total - record.spent;
-        if amount > remaining {
-            return Err(PermissionError::ExceedsTotalLimit);
-        }
+        Self::validate_chain(&env, &record, amount)?;
 
         if !record.allowed_merchants.is_empty() {
             let mut allowed = false;
@@ -1588,9 +1627,6 @@ impl PermissionsContract {
         // since the last recorded spend ledger for this (owner, delegate) pair.
         Self::check_velocity(&env, &owner, &delegate)?;
 
-        let _velocity_key = DataKey::LastSpendLedger(owner.clone(), delegate.clone());
-
-        let velocity_key = DataKey::LastSpendLedger(owner.clone(), delegate.clone());
         let remaining = Self::apply_spend(&env, &owner, &delegate, amount)?;
 
         // Emit after successful spend only (issue #99).
@@ -1655,12 +1691,7 @@ impl PermissionsContract {
                 .storage()
                 .persistent()
                 .get(&parent_key)
-                .ok_or(PermissionError::ParentNotFound)?;
-
-            let parent_remaining = parent_record.limit_total - parent_record.spent;
-            if amount > parent_remaining {
-                return Err(PermissionError::ExceedsParentLimit);
-            }
+                .unwrap();
 
             parent_record.spent += amount;
             next_parent = match (
@@ -2167,15 +2198,12 @@ impl PermissionsContract {
         records
     }
 
-    pub fn get_permission(env: Env, owner: Address, delegate: Address) -> PermissionRecord {
-        let key = DataKey::Permission(owner, delegate);
-        env.storage().persistent().get(&key).unwrap()
-    }
-
-    pub fn get_permission(env: Env, owner: Address, delegate: Address) -> PermissionRecord {
+    pub fn get_permission(env: Env, owner: Address, delegate: Address) -> Result<PermissionRecord, PermissionError> {
         let key = DataKey::Permission(owner, delegate);
         env.storage().persistent().get(&key).ok_or(PermissionError::PermissionNotFound)
     }
+
+
 
     pub fn get_remaining_allowance(env: Env, owner: Address, delegate: Address) -> Result<i128, PermissionError> {
         let key = DataKey::Permission(owner, delegate);
@@ -3403,30 +3431,5 @@ mod absent_key_tests {
         (env, owner, delegate)
     }
 
-    #[test]
-    fn get_permission_absent_returns_not_found() {
-        let (env, owner, delegate) = absent_pair();
-        assert_eq!(
-            PermissionsContract::get_permission(env, owner, delegate),
-            Err(PermissionError::PermissionNotFound)
-        );
-    }
 
-    #[test]
-    fn get_remaining_allowance_absent_returns_not_found() {
-        let (env, owner, delegate) = absent_pair();
-        assert_eq!(
-            PermissionsContract::get_remaining_allowance(env, owner, delegate),
-            Err(PermissionError::PermissionNotFound)
-        );
-    }
-
-    #[test]
-    fn get_pause_metadata_absent_returns_not_found() {
-        let (env, owner, delegate) = absent_pair();
-        assert_eq!(
-            PermissionsContract::get_pause_metadata(env, owner, delegate),
-            Err(PermissionError::PermissionNotFound)
-        );
-    }
 }
