@@ -171,3 +171,8 @@ cargo test
 # Build WASM for deployment
 cargo build --target wasm32-unknown-unknown --release
 ```
+
+Buyer escrow pagination uses `BuyerEscrowCount(buyer)` and one persistent
+`BuyerEscrowAt(buyer, index)` entry per escrow. This keeps each storage entry
+bounded as a buyer accumulates orders; `list_escrows_by_buyer` reads only the
+requested page of indices.

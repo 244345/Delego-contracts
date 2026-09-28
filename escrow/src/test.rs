@@ -2755,6 +2755,26 @@ use soroban_sdk::{
             "batch_deposit should maintain buyer index for each order"
         );
         assert_eq!(page.items.len(), 2);
+        env.as_contract(&_contract_id, || {
+            assert_eq!(
+                env.storage()
+                    .persistent()
+                    .get::<_, u32>(&DataKey::BuyerEscrowCount(buyer.clone())),
+                Some(2)
+            );
+            assert_eq!(
+                env.storage()
+                    .persistent()
+                    .get::<_, u64>(&DataKey::BuyerEscrowAt(buyer.clone(), 0)),
+                Some(page.items.get(0).unwrap().escrow_id)
+            );
+            assert_eq!(
+                env.storage()
+                    .persistent()
+                    .get::<_, u64>(&DataKey::BuyerEscrowAt(buyer.clone(), 1)),
+                Some(page.items.get(1).unwrap().escrow_id)
+            );
+        });
     }
 
     #[test]

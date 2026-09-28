@@ -612,8 +612,10 @@ pub enum DataKey {
     RequireReleaseCondition(u64),
     /// Append-only list of all escrow IDs, used for paginated enumeration (issue #49).
     EscrowIds,
-    /// Per-buyer append-only list of escrow IDs (issue #49).
-    BuyerEscrowIds(Address),
+    /// Number of escrow IDs in a buyer's index.
+    BuyerEscrowCount(Address),
+    /// Per-buyer escrow ID at a zero-based index.
+    BuyerEscrowAt(Address, u32),
 }
 
 #[contracterror]
@@ -2141,15 +2143,24 @@ impl EscrowContract {
         all_ids.push_back(last_id);
         env.storage().instance().set(&DataKey::EscrowIds, &all_ids);
 
-        // Maintain per-buyer index for list_escrows_by_buyer (issue #49).
-        let buyer_ids_key = DataKey::BuyerEscrowIds(buyer.clone());
-        let mut buyer_ids: soroban_sdk::Vec<u64> = env
+        // Keep each buyer index entry separate so no persistent value grows
+        // with the buyer's lifetime escrow count.
+        let buyer_count_key = DataKey::BuyerEscrowCount(buyer.clone());
+        let buyer_count: u32 = env
             .storage()
             .persistent()
-            .get(&buyer_ids_key)
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
-        buyer_ids.push_back(last_id);
-        env.storage().persistent().set(&buyer_ids_key, &buyer_ids);
+            .get(&buyer_count_key)
+            .unwrap_or(0);
+        let next_buyer_count = buyer_count
+            .checked_add(1)
+            .ok_or(EscrowError::InvalidExtension)?;
+        env.storage().persistent().set(
+            &DataKey::BuyerEscrowAt(buyer.clone(), buyer_count),
+            &last_id,
+        );
+        env.storage()
+            .persistent()
+            .set(&buyer_count_key, &next_buyer_count);
 
         // Persist each metadata half independently so a later call can supply
         // the missing one (issue #181). Both halves are only ever stored
@@ -4031,20 +4042,22 @@ impl EscrowContract {
         offset: u32,
         limit: u32,
     ) -> EscrowListPage {
-        let buyer_ids: soroban_sdk::Vec<u64> = env
+        let total: u32 = env
             .storage()
             .persistent()
-            .get(&DataKey::BuyerEscrowIds(buyer))
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
-
-        let total = buyer_ids.len();
+            .get(&DataKey::BuyerEscrowCount(buyer.clone()))
+            .unwrap_or(0);
         let capped_limit = limit.min(MAX_PAGE_LIMIT);
         let start = offset.min(total);
-        let end = (start + capped_limit).min(total);
+        let end = start.saturating_add(capped_limit).min(total);
 
         let mut items = soroban_sdk::Vec::new(&env);
         for i in start..end {
-            let escrow_id = buyer_ids.get(i).unwrap();
+            let escrow_id: u64 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::BuyerEscrowAt(buyer.clone(), i))
+                .unwrap();
             if let Some(record) = env
                 .storage()
                 .persistent()
