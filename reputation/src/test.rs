@@ -376,7 +376,71 @@ fn test_record_transaction_incremental_recompute_cost() {
     let entity = Address::generate(&env);
     let counterparty = Address::generate(&env);
 
-    // Fill the replay window.
+    for i in 0..SCORE_WINDOW as u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+    assert_record_cost_within_thresholds(&env);
+}
+
+#[test]
+fn test_recompute_bumps_window_records_ttl() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut cfg = default_config();
+    // Set a short decay window to make TTL eviction more likely in tests
+    cfg.decay_window_seconds = 100;
+    let contract_id = env.register(ReputationContract, (admin.clone(), cfg));
+    let client = ReputationContractClient::new(&env, &contract_id);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    // Record enough transactions to fill the SCORE_WINDOW
+    for i in 0..SCORE_WINDOW as u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    // Advance time past the decay window to ensure records would expire
+    // without TTL bumps. The ledger timestamp is used for TTL calculations.
+    let initial_ledger_timestamp = env.ledger().timestamp();
+    advance_time(&env, cfg.decay_window_seconds + 100);
+
+    // Record one more transaction to trigger recompute_score on the existing window
+    client.record_transaction(
+        &admin,
+        &(SCORE_WINDOW as u64),
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Released,
+    );
+
+    // Verify that the reputation is still deterministic and not masked due to
+    // missing records. If TTLs were not bumped, some records might have been
+    // evicted, leading to a lower or masked score.
+    let rep = client.get_reputation(&entity);
+    // Since we have SCORE_WINDOW + 1 transactions, and min_transactions_threshold
+    // is 5, the score should be unmasked and near full (10_000).
+    assert_eq!(rep.total_transactions, SCORE_WINDOW as u64 + 1);
+    assert_eq!(rep.score, 10_000);
+
+    // Verify that the records are still present by checking the relation
+    assert!(client.has_relation(&entity, &counterparty, &false));
+}/ Fill the replay window.
     for i in 0..SCORE_WINDOW as u64 {
         client.record_transaction(
             &admin,
