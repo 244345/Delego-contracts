@@ -26,6 +26,7 @@ pub enum MerchantStatus {
     Suspended = 2,  // Temporarily disabled (admin action / review)
     Closed = 3,     // Permanently removed
     All = 4,        // Filter sentinel for cursor discovery (matches every status)
+    Banned = 5,     // Permanently barred from trading
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -209,6 +210,8 @@ pub enum MarketplaceError {
     InvalidParam = 4015,
     NoPendingAdmin = 4016,
     VerificationCountOverflow = 4017,
+    DuplicateMerchantOwner = 4018,
+    MerchantBanned = 4019,
 }
 
 // --- Events ---
@@ -295,6 +298,13 @@ pub struct MerchantCommissionSetEvent {
 pub struct MerchantSuspendedEvent {
     pub merchant_id: u64,
     pub suspended_by: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MerchantBannedEvent {
+    pub merchant_id: u64,
+    pub banned_by: Address,
 }
 
 #[contracttype]
@@ -388,6 +398,8 @@ pub enum DataKey {
     NextMerchantId,
     MerchantStats,
     Merchant(u64),
+    MerchantOwner(Address),
+    RiskOracle,
     MerchantName(String),
     FreedName(String),
     ArchivedMerchant(u64),
@@ -550,8 +562,23 @@ impl MarketplaceContract {
     ) -> Result<u64, MarketplaceError> {
         merchant.require_auth();
 
+        if let Some(existing_id) = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::MerchantOwner(merchant.clone()))
+        {
+            let existing: Merchant = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Merchant(existing_id))
+                .ok_or(MarketplaceError::MerchantNotFound)?;
+            if existing.status != MerchantStatus::Closed {
+                return Err(MarketplaceError::DuplicateMerchantOwner);
+            }
+        }
+
         Self::validate_merchant_input(&params.name, &params.description)?;
-                let params = Self::validate_and_normalize(&env, &params)?;
+        let params = Self::validate_and_normalize(&env, &params)?;
 
         let name_key = DataKey::MerchantName(params.name.clone());
         if env.storage().persistent().has(&name_key) {
@@ -623,6 +650,9 @@ impl MarketplaceContract {
         env.storage()
             .persistent()
             .set(&DataKey::Merchant(next_id), &new_merchant);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantOwner(merchant.clone()), &next_id);
         env.storage().persistent().set(&name_key, &next_id);
         let policy = VerificationPolicy {
             required: required_verifications,
@@ -1759,14 +1789,16 @@ impl MarketplaceContract {
         merchant_id: u64,
     ) -> Result<(), MarketplaceError> {
         admin.require_auth();
-        let current_admin = Self::get_admin(env.clone())?;
-        if admin != current_admin {
+        if !Self::is_admin_or_risk_oracle(&env, &admin)? {
             return Err(MarketplaceError::Unauthorized);
         }
 
         let mut merchant = Self::get_merchant(env.clone(), merchant_id)?;
         if matches!(merchant.status, MerchantStatus::Closed) {
             return Err(MarketplaceError::MerchantClosed);
+        }
+        if matches!(merchant.status, MerchantStatus::Banned) {
+            return Err(MarketplaceError::MerchantBanned);
         }
 
         let prev_status = merchant.status;
@@ -1780,6 +1812,11 @@ impl MarketplaceContract {
         merchant.status = MerchantStatus::Suspended;
         merchant.updated_at = env.ledger().timestamp();
 
+        if let Some(owner) = merchant.owner.clone() {
+            env.storage()
+                .persistent()
+                .set(&DataKey::MerchantOwner(owner), &merchant_id);
+        }
         env.storage()
             .persistent()
             .set(&DataKey::Merchant(merchant_id), &merchant);
@@ -1814,6 +1851,9 @@ impl MarketplaceContract {
         if matches!(merchant.status, MerchantStatus::Closed) {
             return Err(MarketplaceError::MerchantClosed);
         }
+        if matches!(merchant.status, MerchantStatus::Banned) {
+            return Err(MarketplaceError::MerchantBanned);
+        }
 
         let prev_status = merchant.status;
         if prev_status == MerchantStatus::Suspended {
@@ -1830,6 +1870,11 @@ impl MarketplaceContract {
         };
         merchant.updated_at = env.ledger().timestamp();
 
+        if let Some(owner) = merchant.owner.clone() {
+            env.storage()
+                .persistent()
+                .set(&DataKey::MerchantOwner(owner), &merchant_id);
+        }
         env.storage()
             .persistent()
             .set(&DataKey::Merchant(merchant_id), &merchant);
@@ -1842,6 +1887,52 @@ impl MarketplaceContract {
             },
         );
 
+        Ok(())
+    }
+
+    /// Permanently ban a merchant from trading. The admin or configured risk
+    /// oracle may trigger this emergency action; bans cannot be reversed by
+    /// `unsuspend_merchant`.
+    pub fn ban_merchant(
+        env: Env,
+        caller: Address,
+        merchant_id: u64,
+    ) -> Result<(), MarketplaceError> {
+        caller.require_auth();
+        if !Self::is_admin_or_risk_oracle(&env, &caller)? {
+            return Err(MarketplaceError::Unauthorized);
+        }
+        let mut merchant = Self::get_merchant(env.clone(), merchant_id)?;
+        if merchant.status == MerchantStatus::Closed {
+            return Err(MarketplaceError::MerchantClosed);
+        }
+        if merchant.status != MerchantStatus::Banned {
+            let mut stats = Self::get_merchant_stats(env.clone());
+            if merchant.status == MerchantStatus::Suspended {
+                stats.suspended = stats.suspended.saturating_sub(1);
+            } else {
+                stats.active = stats.active.saturating_sub(1);
+                stats.suspended = stats.suspended.saturating_add(1);
+            }
+            env.storage().instance().set(&DataKey::MerchantStats, &stats);
+        }
+        merchant.status = MerchantStatus::Banned;
+        merchant.updated_at = env.ledger().timestamp();
+        if let Some(owner) = merchant.owner.clone() {
+            env.storage()
+                .persistent()
+                .set(&DataKey::MerchantOwner(owner), &merchant_id);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Merchant(merchant_id), &merchant);
+        env.events().publish(
+            (symbol_short!("mkplc"), symbol_short!("ban"), merchant_id),
+            MerchantBannedEvent {
+                merchant_id,
+                banned_by: caller,
+            },
+        );
         Ok(())
     }
 
@@ -1862,19 +1953,25 @@ impl MarketplaceContract {
         if prev_status != MerchantStatus::Closed {
             let mut stats = Self::get_merchant_stats(env.clone());
             match prev_status {
-                MerchantStatus::Suspended => {
+                MerchantStatus::Suspended | MerchantStatus::Banned => {
                     stats.suspended = stats.suspended.saturating_sub(1);
                 }
                 MerchantStatus::Registered | MerchantStatus::Verified => {
                     stats.active = stats.active.saturating_sub(1);
                 }
                 MerchantStatus::Closed => {}
+                MerchantStatus::All => {}
             }
             stats.closed = stats.closed.saturating_add(1);
             env.storage().instance().set(&DataKey::MerchantStats, &stats);
         }
 
         merchant.status = MerchantStatus::Closed;
+        if let Some(owner) = merchant.owner.clone() {
+            env.storage()
+                .persistent()
+                .set(&DataKey::MerchantOwner(owner), &merchant_id);
+        }
 
         // Prune from global merchant index
         let mut merchant_ids: Vec<u64> = env
@@ -2195,6 +2292,47 @@ impl MarketplaceContract {
             .ok_or(MarketplaceError::NotInitialized)
     }
 
+    /// Configure or clear the risk oracle authorized to freeze merchant
+    /// trading. Only the platform admin may change this address.
+    pub fn set_risk_oracle(
+        env: Env,
+        admin: Address,
+        risk_oracle: Option<Address>,
+    ) -> Result<(), MarketplaceError> {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone())? {
+            return Err(MarketplaceError::Unauthorized);
+        }
+        match risk_oracle {
+            Some(oracle) => env.storage().instance().set(&DataKey::RiskOracle, &oracle),
+            None => env.storage().instance().remove(&DataKey::RiskOracle),
+        }
+        Ok(())
+    }
+
+    /// Returns whether a seller may trade. Addresses not registered as
+    /// merchant owners remain eligible for non-marketplace escrow orders.
+    pub fn is_merchant_trading(env: Env, seller: Address) -> bool {
+        let Some(merchant_id) = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::MerchantOwner(seller))
+        else {
+            return true;
+        };
+        let Some(merchant) = env
+            .storage()
+            .persistent()
+            .get::<_, Merchant>(&DataKey::Merchant(merchant_id))
+        else {
+            return false;
+        };
+        !matches!(
+            merchant.status,
+            MerchantStatus::Suspended | MerchantStatus::Banned | MerchantStatus::Closed
+        )
+    }
+
     pub fn get_verifiers(env: Env) -> Vec<Verifier> {
         env.storage()
             .instance()
@@ -2215,9 +2353,25 @@ impl MarketplaceContract {
     fn check_not_frozen_or_closed(merchant: &Merchant) -> Result<(), MarketplaceError> {
         match merchant.status {
             MerchantStatus::Suspended => Err(MarketplaceError::MerchantFrozen),
+            MerchantStatus::Banned => Err(MarketplaceError::MerchantBanned),
             MerchantStatus::Closed => Err(MarketplaceError::MerchantClosed),
             _ => Ok(()),
         }
+    }
+
+    fn is_admin_or_risk_oracle(
+        env: &Env,
+        caller: &Address,
+    ) -> Result<bool, MarketplaceError> {
+        if caller == &Self::get_admin(env.clone())? {
+            return Ok(true);
+        }
+        Ok(env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::RiskOracle)
+            .as_ref()
+            == Some(caller))
     }
 
     /// Trims leading/trailing ASCII whitespace from `s` and enforces that its
@@ -2346,7 +2500,7 @@ mod error_code_uniqueness_tests {
     const REPUTATION_ERROR_RANGE: (u32, u32) = (2000, 2999);
     const DELEGATION_ERROR_RANGE: (u32, u32) = (3000, 3999);
     const MARKETPLACE_ERROR_RANGE: (u32, u32) = (4000, 4999);
-    fn marketplace_error_codes() -> [u32; 16] {
+    fn marketplace_error_codes() -> [u32; 19] {
         [
             MarketplaceError::AlreadyInitialized as u32,
             MarketplaceError::NotInitialized as u32,
@@ -2364,6 +2518,9 @@ mod error_code_uniqueness_tests {
             MarketplaceError::InvalidCategory as u32,
             MarketplaceError::InvalidParam as u32,
             MarketplaceError::NoPendingAdmin as u32,
+            MarketplaceError::VerificationCountOverflow as u32,
+            MarketplaceError::DuplicateMerchantOwner as u32,
+            MarketplaceError::MerchantBanned as u32,
         ]
     fn marketplace_error_codes_are_unique() {
         let codes = marketplace_error_codes();

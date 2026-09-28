@@ -1108,6 +1108,72 @@ fn test_suspension_closing_and_mutation_locking() {
 }
 
 #[test]
+fn test_risk_oracle_freezes_trading_and_bans_are_permanent() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+    let risk_oracle = Address::generate(&f.env);
+    let merchant_id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Risk Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("food"),
+            image_url: String::from_str(&f.env, "food.png"),
+            metadata: None,
+            required_verifications: 1,
+        },
+    );
+    f.client
+        .set_risk_oracle(&f.admin, &Some(risk_oracle.clone()));
+
+    assert!(f.client.is_merchant_trading(&owner));
+    assert_eq!(
+        f.client.try_suspend_merchant(&Address::generate(&f.env), &merchant_id),
+        Err(Ok(MarketplaceError::Unauthorized))
+    );
+
+    f.client.suspend_merchant(&risk_oracle, &merchant_id);
+    assert!(!f.client.is_merchant_trading(&owner));
+    assert_eq!(
+        f.client.get_merchant(&merchant_id).status,
+        MerchantStatus::Suspended
+    );
+
+    f.client.unsuspend_merchant(&f.admin, &merchant_id);
+    assert!(f.client.is_merchant_trading(&owner));
+
+    f.client.ban_merchant(&risk_oracle, &merchant_id);
+    assert!(!f.client.is_merchant_trading(&owner));
+    assert_eq!(
+        f.client.get_merchant(&merchant_id).status,
+        MerchantStatus::Banned
+    );
+    assert_eq!(
+        f.client.try_unsuspend_merchant(&f.admin, &merchant_id),
+        Err(Ok(MarketplaceError::MerchantBanned))
+    );
+}
+
+#[test]
+fn test_merchant_owner_can_register_only_one_open_profile() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+    let params = |name: &str| RegisterParams {
+        name: String::from_str(&f.env, name),
+        description: String::from_str(&f.env, "Desc"),
+        category: symbol_short!("food"),
+        image_url: String::from_str(&f.env, "food.png"),
+        metadata: None,
+        required_verifications: 1,
+    };
+    f.client.register_merchant(&owner, &params("Store One"));
+    assert_eq!(
+        f.client.try_register_merchant(&owner, &params("Store Two")),
+        Err(Ok(MarketplaceError::DuplicateMerchantOwner))
+    );
+}
+
+#[test]
 fn test_paginated_discovery_cost_stays_within_thresholds() {
     let f = TestFixture::setup();
     let owner = Address::generate(&f.env);
