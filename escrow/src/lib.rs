@@ -135,17 +135,37 @@ pub struct PartialRefundResult {
     pub fully_refunded: bool,
 }
 
-/// Configured external condition that gates release of an escrow via
-/// `evaluate_and_release` (issue #339).
+/// Legacy condition metadata retained for storage compatibility.
 ///
-/// `oracle_contract` must expose a `resolve(condition_type: Symbol) -> bool`
-/// function. `evaluate_and_release` calls it and only releases funds when it
-/// returns `true`.
+/// A boolean response from `oracle_contract` is no longer sufficient to
+/// authorize release; use `SignedDeliveryProof` and
+/// `verify_delivery_and_release` instead.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReleaseCondition {
     pub condition_type: Symbol,
     pub oracle_contract: Address,
+}
+
+/// Delivery attestation signed by the configured Ed25519 delivery oracle.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignedDeliveryProof {
+    pub escrow_id: u64,
+    pub carrier_code: Symbol,
+    pub tracking_hash: BytesN<32>,
+    pub delivery_timestamp: u64,
+    pub oracle_pubkey: BytesN<32>,
+    pub signature: BytesN<64>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SignedDeliveryPayload {
+    escrow_id: u64,
+    carrier_code: Symbol,
+    tracking_hash: BytesN<32>,
+    delivery_timestamp: u64,
 }
 
 /// Emitted when a new escrow is created.
@@ -607,13 +627,19 @@ pub enum DataKey {
     EscrowYieldConfig(u64),
     /// Release condition for an escrow.
     ReleaseCondition(u64),
+    /// Ed25519 public key authorized to sign delivery proofs.
+    OraclePublicKey,
+    /// Marketplace contract used to check whether escrow sellers may trade.
+    MerchantRegistry,
     /// Admin flag: when `true`, buyer-originated releases on the escrow must
     /// pass `get_release_eligibility` (issue #48).
     RequireReleaseCondition(u64),
     /// Append-only list of all escrow IDs, used for paginated enumeration (issue #49).
     EscrowIds,
-    /// Per-buyer append-only list of escrow IDs (issue #49).
-    BuyerEscrowIds(Address),
+    /// Number of escrow IDs in a buyer's index.
+    BuyerEscrowCount(Address),
+    /// Per-buyer escrow ID at a zero-based index.
+    BuyerEscrowAt(Address, u32),
 }
 
 #[contracterror]
@@ -673,6 +699,11 @@ pub enum DataKey {
 /// | 39 | InvalidYieldConfig | ≤0.2.0 |
 /// | 40 | AmountLimitsNotSet | ≤0.2.0 |
 /// | 41 | FeeConfigNotSet | ≤0.2.0 |
+/// | 43 | MerchantNotTrading | New |
+/// | 44 | MerchantStatusCheckFailed | New |
+/// | 45 | SignedProofRequired | New |
+/// | 46 | InvalidSignedDeliveryProof | New |
+/// | 47 | OraclePublicKeyNotSet | New |
 /// | 201 | InvalidReleaseRecipient | ≤0.2.0 |
 /// | 400 | MetadataNotSet | next major |
 /// | 401 | InvalidMetadata | next major |
@@ -794,6 +825,16 @@ pub enum EscrowError {
     AmountLimitsNotSet = 40,
     /// Contract fee configuration has not been set
     FeeConfigNotSet = 41,
+    /// Merchant is suspended, banned, or closed in the configured marketplace
+    MerchantNotTrading = 43,
+    /// Configured marketplace could not be queried for merchant status
+    MerchantStatusCheckFailed = 44,
+    /// Conditional release requires a signed delivery proof
+    SignedProofRequired = 45,
+    /// Signed delivery proof does not match this escrow or valid delivery time
+    InvalidSignedDeliveryProof = 46,
+    /// Delivery oracle public key has not been configured by admin
+    OraclePublicKeyNotSet = 47,
     /// Maximum treasuries exceeded
     MaxTreasuriesExceeded = 42,
     /// Escrow exists but no metadata was stored at creation
@@ -2075,6 +2116,24 @@ impl EscrowContract {
             }
         }
 
+        if let Some(registry) = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::MerchantRegistry)
+        {
+            let args = soroban_sdk::vec![&env, seller.to_val()];
+            let status = env.try_invoke_contract::<bool, InvokeError>(
+                &registry,
+                &Symbol::new(&env, "is_merchant_trading"),
+                args,
+            );
+            match status {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => return Err(EscrowError::MerchantNotTrading),
+                _ => return Err(EscrowError::MerchantStatusCheckFailed),
+            }
+        }
+
         if !Self::is_token_allowed(env.clone(), token.clone()) {
             return Err(EscrowError::TokenNotWhitelisted);
         }
@@ -2141,15 +2200,24 @@ impl EscrowContract {
         all_ids.push_back(last_id);
         env.storage().instance().set(&DataKey::EscrowIds, &all_ids);
 
-        // Maintain per-buyer index for list_escrows_by_buyer (issue #49).
-        let buyer_ids_key = DataKey::BuyerEscrowIds(buyer.clone());
-        let mut buyer_ids: soroban_sdk::Vec<u64> = env
+        // Keep each buyer index entry separate so no persistent value grows
+        // with the buyer's lifetime escrow count.
+        let buyer_count_key = DataKey::BuyerEscrowCount(buyer.clone());
+        let buyer_count: u32 = env
             .storage()
             .persistent()
-            .get(&buyer_ids_key)
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
-        buyer_ids.push_back(last_id);
-        env.storage().persistent().set(&buyer_ids_key, &buyer_ids);
+            .get(&buyer_count_key)
+            .unwrap_or(0);
+        let next_buyer_count = buyer_count
+            .checked_add(1)
+            .ok_or(EscrowError::InvalidExtension)?;
+        env.storage().persistent().set(
+            &DataKey::BuyerEscrowAt(buyer.clone(), buyer_count),
+            &last_id,
+        );
+        env.storage()
+            .persistent()
+            .set(&buyer_count_key, &next_buyer_count);
 
         // Persist each metadata half independently so a later call can supply
         // the missing one (issue #181). Both halves are only ever stored
@@ -2836,20 +2904,30 @@ impl EscrowContract {
             .ok_or(EscrowError::ReleaseConditionNotSet)
     }
 
-    /// Query the configured oracle and release the full remaining balance to the
-    /// seller if the condition it reports is met (issue #339). The seller
-    /// receives the remaining balance minus the platform fee (issue #27).
-    ///
-    /// Any caller may trigger evaluation once a condition has been configured via
-    /// `set_release_condition` — authorization to move funds comes from the
-    /// oracle's answer, not from the caller's identity. The oracle call is made
-    /// via `try_invoke_contract` so a missing contract, a wrong/missing
-    /// `resolve` function, or a panic inside the oracle all surface as
-    /// `EscrowError::OracleCallFailed` instead of aborting this transaction.
+    /// Deprecated insecure bool-oracle release path. It remains in the ABI for
+    /// compatibility but never releases funds; use
+    /// `verify_delivery_and_release` with an oracle signature instead.
     pub fn evaluate_and_release(
+        env: Env,
+        _escrow_id: u64,
+        caller: Address,
+    ) -> Result<PartialReleaseResult, EscrowError> {
+        caller.require_auth();
+        Err(EscrowError::SignedProofRequired)
+    }
+
+    /// Verify an oracle-signed delivery attestation and release the escrow's
+    /// full remaining balance to its seller.
+    ///
+    /// The signed payload consists of the XDR encoding of `escrow_id`,
+    /// `carrier_code`, `tracking_hash`, and `delivery_timestamp`. The proof's
+    /// public key must equal the admin-configured key, and the delivery time
+    /// must fall between escrow creation and the current ledger timestamp.
+    pub fn verify_delivery_and_release(
         env: Env,
         escrow_id: u64,
         caller: Address,
+        proof: SignedDeliveryProof,
     ) -> Result<PartialReleaseResult, EscrowError> {
         caller.require_auth();
 
@@ -2858,33 +2936,34 @@ impl EscrowContract {
             Some(rec) => rec,
             None => return Err(EscrowError::NotFound),
         };
-
         check_not_terminal(&record)?;
         if record.status != EscrowStatus::Funded {
             return Err(EscrowError::InvalidStatus);
         }
 
-        let condition: ReleaseCondition = env
+        let configured_key: BytesN<32> = env
             .storage()
-            .persistent()
-            .get(&DataKey::ReleaseCondition(escrow_id))
-            .ok_or(EscrowError::ReleaseConditionNotSet)?;
-
-        let args = soroban_sdk::vec![&env, condition.condition_type.to_val()];
-        let call_result = env.try_invoke_contract::<bool, InvokeError>(
-            &condition.oracle_contract,
-            &symbol_short!("resolve"),
-            args,
-        );
-
-        let condition_met = match call_result {
-            Ok(Ok(met)) => met,
-            _ => return Err(EscrowError::OracleCallFailed),
-        };
-
-        if !condition_met {
-            return Err(EscrowError::ConditionNotMet);
+            .instance()
+            .get(&DataKey::OraclePublicKey)
+            .ok_or(EscrowError::OraclePublicKeyNotSet)?;
+        if proof.escrow_id != escrow_id
+            || proof.oracle_pubkey != configured_key
+            || proof.delivery_timestamp < record.created_at
+            || proof.delivery_timestamp > env.ledger().timestamp()
+        {
+            return Err(EscrowError::InvalidSignedDeliveryProof);
         }
+
+        use soroban_sdk::xdr::ToXdr;
+        let payload = SignedDeliveryPayload {
+            escrow_id: proof.escrow_id,
+            carrier_code: proof.carrier_code,
+            tracking_hash: proof.tracking_hash,
+            delivery_timestamp: proof.delivery_timestamp,
+        }
+        .to_xdr(&env);
+        env.crypto()
+            .ed25519_verify(&configured_key, &payload, &proof.signature);
 
         let remaining = record.amount - record.released_amount;
         Self::execute_release(&env, escrow_id, &key, record, caller, remaining)
@@ -3451,6 +3530,40 @@ impl EscrowContract {
         env.storage()
             .instance()
             .set(&DataKey::AdminList, &admin_list);
+        Ok(true)
+    }
+
+    /// Configure the marketplace registry used to reject suspended merchant
+    /// sellers when creating new escrows. Admin-only.
+    pub fn set_merchant_registry(
+        env: Env,
+        admin: Address,
+        registry: Address,
+    ) -> Result<bool, EscrowError> {
+        admin.require_auth();
+        if !Self::is_admin(env.clone(), admin) {
+            return Err(EscrowError::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantRegistry, &registry);
+        Ok(true)
+    }
+
+    /// Configure the Ed25519 public key authorized to sign delivery proofs.
+    /// Admin-only; changing this key immediately changes which proofs are valid.
+    pub fn set_oracle_public_key(
+        env: Env,
+        admin: Address,
+        public_key: BytesN<32>,
+    ) -> Result<bool, EscrowError> {
+        admin.require_auth();
+        if !Self::is_admin(env.clone(), admin) {
+            return Err(EscrowError::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::OraclePublicKey, &public_key);
         Ok(true)
     }
 
@@ -4031,20 +4144,22 @@ impl EscrowContract {
         offset: u32,
         limit: u32,
     ) -> EscrowListPage {
-        let buyer_ids: soroban_sdk::Vec<u64> = env
+        let total: u32 = env
             .storage()
             .persistent()
-            .get(&DataKey::BuyerEscrowIds(buyer))
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
-
-        let total = buyer_ids.len();
+            .get(&DataKey::BuyerEscrowCount(buyer.clone()))
+            .unwrap_or(0);
         let capped_limit = limit.min(MAX_PAGE_LIMIT);
         let start = offset.min(total);
-        let end = (start + capped_limit).min(total);
+        let end = start.saturating_add(capped_limit).min(total);
 
         let mut items = soroban_sdk::Vec::new(&env);
         for i in start..end {
-            let escrow_id = buyer_ids.get(i).unwrap();
+            let escrow_id: u64 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::BuyerEscrowAt(buyer.clone(), i))
+                .unwrap();
             if let Some(record) = env
                 .storage()
                 .persistent()
@@ -4545,7 +4660,7 @@ mod error_code_allocation_tests {
         (3_000, 3_999),
         (4_000, 4_999),
     ];
-    fn escrow_error_codes() -> [u32; 40] {
+    fn escrow_error_codes() -> [u32; 45] {
         [
             EscrowError::AlreadyInitialized as u32,
             EscrowError::NotFound as u32,
@@ -4587,6 +4702,11 @@ mod error_code_allocation_tests {
             EscrowError::AmountLimitsNotSet as u32,
             EscrowError::FeeConfigNotSet as u32,
             EscrowError::InvalidReleaseRecipient as u32,
+            EscrowError::MerchantNotTrading as u32,
+            EscrowError::MerchantStatusCheckFailed as u32,
+            EscrowError::SignedProofRequired as u32,
+            EscrowError::InvalidSignedDeliveryProof as u32,
+            EscrowError::OraclePublicKeyNotSet as u32,
         ]
     }
     #[test]

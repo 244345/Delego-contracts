@@ -9,7 +9,7 @@ The Marketplace Contract maintains a trusted on-chain registry of merchants on t
 - **Paginated Discovery**: Client-queryable paginated listing by category (`get_merchants_by_category`) and global list (`get_merchants`).
 - **Commission Configuration**: Configurable per-merchant fee in basis points (`0 - 10000 bps`) settable by the merchant owner or platform admin.
 - **Metadata Cooldown Lock**: Self-update of metadata by merchant owner with a configurable lockout cooldown period (`MetadataCooldown`), bypassable by admin in emergencies.
-- **Security & Lifecycle Moderation**: Admin suspension (`suspend_merchant`), un-suspension (`unsuspend_merchant`), and permanent removal (`close_merchant`), completely blocking mutating operations on frozen or closed merchants.
+- **Security & Lifecycle Moderation**: Admin/risk-oracle suspension (`suspend_merchant`), permanent ban (`ban_merchant`), admin un-suspension (`unsuspend_merchant`), and permanent removal (`close_merchant`), blocking trading for suspended, banned, or closed merchant owners.
 - **Reputation Integration**: Read-only reference to scoring from the Delego Reputation Contract, snapshots dynamically into `MerchantView.reputation_score`.
 - **Two-Step Admin Transfer**: Secure transfer of administrative rights via `propose_admin` and `accept_admin`.
 
@@ -53,7 +53,10 @@ pub fn get_commission(env: Env, merchant_id: u64) -> Result<u32, MarketplaceErro
 ```rust
 pub fn suspend_merchant(env: Env, admin: Address, merchant_id: u64) -> Result<(), MarketplaceError>
 pub fn unsuspend_merchant(env: Env, admin: Address, merchant_id: u64) -> Result<(), MarketplaceError>
+pub fn ban_merchant(env: Env, caller: Address, merchant_id: u64) -> Result<(), MarketplaceError>
 pub fn close_merchant(env: Env, admin: Address, merchant_id: u64, reason: Symbol) -> Result<(), MarketplaceError>
+pub fn set_risk_oracle(env: Env, admin: Address, risk_oracle: Option<Address>) -> Result<(), MarketplaceError>
+pub fn is_merchant_trading(env: Env, seller: Address) -> bool
 pub fn prune_closed_merchants(env: Env, admin: Address, merchant_ids: Vec<u64>) -> Result<u32, MarketplaceError>
 ```
 
@@ -73,3 +76,10 @@ pub fn version(env: Env) -> ContractVersion
 ## Discovery Implementation Notes
 
 `get_merchants` and `get_merchants_by_category` iterate monotonic identifier indices stored in persistent state and slice with `offset` and bounded `limit`. Note that a full index refactor (such as status buckets or ordered key-value trees) is planned for high-throughput scaling and tracked in issue #23.
+
+The admin configures one risk-oracle address with `set_risk_oracle`. That
+oracle may suspend or permanently ban a merchant immediately; only the admin
+can unsuspend a suspended merchant, and a ban cannot be reversed. A merchant
+owner may register only one non-closed profile at a time. Escrow deployments
+should configure this contract as their merchant registry so creation checks
+`is_merchant_trading` for the seller address before accepting a new escrow.
