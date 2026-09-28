@@ -73,11 +73,15 @@ pub struct DelegationSnapshot {
     pub record: DelegationRecord,
 }
 
+/// A paginated page of delegation records.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DelegationPage {
+    /// Items on this page.
     pub items: Vec<DelegationRecord>,
+    /// Total count across all pages.
     pub total: u32,
+    /// Next offset for pagination, or None if no more pages.
     pub next_offset: Option<u32>,
 }
 
@@ -240,6 +244,8 @@ pub enum DelegationError {
     NoPendingAdmin = 311,
     /// The registry has not been initialized yet.
     NotInitialized = 312,
+    /// The provided TTL is invalid (must be greater than 0).
+    InvalidTtl = 313,
 }
 
 /// The delegation registry contract.
@@ -354,6 +360,10 @@ impl DelegationRegistry {
         ttl_ledgers: u32,
     ) -> Result<u64, DelegationError> {
         owner.require_auth();
+
+        if ttl_ledgers == 0 {
+            return Err(DelegationError::InvalidTtl);
+        }
 
         // Reject the all-zero sentinel agent id so authorization records
         // can never be seeded with a dead id, keeping is_authorized
@@ -677,6 +687,7 @@ impl DelegationRegistry {
         offset: u32,
         limit: u32,
     ) -> DelegationPage {
+        let current_ledger = env.ledger().sequence();
         let next_id: u64 = env
             .storage()
             .instance()
@@ -690,7 +701,10 @@ impl DelegationRegistry {
                 .persistent()
                 .get::<_, DelegationRecord>(&DataKey::Delegation(id))
             {
-                if record.status == DelegationStatus::Expired {
+                let is_expired = record.status == DelegationStatus::Expired
+                    || (record.status != DelegationStatus::Revoked
+                        && current_ledger >= record.expires_at_ledger);
+                if is_expired {
                     expired.push_back(record);
                 }
             }
@@ -1076,6 +1090,7 @@ mod error_code_uniqueness_tests {
             (DelegationError::IdExhausted, 310u32),
             (DelegationError::NoPendingAdmin, 311u32),
             (DelegationError::NotInitialized, 312u32),
+            (DelegationError::InvalidTtl, 313u32),
         ];
 
         for (variant, expected) in codes {
@@ -1095,6 +1110,7 @@ mod error_code_uniqueness_tests {
             DelegationError::IdExhausted as u32,
             DelegationError::NoPendingAdmin as u32,
             DelegationError::NotInitialized as u32,
+            DelegationError::InvalidTtl as u32,
         ];
         seen.sort_unstable();
         for pair in seen.windows(2) {
@@ -1103,8 +1119,7 @@ mod error_code_uniqueness_tests {
         for code in seen {
             assert!(
                 (301..=400).contains(&code),
-                "DelegationError code {} is outside the reserved range",
-                code
+                "DelegationError code {code} is outside the reserved range"
             );
         }
     }

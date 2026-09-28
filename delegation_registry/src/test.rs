@@ -206,6 +206,7 @@ fn test_rollback_rejects_stale_permissions_pointer() {
 
     let label = Symbol::new(&env, "Rotated_Pointer");
     let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    client.pause_delegation(&id);
 
     let rotated_permissions = Address::generate(&env);
     let mut record = client.get_delegation(&id);
@@ -566,6 +567,8 @@ fn test_revoke_paused_delegation_returns_true() {
     assert_eq!(client.get_delegation_version(&id), 3);
 }
 
+const LARGE_TTL: u32 = 10_000_000;
+
 #[test]
 fn test_get_delegation_bumps_ttl() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
@@ -734,9 +737,9 @@ fn test_create_delegation_returns_id_exhausted_at_boundary() {
     env.mock_all_auths();
 
     // Directly set NextId to u64::MAX so the next increment overflows
-    env.storage()
-        .instance()
-        .set(&DataKey::NextId, &u64::MAX);
+    env.as_contract(&client.address, || {
+        env.storage().instance().set(&DataKey::NextId, &u64::MAX);
+    });
 
     let label = Symbol::new(&env, "Boundary_Test");
     let result =
@@ -971,12 +974,12 @@ fn test_get_expired_delegations_paged_paginates() {
 
     env.ledger().set_sequence_number(300);
 
-    let page = client.get_expired_delegations_paged(&owner, &0u32, &(MAX_PAGE_LIMIT + 1));
+    let page = client.get_expired_delegations_paged(&0u32, &(MAX_PAGE_LIMIT + 1));
     assert_eq!(page.total, MAX_PAGE_LIMIT + 1);
     assert_eq!(page.items.len(), MAX_PAGE_LIMIT);
     assert_eq!(page.next_offset, Some(MAX_PAGE_LIMIT));
 
-    let next = client.get_expired_delegations_paged(&owner, &MAX_PAGE_LIMIT, &MAX_PAGE_LIMIT);
+    let next = client.get_expired_delegations_paged(&MAX_PAGE_LIMIT, &MAX_PAGE_LIMIT);
     assert_eq!(next.items.len(), 1);
     assert_eq!(next.total, MAX_PAGE_LIMIT + 1);
     assert_eq!(next.next_offset, None);
@@ -1219,26 +1222,55 @@ fn test_admin_transfer_emits_propose_and_transfer_events() {
     let (env, client, _, _, _, _) = setup();
     env.mock_all_auths();
 
-    let successor = Address::generate(&env);
-    client.propose_admin(&successor);
-    client.accept_admin();
-
-    let events = env.events().all();
-    let has_topic = |wanted: Symbol| {
+    let has_topic = |events: &soroban_sdk::Vec<(Address, soroban_sdk::Vec<soroban_sdk::Val>, soroban_sdk::Val)>, wanted: Symbol| {
         events.iter().any(|(_, topics, _)| {
             let t: soroban_sdk::Vec<soroban_sdk::Val> = topics;
             t.len() >= 2
                 && Symbol::try_from_val(&env, &t.get(0).unwrap()).ok() == Some(symbol_short!("deleg"))
-                && Symbol::try_from_val(&env, &t.get(1).unwrap()).ok() == Some(wanted)
+                && Symbol::try_from_val(&env, &t.get(1).unwrap()).ok() == Some(wanted.clone())
         })
     };
 
+    let successor = Address::generate(&env);
+    client.propose_admin(&successor);
+    let events_prop = env.events().all();
     assert!(
-        has_topic(symbol_short!("adm_prop")),
+        has_topic(&events_prop, symbol_short!("adm_prop")),
         "AdminProposed event not emitted"
     );
+
+    client.accept_admin();
+    let events_xfer = env.events().all();
     assert!(
-        has_topic(symbol_short!("adm_xfer")),
+        has_topic(&events_xfer, symbol_short!("adm_xfer")),
         "AdminTransferred event not emitted"
     );
+}
+
+#[test]
+fn test_create_delegation_zero_ttl_rejected() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+    let label = Symbol::new(&env, "Zero_TTL");
+
+    let result = client.try_create_delegation(&owner, &agent_id, &permissions_contract, &label, &0);
+    assert_eq!(result, Err(Ok(DelegationError::InvalidTtl)));
+
+    // Ensure no delegation was created
+    let records = client.get_delegations_by_owner(&owner);
+    assert_eq!(records.len(), 0);
+}
+
+#[test]
+fn test_create_delegation_ttl_one_succeeds() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+    let label = Symbol::new(&env, "TTL_One");
+
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1);
+    assert_eq!(id, 1);
+
+    let record = client.get_delegation(&id);
+    assert_eq!(record.expires_at_ledger, env.ledger().sequence() + 1);
+    assert_eq!(record.status, DelegationStatus::Active);
 }
