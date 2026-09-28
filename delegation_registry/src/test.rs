@@ -1129,3 +1129,116 @@ fn test_resume_paused_before_expiry_still_succeeds() {
     assert_eq!(record.status, DelegationStatus::Active);
     assert!(client.is_authorized(&id, &agent_id));
 }
+
+// ── #5 two-step admin transfer (propose / accept) ────────────────────────────
+
+#[test]
+fn test_current_admin_can_propose_successor() {
+    let (env, client, admin, _, _, _) = setup();
+    env.mock_all_auths();
+
+    let successor = Address::generate(&env);
+    assert!(client.propose_admin(&successor));
+
+    // The proposal changes nothing until it is accepted.
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn test_non_admin_cannot_propose_successor() {
+    let (env, client, admin, _, _, _) = setup();
+    let successor = Address::generate(&env);
+
+    // No auth is mocked, so the stored admin has not authorized the call.
+    let result = client.try_propose_admin(&successor);
+    assert!(result.is_err());
+
+    // get_admin is unaffected.
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn test_proposed_admin_can_accept() {
+    let (env, client, _, _, _, _) = setup();
+    env.mock_all_auths();
+
+    let successor = Address::generate(&env);
+    client.propose_admin(&successor);
+
+    assert_eq!(client.accept_admin(), successor);
+    assert_eq!(client.get_admin(), successor);
+}
+
+#[test]
+fn test_admin_transfer_is_two_step_not_one_step() {
+    let (env, client, admin, _, _, _) = setup();
+    env.mock_all_auths();
+
+    let successor = Address::generate(&env);
+    client.propose_admin(&successor);
+
+    // A proposal alone must not move the admin role.
+    assert_eq!(client.get_admin(), admin);
+
+    // The successor's first proposal is rejected, proving the role only moved
+    // after accept_admin.
+    let outsider = Address::generate(&env);
+    assert_ne!(client.get_admin(), outsider);
+}
+
+#[test]
+fn test_accept_without_proposal_returns_typed_error() {
+    let (env, client, _, _, _, _) = setup();
+    env.mock_all_auths();
+
+    let result = client.try_accept_admin();
+    assert_eq!(result, Err(Ok(DelegationError::NoPendingAdmin)));
+}
+
+#[test]
+fn test_new_admin_can_propose_after_transfer() {
+    let (env, client, _, _, _, _) = setup();
+    env.mock_all_auths();
+
+    let successor = Address::generate(&env);
+    client.propose_admin(&successor);
+    client.accept_admin();
+
+    // Old admin can no longer propose: the pending slot it would need is set by
+    // the *current* admin, and the transfer cleared the previous proposal.
+    assert_eq!(client.get_admin(), successor);
+
+    let next = Address::generate(&env);
+    client.propose_admin(&next);
+    assert_eq!(client.accept_admin(), next);
+    assert_eq!(client.get_admin(), next);
+}
+
+#[test]
+fn test_admin_transfer_emits_propose_and_transfer_events() {
+    let (env, client, _, _, _, _) = setup();
+    env.mock_all_auths();
+
+    let successor = Address::generate(&env);
+    client.propose_admin(&successor);
+    client.accept_admin();
+
+    let events = env.events().all();
+    let has_topic = |wanted: Symbol| {
+        events.iter().any(|(_, topics, _)| {
+            let t: soroban_sdk::Vec<soroban_sdk::Val> = topics;
+            t.len() >= 2
+                && Symbol::try_from_val(&env, &t.get(0).unwrap()).ok() == Some(symbol_short!("deleg"))
+                && Symbol::try_from_val(&env, &t.get(1).unwrap()).ok() == Some(wanted)
+        })
+    };
+
+    assert!(
+        has_topic(symbol_short!("adm_prop")),
+        "AdminProposed event not emitted"
+    );
+    assert!(
+        has_topic(symbol_short!("adm_xfer")),
+        "AdminTransferred event not emitted"
+    );
+}

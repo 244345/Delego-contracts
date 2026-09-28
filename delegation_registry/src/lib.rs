@@ -153,6 +153,30 @@ pub struct DelegationExpiredEvent {
     pub timestamp: u64,
 }
 
+/// Emitted when the current admin proposes a successor.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AdminProposedEvent {
+    /// Admin that made the proposal.
+    pub current_admin: Address,
+    /// Address proposed to take over as admin.
+    pub proposed_admin: Address,
+    /// Ledger timestamp of the event.
+    pub timestamp: u64,
+}
+
+/// Emitted when a proposed admin accepts the role and the transfer completes.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AdminTransferredEvent {
+    /// Admin that held the role before the transfer.
+    pub previous_admin: Address,
+    /// Address that is now the admin.
+    pub new_admin: Address,
+    /// Ledger timestamp of the event.
+    pub timestamp: u64,
+}
+
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
 /// Storage keys used by the delegation registry.
@@ -170,6 +194,8 @@ pub enum DataKey {
     DelegationVersion(u64),
     /// Version history for a delegation.
     DelegationHistory(u64),
+    /// Admin address proposed to take over, pending acceptance.
+    ProposedAdmin,
 }
 
 /// Errors for delegation registry operations.
@@ -184,7 +210,7 @@ pub enum DataKey {
 /// | `ReputationError` | 201..=300 |
 /// | `DelegationError` | 301..=400 |
 /// | `MarketplaceError` | 401..=500 |
-/// `DelegationError` currently occupies the first nine codes in its range.
+/// `DelegationError` currently occupies codes 301..=312.
 /// New variants must use the next unused code within 301..=400.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -210,6 +236,10 @@ pub enum DelegationError {
     InvalidAgentId = 309,
     /// No more delegation ids are available.
     IdExhausted = 310,
+    /// No admin transfer has been proposed.
+    NoPendingAdmin = 311,
+    /// The registry has not been initialized yet.
+    NotInitialized = 312,
 }
 
 /// The delegation registry contract.
@@ -243,6 +273,75 @@ impl DelegationRegistry {
             .instance()
             .get::<DataKey, Address>(&DataKey::Admin)
             .expect("Admin not set")
+    }
+
+    /// Proposes `new_admin` as the successor to the current admin.
+    ///
+    /// Only the current admin can propose: the stored admin address is loaded
+    /// from instance storage and has to authorize the call, so nobody else can
+    /// nominate a successor. The proposal stays pending until the proposed
+    /// address calls `accept_admin`, so proposing an address the contract does
+    /// not control transfers nothing on its own.
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<bool, DelegationError> {
+        let current_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(DelegationError::NotInitialized)?;
+
+        current_admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ProposedAdmin, &new_admin);
+
+        env.events().publish(
+            (symbol_short!("deleg"), symbol_short!("adm_prop")),
+            AdminProposedEvent {
+                current_admin,
+                proposed_admin: new_admin,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(true)
+    }
+
+    /// Accepts a pending admin proposal, completing the two-step transfer.
+    ///
+    /// Only the proposed address can accept — it must authorize the call — and
+    /// the pending proposal is cleared once the transfer lands. Returns the
+    /// address that is now the admin.
+    pub fn accept_admin(env: Env) -> Result<Address, DelegationError> {
+        let proposed_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposedAdmin)
+            .ok_or(DelegationError::NoPendingAdmin)?;
+
+        proposed_admin.require_auth();
+
+        let previous_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(DelegationError::NotInitialized)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Admin, &proposed_admin);
+        env.storage().instance().remove(&DataKey::ProposedAdmin);
+
+        env.events().publish(
+            (symbol_short!("deleg"), symbol_short!("adm_xfer")),
+            AdminTransferredEvent {
+                previous_admin,
+                new_admin: proposed_admin.clone(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(proposed_admin)
     }
 
     /// Creates a new delegation and returns its id.
@@ -974,6 +1073,9 @@ mod error_code_uniqueness_tests {
             (DelegationError::VersionNotLower, 307u32),
             (DelegationError::SnapshotNotFound, 308u32),
             (DelegationError::InvalidAgentId, 309u32),
+            (DelegationError::IdExhausted, 310u32),
+            (DelegationError::NoPendingAdmin, 311u32),
+            (DelegationError::NotInitialized, 312u32),
         ];
 
         for (variant, expected) in codes {
@@ -990,6 +1092,9 @@ mod error_code_uniqueness_tests {
             DelegationError::VersionNotLower as u32,
             DelegationError::SnapshotNotFound as u32,
             DelegationError::InvalidAgentId as u32,
+            DelegationError::IdExhausted as u32,
+            DelegationError::NoPendingAdmin as u32,
+            DelegationError::NotInitialized as u32,
         ];
         seen.sort_unstable();
         for pair in seen.windows(2) {
