@@ -607,6 +607,10 @@ pub enum DataKey {
     EscrowYieldConfig(u64),
     /// Release condition for an escrow.
     ReleaseCondition(u64),
+    /// Ed25519 public key authorized to sign delivery proofs.
+    OraclePublicKey,
+    /// Marketplace contract used to check whether escrow sellers may trade.
+    MerchantRegistry,
     /// Admin flag: when `true`, buyer-originated releases on the escrow must
     /// pass `get_release_eligibility` (issue #48).
     RequireReleaseCondition(u64),
@@ -675,6 +679,11 @@ pub enum DataKey {
 /// | 39 | InvalidYieldConfig | ≤0.2.0 |
 /// | 40 | AmountLimitsNotSet | ≤0.2.0 |
 /// | 41 | FeeConfigNotSet | ≤0.2.0 |
+/// | 43 | MerchantNotTrading | New |
+/// | 44 | MerchantStatusCheckFailed | New |
+/// | 45 | SignedProofRequired | New |
+/// | 46 | InvalidSignedDeliveryProof | New |
+/// | 47 | OraclePublicKeyNotSet | New |
 /// | 201 | InvalidReleaseRecipient | ≤0.2.0 |
 /// | 400 | MetadataNotSet | next major |
 /// | 401 | InvalidMetadata | next major |
@@ -796,6 +805,16 @@ pub enum EscrowError {
     AmountLimitsNotSet = 40,
     /// Contract fee configuration has not been set
     FeeConfigNotSet = 41,
+    /// Merchant is suspended, banned, or closed in the configured marketplace
+    MerchantNotTrading = 43,
+    /// Configured marketplace could not be queried for merchant status
+    MerchantStatusCheckFailed = 44,
+    /// Conditional release requires a signed delivery proof
+    SignedProofRequired = 45,
+    /// Signed delivery proof does not match this escrow or valid delivery time
+    InvalidSignedDeliveryProof = 46,
+    /// Delivery oracle public key has not been configured by admin
+    OraclePublicKeyNotSet = 47,
     /// Maximum treasuries exceeded
     MaxTreasuriesExceeded = 42,
     /// Escrow exists but no metadata was stored at creation
@@ -2074,6 +2093,24 @@ impl EscrowContract {
         {
             if pause_state.create_paused {
                 return Err(EscrowError::CreationPaused);
+            }
+        }
+
+        if let Some(registry) = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::MerchantRegistry)
+        {
+            let args = soroban_sdk::vec![&env, seller.to_val()];
+            let status = env.try_invoke_contract::<bool, InvokeError>(
+                &registry,
+                &Symbol::new(&env, "is_merchant_trading"),
+                args,
+            );
+            match status {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => return Err(EscrowError::MerchantNotTrading),
+                _ => return Err(EscrowError::MerchantStatusCheckFailed),
             }
         }
 
@@ -3465,6 +3502,40 @@ impl EscrowContract {
         Ok(true)
     }
 
+    /// Configure the marketplace registry used to reject suspended merchant
+    /// sellers when creating new escrows. Admin-only.
+    pub fn set_merchant_registry(
+        env: Env,
+        admin: Address,
+        registry: Address,
+    ) -> Result<bool, EscrowError> {
+        admin.require_auth();
+        if !Self::is_admin(env.clone(), admin) {
+            return Err(EscrowError::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantRegistry, &registry);
+        Ok(true)
+    }
+
+    /// Configure the Ed25519 public key authorized to sign delivery proofs.
+    /// Admin-only; changing this key immediately changes which proofs are valid.
+    pub fn set_oracle_public_key(
+        env: Env,
+        admin: Address,
+        public_key: BytesN<32>,
+    ) -> Result<bool, EscrowError> {
+        admin.require_auth();
+        if !Self::is_admin(env.clone(), admin) {
+            return Err(EscrowError::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::OraclePublicKey, &public_key);
+        Ok(true)
+    }
+
     /// Set or clear the admin pause flag for new escrow creation. Admin-only.
     pub fn set_create_paused(env: Env, admin: Address, paused: bool) -> Result<bool, EscrowError> {
         admin.require_auth();
@@ -4558,7 +4629,7 @@ mod error_code_allocation_tests {
         (3_000, 3_999),
         (4_000, 4_999),
     ];
-    fn escrow_error_codes() -> [u32; 40] {
+    fn escrow_error_codes() -> [u32; 45] {
         [
             EscrowError::AlreadyInitialized as u32,
             EscrowError::NotFound as u32,
@@ -4600,6 +4671,11 @@ mod error_code_allocation_tests {
             EscrowError::AmountLimitsNotSet as u32,
             EscrowError::FeeConfigNotSet as u32,
             EscrowError::InvalidReleaseRecipient as u32,
+            EscrowError::MerchantNotTrading as u32,
+            EscrowError::MerchantStatusCheckFailed as u32,
+            EscrowError::SignedProofRequired as u32,
+            EscrowError::InvalidSignedDeliveryProof as u32,
+            EscrowError::OraclePublicKeyNotSet as u32,
         ]
     }
     #[test]
