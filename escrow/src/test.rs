@@ -3089,4 +3089,273 @@ use soroban_sdk::{
         }
         assert!(found, "created event with escrow_id topic not found");
     }
+
+    // ─── Feature: bump_ttl_with_bounty ───────────────────────────────────────
+
+    #[test]
+    fn test_bump_ttl_with_bounty_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let keeper = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        token_admin_client.mint(&client.address, &10_000i128);
+        client.add_token(&admin, &token);
+        
+        let order_id = BytesN::from_array(&env, &[1u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
+        );
+        
+        // Bump TTL - should succeed and pay bounty since escrow is close to timeout
+        let result = client.bump_ttl_with_bounty(&escrow_id, &keeper);
+        assert!(result, "bump should succeed");
+    }
+
+    #[test]
+    fn test_bump_ttl_with_bounty_rate_limit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let keeper = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+        
+        let order_id = BytesN::from_array(&env, &[2u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
+        );
+        
+        // First bump should succeed
+        client.bump_ttl_with_bounty(&escrow_id, &keeper);
+        
+        // Immediate second bump should fail due to rate limit
+        let result = client.try_bump_ttl_with_bounty(&escrow_id, &keeper);
+        assert_eq!(result, Err(Ok(EscrowError::BumpRateLimitExceeded)));
+    }
+
+    #[test]
+    fn test_bump_ttl_with_bounty_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _contract_id) = setup_client(&env);
+        let keeper = Address::generate(&env);
+        
+        let result = client.try_bump_ttl_with_bounty(&999u64, &keeper);
+        assert_eq!(result, Err(Ok(EscrowError::NotFound)));
+    }
+
+    // ─── Feature: schedule_fee_update ───────────────────────────────────────
+
+    #[test]
+    fn test_schedule_fee_update_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+        
+        let new_treasury = Address::generate(&env);
+        let result = client.schedule_fee_update(&admin, &200u32, &new_treasury);
+        assert!(result, "schedule_fee_update should succeed");
+        
+        let scheduled = client.get_scheduled_fee_update();
+        assert!(scheduled.is_some(), "scheduled update should exist");
+    }
+
+    #[test]
+    fn test_schedule_fee_update_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _contract_id) = setup_client(&env);
+        let non_admin = Address::generate(&env);
+        
+        let result = client.try_schedule_fee_update(&non_admin, &200u32, &Address::generate(&env));
+        assert_eq!(result, Err(Ok(EscrowError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_schedule_fee_update_invalid_fee() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+        
+        // Fee > 1000 should fail
+        let result = client.try_schedule_fee_update(&admin, &2000u32, &Address::generate(&env));
+        assert_eq!(result, Err(Ok(EscrowError::InvalidFeeBps)));
+    }
+
+    // ─── Feature: shipment_proof for buyer refund precedence ─────────────────
+
+    #[test]
+    fn test_shipment_proof_record_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+        
+        let order_id = BytesN::from_array(&env, &[3u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &100u32, &None, &None,
+        );
+        
+        // Record shipment proof
+        let tracking_hash = BytesN::from_array(&env, &[0u8; 32]);
+        let result = client.record_shipment_proof(
+            &escrow_id, 
+            &seller, 
+            &symbol_short!("fedex"),
+            &tracking_hash,
+            &env.ledger().timestamp(),
+        );
+        assert!(result, "record_shipment_proof should succeed");
+        
+        // Verify proof exists
+        assert!(client.has_shipment_proof(&escrow_id));
+    }
+
+    #[test]
+    fn test_shipment_proof_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+        
+        let order_id = BytesN::from_array(&env, &[4u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &100u32, &None, &None,
+        );
+        
+        // Only seller can record shipment proof
+        let result = client.try_record_shipment_proof(
+            &escrow_id, 
+            &stranger, 
+            &symbol_short!("ups"),
+            &BytesN::from_array(&env, &[0u8; 32]),
+            &env.ledger().timestamp(),
+        );
+        assert_eq!(result, Err(Ok(EscrowError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_buyer_refund_precedence_over_seller_claim() {
+        // This test verifies that when there's no shipment proof,
+        // the buyer has exclusive refund rights on timeout, and seller cannot claim
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        token_admin_client.mint(&seller, &10_000i128); // Seller needs tokens for potential bounty
+        client.add_token(&admin, &token);
+        
+        // Create escrow with very short timeout (so we can test timeout quickly)
+        let order_id = BytesN::from_array(&env, &[5u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &10u32, &None, &None,
+        );
+        
+        // Advance ledger past timeout
+        env.ledger().set_sequence_number(100);
+        
+        // Verify no shipment proof exists
+        assert!(!client.has_shipment_proof(&escrow_id));
+        
+        // Buyer should be able to refund (timeout reached)
+        let result = client.try_refund(&escrow_id, &buyer);
+        assert!(result.is_ok(), "buyer should be able to refund after timeout");
+        
+        // Create another escrow to test seller cannot refund without proof
+        let order_id2 = BytesN::from_array(&env, &[6u8; 32]);
+        let escrow_id2 = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id2, &10u32, &None, &None,
+        );
+        
+        // Seller trying to refund without shipment proof should fail
+        let result2 = client.try_refund(&escrow_id2, &seller);
+        assert_eq!(result2, Err(Ok(EscrowError::TimeoutNotReached)), 
+            "seller cannot refund without shipment proof on timeout");
+        
+        // Now record shipment proof for seller
+        let tracking_hash = BytesN::from_array(&env, &[9u8; 32]);
+        client.record_shipment_proof(
+            &escrow_id2,
+            &seller,
+            &symbol_short!("dhl"),
+            &tracking_hash,
+            &env.ledger().timestamp(),
+        );
+        
+        // After proof is recorded, seller should be able to refund
+        let result3 = client.try_refund(&escrow_id2, &seller);
+        assert!(result3.is_ok(), "seller should be able to refund with shipment proof");
+    }
+
+    // ─── Feature: authorized categories ─────────────────────────────────────
+
+    #[test]
+    fn test_set_authorized_categories() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+        
+        let mut categories = soroban_sdk::Vec::new(&env);
+        categories.push_back(symbol_short!("retail"));
+        categories.push_back(symbol_short!("food"));
+        
+        let result = client.set_authorized_categories(&admin, &categories);
+        assert!(result, "set_authorized_categories should succeed");
+        
+        let stored = client.get_authorized_categories();
+        assert_eq!(stored.len(), 2);
+    }
+
+    #[test]
+    fn test_authorized_categories_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _contract_id) = setup_client(&env);
+        let non_admin = Address::generate(&env);
+        
+        let mut categories = soroban_sdk::Vec::new(&env);
+        categories.push_back(symbol_short!("retail"));
+        
+        let result = client.try_set_authorized_categories(&non_admin, &categories);
+        assert_eq!(result, Err(Ok(EscrowError::Unauthorized)));
+    }
 }

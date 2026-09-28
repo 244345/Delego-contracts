@@ -568,6 +568,53 @@ pub struct TimeoutExtendedEvent {
     pub extension_ledgers: u32,
 }
 
+/// Emitted when a keeper bumps TTL and receives a bounty.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct KeeperBountyPaidEvent {
+    pub escrow_id: u64,
+    pub keeper: Address,
+    pub bounty_amount: i128,
+    pub new_timeout_ledger: u32,
+}
+
+/// Emitted when a scheduled config change becomes effective.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ConfigChangeScheduledEvent {
+    pub fee_bps: u32,
+    pub treasury: Address,
+    pub effective_ledger: u32,
+    pub scheduled_at_ledger: u32,
+    pub scheduled_by: Address,
+}
+
+/// Represents a scheduled fee configuration change.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduledFeeUpdate {
+    pub fee_bps: u32,
+    pub treasury: Address,
+    pub effective_ledger: u32,
+    pub scheduled_at_ledger: u32,
+}
+
+/// On-chain shipment proof record for timeout resolution.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShipmentProof {
+    /// Escrow ID this proof belongs to.
+    pub escrow_id: u64,
+    /// Carrier/shipping provider identifier.
+    pub carrier: Symbol,
+    /// Tracking number hash.
+    pub tracking_hash: BytesN<32>,
+    /// Timestamp when shipment was made.
+    pub shipped_at: u64,
+    /// Block timestamp when proof was recorded.
+    pub recorded_at: u64,
+}
+
 /// Contract version information for deployment scripts and runtime compatibility checks.
 ///
 /// # When to bump
@@ -631,6 +678,8 @@ pub enum DataKey {
     OraclePublicKey,
     /// Marketplace contract used to check whether escrow sellers may trade.
     MerchantRegistry,
+    /// Authorized merchant categories for spend validation (MCC codes).
+    AuthorizedCategories,
     /// Admin flag: when `true`, buyer-originated releases on the escrow must
     /// pass `get_release_eligibility` (issue #48).
     RequireReleaseCondition(u64),
@@ -640,6 +689,12 @@ pub enum DataKey {
     BuyerEscrowCount(Address),
     /// Per-buyer escrow ID at a zero-based index.
     BuyerEscrowAt(Address, u32),
+    /// Last ledger when bump_ttl_with_bounty was called (rate limiting).
+    LastBumpLedger(u64),
+    /// Scheduled fee update pending activation.
+    ScheduledFeeUpdate,
+    /// Shipment proof for an escrow (required for seller claim on timeout).
+    ShipmentProof(u64),
 }
 
 #[contracterror]
@@ -842,6 +897,16 @@ pub enum EscrowError {
     /// Only one of order_hash/schema was supplied; metadata must be provided
     /// fully (both halves) or not at all (issue #38).
     InvalidMetadata = 401,
+    /// Keeper bump rate limit exceeded (minimum time between bumps not elapsed)
+    BumpRateLimitExceeded = 402,
+    /// Escrow TTL not within threshold for bounty payout
+    BumpThresholdNotMet = 403,
+    /// No shipment proof recorded for this escrow
+    ShipmentProofNotFound = 404,
+    /// Scheduled fee update is not yet effective
+    FeeUpdateNotEffective = 405,
+    /// Minimum notice window for fee change not met
+    FeeNoticeWindowNotMet = 406,
 }
 
 /// Compact receipt returned to buyers after escrow creation via `get_receipt`.
@@ -1010,6 +1075,15 @@ const MAX_TREASURIES: u32 = 10;
 /// must not be evicted while funds are still locked.
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280; // ~1 day of ledgers (5s/ledger)
 const PERSISTENT_BUMP_AMOUNT: u32 = 518_400; // ~30 days of ledgers
+
+/// Minimum ledgers between bump_ttl_with_bounty calls to prevent bounty draining.
+const BUMP_RATE_LIMIT_LEDGERS: u32 = 100;
+/// TTL threshold (in ledgers) from expiration to qualify for bounty payout.
+const BUMP_BOUNTY_THRESHOLD_LEDGERS: u32 = 17_280; // ~1 day
+/// Keeper bounty amount instroked (small amount to incentivize maintenance).
+const KEEPER_BOUNTY_AMOUNT: i128 = 1_000_000; // 1 XLM equivalent (assuming 7 decimal tokens)
+/// Minimum ledgers of notice required before fee changes take effect.
+const FEE_NOTICE_WINDOW_LEDGERS: u32 = 10_000;
 
 fn check_not_terminal(record: &EscrowRecord) -> Result<(), EscrowError> {
     match record.status {
@@ -1567,10 +1641,274 @@ impl EscrowContract {
     /// Returns [`EscrowError::FeeConfigNotSet`] when the contract has not
     /// been initialized with fee configuration yet.
     pub fn get_fee_config(env: Env) -> Result<FeeConfig, EscrowError> {
+        // Check for pending scheduled update that is now effective
+        let current_ledger = env.ledger().sequence();
+        if let Some(scheduled) = env
+            .storage()
+            .instance()
+            .get::<_, ScheduledFeeUpdate>(&DataKey::ScheduledFeeUpdate)
+        {
+            if current_ledger >= scheduled.effective_ledger {
+                // Apply the scheduled update
+                let mut fee_config: FeeConfig = Self::get_fee_config(env.clone())?;
+                fee_config.fee_bps = scheduled.fee_bps;
+                fee_config.treasury = scheduled.treasury.clone();
+                env.storage()
+                    .instance()
+                    .set(&DataKey::FeeConfig, &fee_config);
+                // Clear the scheduled update
+                env.storage()
+                    .instance()
+                    .remove(&DataKey::ScheduledFeeUpdate);
+                return Ok(fee_config);
+            }
+        }
+
         env.storage()
             .instance()
             .get(&DataKey::FeeConfig)
             .ok_or(EscrowError::FeeConfigNotSet)
+    }
+
+    /// Schedule a fee update to take effect after the minimum notice window.
+    ///
+    /// Requires admin authentication and enforces a minimum notice period
+    /// of 10,000 ledgers before the new fee takes effect.
+    /// Emits [`ConfigChangeScheduledEvent`] when scheduled.
+    pub fn schedule_fee_update(
+        env: Env,
+        admin: Address,
+        new_fee_bps: u32,
+        new_treasury: Address,
+    ) -> Result<bool, EscrowError> {
+        admin.require_auth();
+        if !Self::is_admin(env.clone(), admin.clone()) {
+            return Err(EscrowError::Unauthorized);
+        }
+        if new_fee_bps > 1000 {
+            return Err(EscrowError::InvalidFeeBps);
+        }
+        if is_zero_address(&env, &new_treasury) {
+            return Err(EscrowError::InvalidAddress);
+        }
+
+        let current_ledger = env.ledger().sequence();
+        let effective_ledger = current_ledger
+            .checked_add(FEE_NOTICE_WINDOW_LEDGERS)
+            .ok_or(EscrowError::InvalidExtension)?;
+
+        let scheduled = ScheduledFeeUpdate {
+            fee_bps: new_fee_bps,
+            treasury: new_treasury.clone(),
+            effective_ledger,
+            scheduled_at_ledger: current_ledger,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::ScheduledFeeUpdate, &scheduled);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("fee_sched")),
+            ConfigChangeScheduledEvent {
+                fee_bps: new_fee_bps,
+                treasury: new_treasury,
+                effective_ledger,
+                scheduled_at_ledger: current_ledger,
+                scheduled_by: admin,
+            },
+        );
+
+        Ok(true)
+    }
+
+    /// Get any pending scheduled fee update.
+    pub fn get_scheduled_fee_update(env: Env) -> Option<ScheduledFeeUpdate> {
+        env.storage()
+            .instance()
+            .get(&DataKey::ScheduledFeeUpdate)
+    }
+
+    /// Extend an escrow's TTL and pay a small keeper bounty if within threshold.
+    ///
+    /// This function allows keepers to extend escrows that are close to expiration
+    /// (within `BUMP_BOUNTY_THRESHOLD_LEDGERS` of their timeout). If the escrow
+    /// is within this threshold, a small bounty is paid to the keeper address.
+    ///
+    /// Rate limiting is enforced to prevent bounty draining - a keeper cannot
+    /// call this function more frequently than `BUMP_RATE_LIMIT_LEDGERS`.
+    ///
+    /// # Arguments
+    /// * `escrow_id` - The ID of the escrow to bump
+    /// * `keeper` - Address that receives the bounty and called the function
+    ///
+    /// # Returns
+    /// * `true` if TTL was extended and bounty paid
+    /// * `false` if TTL was extended but escrow was not within bounty threshold
+    ///
+    /// # Errors
+    /// Returns [`EscrowError::BumpRateLimitExceeded`] if called too soon after last bump.
+    /// Returns [`EscrowError::NotFound`] if escrow does not exist.
+    /// Returns [`EscrowError::InvalidStatus`] if escrow is in a terminal state.
+    pub fn bump_ttl_with_bounty(
+        env: Env,
+        escrow_id: u64,
+        keeper: Address,
+    ) -> Result<bool, EscrowError> {
+        keeper.require_auth();
+
+        // Check rate limiting
+        let current_ledger = env.ledger().sequence();
+        let last_bump: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastBumpLedger(escrow_id))
+            .unwrap_or(0);
+        if current_ledger.saturating_sub(last_bump) < BUMP_RATE_LIMIT_LEDGERS {
+            return Err(EscrowError::BumpRateLimitExceeded);
+        }
+
+        // Get and validate escrow
+        let key = DataKey::Escrow(escrow_id);
+        let mut record: EscrowRecord = match env.storage().persistent().get(&key) {
+            Some(rec) => rec,
+            None => return Err(EscrowError::NotFound),
+        };
+        check_not_terminal(&record)?;
+
+        if record.status != EscrowStatus::Funded {
+            return Err(EscrowError::InvalidStatus);
+        }
+
+        // Calculate ledgers until timeout
+        let ledgers_until_timeout = record
+            .timeout_ledger
+            .saturating_sub(current_ledger);
+
+        // Extend TTL by the bump amount (30 days)
+        let extension = PERSISTENT_BUMP_AMOUNT;
+        let old_timeout = record.timeout_ledger;
+        record.timeout_ledger = record.timeout_ledger.saturating_add(extension);
+        record.updated_at = env.ledger().timestamp();
+
+        // Update storage
+        env.storage().persistent().set(&key, &record);
+        env.storage()
+            .instance()
+            .set(&DataKey::LastBumpLedger(escrow_id), &current_ledger);
+
+        // Extend TTL of the escrow record
+        let storage = env.storage().persistent();
+        storage.extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        // Check if within bounty threshold and pay bounty
+        let bounty_paid = if ledgers_until_timeout <= BUMP_BOUNTY_THRESHOLD_LEDGERS
+            && ledgers_until_timeout > 0
+        {
+            let remaining = record.amount - record.released_amount - record.refunded_amount;
+            if remaining >= KEEPER_BOUNTY_AMOUNT {
+                let token_client = soroban_sdk::token::Client::new(&env, &record.token);
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &keeper,
+                    &KEEPER_BOUNTY_AMOUNT,
+                );
+
+                env.events().publish(
+                    (symbol_short!("escrow"), symbol_short!("bounty"), escrow_id),
+                    KeeperBountyPaidEvent {
+                        escrow_id,
+                        keeper: keeper.clone(),
+                        bounty_amount: KEEPER_BOUNTY_AMOUNT,
+                        new_timeout_ledger: record.timeout_ledger,
+                    },
+                );
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Emit timeout extended event
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("tmo_ext"), escrow_id),
+            EscrowTimeoutExtendedEvent {
+                escrow_id,
+                old_timeout_ledger: old_timeout,
+                new_timeout_ledger: record.timeout_ledger,
+                extended_by: keeper,
+            },
+        );
+
+        Ok(bounty_paid)
+    }
+
+    /// Record an on-chain shipment proof for an escrow.
+    ///
+    /// This proof is required for sellers to claim funds on timeout.
+    /// Without a recorded proof, only the buyer can claim a refund on timeout.
+    pub fn record_shipment_proof(
+        env: Env,
+        escrow_id: u64,
+        caller: Address,
+        carrier: Symbol,
+        tracking_hash: BytesN<32>,
+        shipped_at: u64,
+    ) -> Result<bool, EscrowError> {
+        caller.require_auth();
+
+        let key = DataKey::Escrow(escrow_id);
+        let record: EscrowRecord = match env.storage().persistent().get(&key) {
+            Some(rec) => rec,
+            None => return Err(EscrowError::NotFound),
+        };
+
+        // Only seller can record shipment proof
+        if caller != record.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        // Validate shipment timestamp is reasonable
+        if shipped_at < record.created_at || shipped_at > env.ledger().timestamp() {
+            return Err(EscrowError::InvalidSignedDeliveryProof);
+        }
+
+        let proof = ShipmentProof {
+            escrow_id,
+            carrier,
+            tracking_hash,
+            shipped_at,
+            recorded_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::ShipmentProof(escrow_id), &proof);
+
+        // Extend TTL for the proof
+        let storage = env.storage().persistent();
+        storage.extend_ttl(
+            &DataKey::ShipmentProof(escrow_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Ok(true)
+    }
+
+    /// Get shipment proof for an escrow.
+    pub fn get_shipment_proof(env: Env, escrow_id: u64) -> Result<ShipmentProof, EscrowError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ShipmentProof(escrow_id))
+            .ok_or(EscrowError::ShipmentProofNotFound)
+    }
+
+    /// Check if an escrow has a valid shipment proof.
+    pub fn has_shipment_proof(env: Env, escrow_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::ShipmentProof(escrow_id))
     }
 
     /// Configure the release fee to be split across multiple treasuries. Admin-only.
@@ -2726,6 +3064,9 @@ impl EscrowContract {
             return Err(EscrowError::InvalidReleaseRecipient);
         }
 
+        // Validate seller's merchant category if authorization is configured
+        Self::validate_seller_category(&env, &record.seller)?;
+
         let remaining = record.amount - record.released_amount;
         Self::partial_release(env, escrow_id, caller, remaining)?;
         Ok(true)
@@ -2784,9 +3125,20 @@ impl EscrowContract {
 
         let timeout_reached = env.ledger().sequence() >= record.timeout_ledger;
 
+        // Check for shipment proof - required for seller to claim on timeout
+        let has_proof = env
+            .storage()
+            .persistent()
+            .has(&DataKey::ShipmentProof(escrow_id));
+
         if caller == record.seller || Self::is_admin(env.clone(), caller.clone()) {
-            // Authorized at any time while funded.
+            // Seller or admin: allowed at any time while funded,
+            // BUT on timeout without proof, seller cannot claim (buyer has exclusive refund rights)
+            if timeout_reached && !has_proof {
+                return Err(EscrowError::TimeoutNotReached);
+            }
         } else if caller == record.buyer {
+            // Buyer: can always refund after timeout, even without shipment proof
             if !timeout_reached {
                 return Err(EscrowError::TimeoutNotReached);
             }
@@ -3548,6 +3900,89 @@ impl EscrowContract {
             .instance()
             .set(&DataKey::MerchantRegistry, &registry);
         Ok(true)
+    }
+
+    /// Set authorized merchant categories (MCC codes) for spend validation.
+    ///
+    /// When set, the escrow contract will validate that the seller's merchant
+    /// category matches one of these authorized categories during spend operations.
+    /// This enforces merchant category restrictions as configured by the platform.
+    ///
+    /// Admin-only. Setting an empty list disables category validation.
+    pub fn set_authorized_categories(
+        env: Env,
+        admin: Address,
+        categories: soroban_sdk::Vec<Symbol>,
+    ) -> Result<bool, EscrowError> {
+        admin.require_auth();
+        if !Self::is_admin(env.clone(), admin) {
+            return Err(EscrowError::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::AuthorizedCategories, &categories);
+        Ok(true)
+    }
+
+    /// Get the currently authorized merchant categories.
+    pub fn get_authorized_categories(env: Env) -> soroban_sdk::Vec<Symbol> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AuthorizedCategories)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
+    }
+
+    /// Validate that a seller's merchant category is authorized for spending.
+    ///
+    /// This function checks the marketplace registry to verify the seller's
+    /// category matches one of the authorized categories configured on the escrow.
+    /// Returns `Ok(())` on success, or `Err(EscrowError::MerchantCategoryNotAllowed)` on failure.
+    fn validate_seller_category(
+        env: &Env,
+        seller: &Address,
+    ) -> Result<(), EscrowError> {
+        // Get authorized categories
+        let authorized_categories = Self::get_authorized_categories(env.clone());
+
+        // If no categories configured, skip validation
+        if authorized_categories.is_empty() {
+            return Ok(());
+        }
+
+        // Get marketplace registry
+        let registry: Address = match env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::MerchantRegistry)
+        {
+            Some(r) => r,
+            None => return Ok(()), // No registry, skip validation
+        };
+
+        // Try calling the marketplace to validate merchant category by seller address
+        let result = env.try_invoke_contract::<u64, EscrowError>(
+            &registry,
+            &Symbol::new(env, "get_merchant_id_by_owner"),
+            soroban_sdk::vec![env, seller.to_val()],
+        );
+
+        let merchant_id = match result {
+            Ok(Ok(id)) => id,
+            _ => return Ok(()), // If we can't find merchant, allow (fail open)
+        };
+
+        // Now validate the category
+        let args = soroban_sdk::vec![env, merchant_id.to_val(), authorized_categories.to_val()];
+        let validation_result = env.try_invoke_contract::<(), EscrowError>(
+            &registry,
+            &Symbol::new(env, "validate_merchant_category"),
+            args,
+        );
+
+        match validation_result {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(EscrowError::MerchantCategoryNotAllowed),
+        }
     }
 
     /// Configure the Ed25519 public key authorized to sign delivery proofs.

@@ -212,6 +212,8 @@ pub enum MarketplaceError {
     VerificationCountOverflow = 4017,
     DuplicateMerchantOwner = 4018,
     MerchantBanned = 4019,
+    /// Merchant category does not match authorized categories for this operation
+    MerchantCategoryNotAllowed = 4020,
 }
 
 // --- Events ---
@@ -1308,6 +1310,95 @@ impl MarketplaceContract {
         Self::bump_merchant_state(&env, merchant_id);
 
         Ok(merchant)
+    }
+
+    /// Validate that a merchant's category matches one of the authorized categories.
+    ///
+    /// This is used by the escrow contract to enforce merchant category restrictions
+    /// during spend operations. The merchant must be active and verified.
+    ///
+    /// # Arguments
+    /// * `merchant_id` - The ID of the merchant to validate
+    /// * `authorized_categories` - List of category symbols that are allowed
+    ///
+    /// # Returns
+    /// * `Ok(())` if the merchant's category is in the authorized list
+    /// * `Err(MarketplaceError::MerchantCategoryNotAllowed)` if category doesn't match
+    /// * `Err(MarketplaceError::MerchantNotFound)` if merchant doesn't exist
+    /// * `Err(MarketplaceError::MerchantFrozen)` if merchant is suspended
+    /// * `Err(MarketplaceError::MerchantClosed)` if merchant is closed
+    /// * `Err(MarketplaceError::MerchantBanned)` if merchant is banned
+    pub fn validate_merchant_category(
+        env: Env,
+        merchant_id: u64,
+        authorized_categories: soroban_sdk::Vec<Symbol>,
+    ) -> Result<(), MarketplaceError> {
+        let merchant = Self::get_merchant(env.clone(), merchant_id)?;
+
+        // Check merchant status - must be active (Verified or Registered)
+        match merchant.status {
+            MerchantStatus::Verified | MerchantStatus::Registered => {}
+            MerchantStatus::Suspended => return Err(MarketplaceError::MerchantFrozen),
+            MerchantStatus::Closed => return Err(MarketplaceError::MerchantClosed),
+            MerchantStatus::Banned => return Err(MarketplaceError::MerchantBanned),
+            MerchantStatus::All => {
+                // This is a sentinel value, should never reach here
+                return Err(MarketplaceError::InvalidParam);
+            }
+        }
+
+        // Check if merchant's category is in the authorized list
+        let mut authorized = false;
+        for cat in authorized_categories.iter() {
+            if cat == merchant.category || normalize_symbol(&env, &cat) == merchant.category {
+                authorized = true;
+                break;
+            }
+        }
+
+        if !authorized {
+            return Err(MarketplaceError::MerchantCategoryNotAllowed);
+        }
+
+        Ok(())
+    }
+
+    /// Get merchant category by ID (convenience function for cross-contract calls).
+    pub fn get_merchant_category(env: Env, merchant_id: u64) -> Result<Symbol, MarketplaceError> {
+        let merchant = Self::get_merchant(env, merchant_id)?;
+        Ok(merchant.category)
+    }
+
+    /// Get merchant ID by owner address.
+    ///
+    /// This is used by the escrow contract to validate merchant categories.
+    /// Returns the merchant ID if found, or 0 if no merchant is registered for this owner.
+    pub fn get_merchant_id_by_owner(env: Env, owner: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantOwner(owner))
+            .unwrap_or(0)
+    }
+
+    /// Validate a merchant's category against authorized categories.
+    ///
+    /// Used by escrow contract for spend validation.
+    /// Returns Ok(()) if valid, or error if not allowed.
+    pub fn validate_merchant_category_by_seller(
+        env: Env,
+        seller: Address,
+        authorized_categories: soroban_sdk::Vec<Symbol>,
+    ) -> Result<(), MarketplaceError> {
+        // First get the merchant ID by owner
+        let merchant_id = Self::get_merchant_id_by_owner(env.clone(), seller);
+        
+        // If no merchant found, allow (non-marketplace seller)
+        if merchant_id == 0 {
+            return Ok(());
+        }
+        
+        // Now validate the category
+        Self::validate_merchant_category(env, merchant_id, authorized_categories)
     }
 
     pub fn get_merchant_view_detailed(env: Env, merchant_id: u64) -> Result<MerchantViewDetailed, MarketplaceError> {
