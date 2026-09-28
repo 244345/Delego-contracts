@@ -246,6 +246,8 @@ pub enum DelegationError {
     NotInitialized = 312,
     /// The provided TTL is invalid (must be greater than 0).
     InvalidTtl = 313,
+    /// The caller is not authorized to perform admin operations.
+    NotAuthorized = 314,
 }
 
 /// The delegation registry contract.
@@ -564,6 +566,57 @@ impl DelegationRegistry {
             .ok_or(DelegationError::NotFound)?;
 
         record.owner.require_auth();
+
+        if record.status == DelegationStatus::Revoked {
+            return Ok(false);
+        }
+
+        record.status = DelegationStatus::Revoked;
+        record.version = Self::increment_version(&env, delegation_id);
+        record.updated_at = env.ledger().timestamp();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Delegation(delegation_id), &record);
+
+        Self::store_snapshot(&env, delegation_id, &record);
+
+        env.events().publish(
+            (symbol_short!("deleg"), symbol_short!("revoked")),
+            DelegationRevokedEvent {
+                delegation_id,
+                owner: record.owner.clone(),
+                agent: record.agent_id.clone(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(true)
+    }
+
+    /// Admin force-revokes a delegation regardless of owner consent.
+    /// This is an emergency function for compromised delegations.
+    ///
+    /// Returns `Ok(true)` if the delegation transitioned to `Revoked`.
+    /// Returns `Ok(false)` if the delegation was already `Revoked` (idempotent no-op).
+    pub fn admin_revoke(env: Env, caller: Address, delegation_id: u64) -> Result<bool, DelegationError> {
+        caller.require_auth();
+
+        let admin = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .expect("Admin not set");
+
+        if caller != admin {
+            return Err(DelegationError::NotAuthorized);
+        }
+
+        let mut record: DelegationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(delegation_id))
+            .ok_or(DelegationError::NotFound)?;
 
         if record.status == DelegationStatus::Revoked {
             return Ok(false);
@@ -1060,7 +1113,7 @@ impl DelegationRegistry {
             .storage()
             .persistent()
             .get(&DataKey::DelegationHistory(delegation_id))
-            .unwrap_or(Vec::new(env));
+            .unwrap_or(Vec::new(&env));
         history.push_back(snapshot);
         env.storage()
             .persistent()
@@ -1091,6 +1144,7 @@ mod error_code_uniqueness_tests {
             (DelegationError::NoPendingAdmin, 311u32),
             (DelegationError::NotInitialized, 312u32),
             (DelegationError::InvalidTtl, 313u32),
+            (DelegationError::NotAuthorized, 314u32),
         ];
 
         for (variant, expected) in codes {
@@ -1111,6 +1165,7 @@ mod error_code_uniqueness_tests {
             DelegationError::NoPendingAdmin as u32,
             DelegationError::NotInitialized as u32,
             DelegationError::InvalidTtl as u32,
+            DelegationError::NotAuthorized as u32,
         ];
         seen.sort_unstable();
         for pair in seen.windows(2) {

@@ -1274,3 +1274,86 @@ fn test_create_delegation_ttl_one_succeeds() {
     assert_eq!(record.expires_at_ledger, env.ledger().sequence() + 1);
     assert_eq!(record.status, DelegationStatus::Active);
 }
+
+#[test]
+fn test_admin_can_force_revoke() {
+    let (env, client, admin, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Admin_Revoke");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    // Verify delegation is initially active
+    assert_eq!(client.get_delegation(&id).status, DelegationStatus::Active);
+    assert!(client.is_authorized(&id, &agent_id));
+
+    // Admin force-revokes the delegation
+    let result = client.admin_revoke(&admin, &id);
+    assert!(result);
+
+    // Verify delegation is now revoked
+    let record = client.get_delegation(&id);
+    assert_eq!(record.status, DelegationStatus::Revoked);
+    assert!(!client.is_authorized(&id, &agent_id));
+
+    // Version should increment
+    assert_eq!(client.get_delegation_version(&id), 2);
+}
+
+#[test]
+fn test_non_admin_cannot_force_revoke() {
+    let (env, client, _admin, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Non_Admin_Revoke");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    // Try to force-revoke with a non-admin address
+    let non_admin = Address::generate(&env);
+    let result = client.try_admin_revoke(&non_admin, &id);
+
+    // Should fail with NotAuthorized error
+    assert_eq!(result, Err(Ok(DelegationError::NotAuthorized)));
+
+    // Delegation should remain active
+    assert_eq!(client.get_delegation(&id).status, DelegationStatus::Active);
+    assert!(client.is_authorized(&id, &agent_id));
+
+    // Version should remain unchanged
+    assert_eq!(client.get_delegation_version(&id), 1);
+}
+
+#[test]
+fn test_admin_revoke_idempotency() {
+    let (env, client, admin, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Admin_Revoke_Idempotent");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    // First admin revoke should return true
+    let first_result = client.admin_revoke(&admin, &id);
+    assert!(first_result);
+    assert_eq!(client.get_delegation(&id).status, DelegationStatus::Revoked);
+    assert_eq!(client.get_delegation_version(&id), 2);
+
+    // Second admin revoke should return false (idempotent no-op)
+    let second_result = client.admin_revoke(&admin, &id);
+    assert!(!second_result);
+    assert_eq!(client.get_delegation(&id).status, DelegationStatus::Revoked);
+
+    // Version should remain unchanged on idempotent call
+    assert_eq!(client.get_delegation_version(&id), 2);
+}
+
+#[test]
+fn test_admin_revoke_nonexistent_delegation() {
+    let (env, client, admin, _, _, _) = setup();
+    env.mock_all_auths();
+
+    // Try to admin revoke a non-existent delegation
+    let result = client.try_admin_revoke(&admin, &9999u64);
+
+    // Should fail with NotFound error
+    assert_eq!(result, Err(Ok(DelegationError::NotFound)));
+}
