@@ -135,17 +135,37 @@ pub struct PartialRefundResult {
     pub fully_refunded: bool,
 }
 
-/// Configured external condition that gates release of an escrow via
-/// `evaluate_and_release` (issue #339).
+/// Legacy condition metadata retained for storage compatibility.
 ///
-/// `oracle_contract` must expose a `resolve(condition_type: Symbol) -> bool`
-/// function. `evaluate_and_release` calls it and only releases funds when it
-/// returns `true`.
+/// A boolean response from `oracle_contract` is no longer sufficient to
+/// authorize release; use `SignedDeliveryProof` and
+/// `verify_delivery_and_release` instead.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReleaseCondition {
     pub condition_type: Symbol,
     pub oracle_contract: Address,
+}
+
+/// Delivery attestation signed by the configured Ed25519 delivery oracle.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignedDeliveryProof {
+    pub escrow_id: u64,
+    pub carrier_code: Symbol,
+    pub tracking_hash: BytesN<32>,
+    pub delivery_timestamp: u64,
+    pub oracle_pubkey: BytesN<32>,
+    pub signature: BytesN<64>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SignedDeliveryPayload {
+    escrow_id: u64,
+    carrier_code: Symbol,
+    tracking_hash: BytesN<32>,
+    delivery_timestamp: u64,
 }
 
 /// Emitted when a new escrow is created.
@@ -2884,20 +2904,30 @@ impl EscrowContract {
             .ok_or(EscrowError::ReleaseConditionNotSet)
     }
 
-    /// Query the configured oracle and release the full remaining balance to the
-    /// seller if the condition it reports is met (issue #339). The seller
-    /// receives the remaining balance minus the platform fee (issue #27).
-    ///
-    /// Any caller may trigger evaluation once a condition has been configured via
-    /// `set_release_condition` — authorization to move funds comes from the
-    /// oracle's answer, not from the caller's identity. The oracle call is made
-    /// via `try_invoke_contract` so a missing contract, a wrong/missing
-    /// `resolve` function, or a panic inside the oracle all surface as
-    /// `EscrowError::OracleCallFailed` instead of aborting this transaction.
+    /// Deprecated insecure bool-oracle release path. It remains in the ABI for
+    /// compatibility but never releases funds; use
+    /// `verify_delivery_and_release` with an oracle signature instead.
     pub fn evaluate_and_release(
+        env: Env,
+        _escrow_id: u64,
+        caller: Address,
+    ) -> Result<PartialReleaseResult, EscrowError> {
+        caller.require_auth();
+        Err(EscrowError::SignedProofRequired)
+    }
+
+    /// Verify an oracle-signed delivery attestation and release the escrow's
+    /// full remaining balance to its seller.
+    ///
+    /// The signed payload consists of the XDR encoding of `escrow_id`,
+    /// `carrier_code`, `tracking_hash`, and `delivery_timestamp`. The proof's
+    /// public key must equal the admin-configured key, and the delivery time
+    /// must fall between escrow creation and the current ledger timestamp.
+    pub fn verify_delivery_and_release(
         env: Env,
         escrow_id: u64,
         caller: Address,
+        proof: SignedDeliveryProof,
     ) -> Result<PartialReleaseResult, EscrowError> {
         caller.require_auth();
 
@@ -2906,33 +2936,34 @@ impl EscrowContract {
             Some(rec) => rec,
             None => return Err(EscrowError::NotFound),
         };
-
         check_not_terminal(&record)?;
         if record.status != EscrowStatus::Funded {
             return Err(EscrowError::InvalidStatus);
         }
 
-        let condition: ReleaseCondition = env
+        let configured_key: BytesN<32> = env
             .storage()
-            .persistent()
-            .get(&DataKey::ReleaseCondition(escrow_id))
-            .ok_or(EscrowError::ReleaseConditionNotSet)?;
-
-        let args = soroban_sdk::vec![&env, condition.condition_type.to_val()];
-        let call_result = env.try_invoke_contract::<bool, InvokeError>(
-            &condition.oracle_contract,
-            &symbol_short!("resolve"),
-            args,
-        );
-
-        let condition_met = match call_result {
-            Ok(Ok(met)) => met,
-            _ => return Err(EscrowError::OracleCallFailed),
-        };
-
-        if !condition_met {
-            return Err(EscrowError::ConditionNotMet);
+            .instance()
+            .get(&DataKey::OraclePublicKey)
+            .ok_or(EscrowError::OraclePublicKeyNotSet)?;
+        if proof.escrow_id != escrow_id
+            || proof.oracle_pubkey != configured_key
+            || proof.delivery_timestamp < record.created_at
+            || proof.delivery_timestamp > env.ledger().timestamp()
+        {
+            return Err(EscrowError::InvalidSignedDeliveryProof);
         }
+
+        use soroban_sdk::xdr::ToXdr;
+        let payload = SignedDeliveryPayload {
+            escrow_id: proof.escrow_id,
+            carrier_code: proof.carrier_code,
+            tracking_hash: proof.tracking_hash,
+            delivery_timestamp: proof.delivery_timestamp,
+        }
+        .to_xdr(&env);
+        env.crypto()
+            .ed25519_verify(&configured_key, &payload, &proof.signature);
 
         let remaining = record.amount - record.released_amount;
         Self::execute_release(&env, escrow_id, &key, record, caller, remaining)

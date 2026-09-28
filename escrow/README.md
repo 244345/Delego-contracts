@@ -32,6 +32,7 @@ Soroban smart contract for holding purchase funds until fulfillment.
 | `get_quorum_config` | — | Current arbiter quorum config |
 | `get_dispute_votes` | — | Votes cast on a disputed escrow |
 | `get_create_paused` | — | Whether new escrow creation is paused |
+| `verify_delivery_and_release` | caller | Verify an Ed25519 delivery proof and release funds |
 | `get_admin` | — | Current primary admin and pending transfer target |
 | `set_limits` | admin | Update amount limits |
 | `set_quorum_config` | admin | Update arbiter list and threshold |
@@ -41,6 +42,8 @@ Soroban smart contract for holding purchase funds until fulfillment.
 | `list_tokens` | — | List all whitelisted tokens |
 | `is_token_allowed` | — | Check if a token is whitelisted |
 | `set_create_paused` | admin | Pause or unpause new escrow creation |
+| `set_merchant_registry` | admin | Configure marketplace checks for seller trading status |
+| `set_oracle_public_key` | admin | Configure the Ed25519 key accepted for delivery proofs |
 | `propose_admin` | primary admin | Start a two-step admin transfer |
 | `accept_admin` | pending admin | Accept the admin role |
 | `cancel_admin_transfer` | primary admin | Cancel a pending admin transfer |
@@ -176,3 +179,15 @@ Buyer escrow pagination uses `BuyerEscrowCount(buyer)` and one persistent
 `BuyerEscrowAt(buyer, index)` entry per escrow. This keeps each storage entry
 bounded as a buyer accumulates orders; `list_escrows_by_buyer` reads only the
 requested page of indices.
+
+Configure the marketplace address with `set_merchant_registry` to block new
+escrows for suspended, banned, or closed merchant owners. A configured
+registry failure rejects creation. Delivery releases require the admin-set
+Ed25519 key and a `SignedDeliveryProof`; the legacy boolean
+`evaluate_and_release` entry point remains for ABI compatibility but always
+returns `SignedProofRequired`.
+
+The oracle signs the XDR encoding of the ordered payload fields
+`(escrow_id, carrier_code, tracking_hash, delivery_timestamp)`. The proof is
+accepted only for the configured public key and when the delivery timestamp is
+between the escrow's creation timestamp and the current ledger timestamp.
