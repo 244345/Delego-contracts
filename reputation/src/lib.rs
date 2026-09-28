@@ -265,6 +265,9 @@ pub struct EntityHistoryPrunedEvent {
     pub entity: Address,
     pub pruned_count: u32,
     pub pruned_by: Address,
+}
+
+#[contracttype]
 pub struct ScoreAccumulator {
     pub decay_window_seconds: u64,
     pub weighted_value_sum: i128,
@@ -340,23 +343,51 @@ fn outcome_value_bps(outcome: &TransactionOutcome) -> i128 {
 /// remainder — a deterministic fixed-point approximation of `e^(-lambda *
 /// t)` accurate to a few percent, which is sufficient for reputation
 /// weighting.
+///
+/// The public score helper uses the same fixed-point curve with a zero
+/// baseline, so historical values converge to zero after sustained inactivity.
+/// A zero half-life disables decay and returns the historical score unchanged.
+pub fn calculate_decayed_score(
+    historical_score: u32,
+    ledgers_elapsed: u32,
+    half_life_ledgers: u32,
+) -> u32 {
+    fixed_point_decay(
+        historical_score as u64,
+        ledgers_elapsed as u64,
+        half_life_ledgers as u64,
+        u32::BITS as u64,
+    ) as u32
+}
+
+fn fixed_point_decay(
+    historical_score: u64,
+    elapsed: u64,
+    half_life: u64,
+    max_halvings: u64,
+) -> u64 {
+    if half_life == 0 {
+        return historical_score;
+    }
+
+    let full_halvings = elapsed / half_life;
+    if full_halvings >= max_halvings {
+        return 0;
+    }
+
+    let base = historical_score >> full_halvings;
+    let remainder = elapsed % half_life;
+    let decrement = (u128::from(base) * u128::from(remainder) / (2 * u128::from(half_life))) as u64;
+    base.saturating_sub(decrement)
+}
+
 fn recency_weight_bps(elapsed_secs: u64, decay_window_secs: u64) -> i128 {
-    if decay_window_secs == 0 {
-        return BPS_SCALE;
-    }
-    let full_halvings = elapsed_secs / decay_window_secs;
-    if full_halvings >= MAX_HALVINGS {
-        return 0;
-    }
-    let remainder_secs = elapsed_secs % decay_window_secs;
-    let base = BPS_SCALE >> full_halvings;
-    if base == 0 {
-        return 0;
-    }
-    let numerator = base * (remainder_secs as i128);
-    let denominator = 2 * (decay_window_secs as i128);
-    let decrement = numerator / denominator;
-    (base - decrement).max(0)
+    fixed_point_decay(
+        BPS_SCALE as u64,
+        elapsed_secs,
+        decay_window_secs,
+        MAX_HALVINGS,
+    ) as i128
 }
 
 #[contract]
@@ -620,7 +651,7 @@ impl ReputationContract {
         entity: Address,
     ) -> Result<ScoreDecomposition, ReputationError> {
         let rep = Self::load_or_default_reputation(&env, &entity);
-        let (decomposition, _, _) =
+        let (decomposition, _, _, _) =
             Self::compute_score_components(&env, &entity, rep.total_transactions)?;
         Ok(decomposition)
     }
@@ -809,21 +840,7 @@ impl ReputationContract {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
 
-        // Check if entity has any flags at all
         if flags.is_empty() {
-            return Err(ReputationError::EntityNotFound);
-        }
-
-        // Check if reporter has any flags (active or resolved) for this entity
-        let has_any_flag = flags.iter().any(|f| f.reporter == reporter);
-        if !has_any_flag {
-            return Err(ReputationError::NotFlagReporter);
-            return Err(ReputationError::NoActiveFlag);
-        // Error taxonomy (see ReputationError):
-        // - entity never seen on-chain (no reputation record, no relation) → EntityNotFound
-        // - entity known, but there is no flag to resolve for it → NoActiveFlag
-        // - entity has flags, but none from this reporter → NotFlagReporter
-        // - reporter's flag exists but is already resolved → NoActiveFlag
             let entity_known = env
                 .storage()
                 .persistent()
@@ -836,38 +853,16 @@ impl ReputationContract {
             });
         }
 
+        let has_any_flag = flags.iter().any(|f| f.reporter == reporter);
+        if !has_any_flag {
+            return Err(ReputationError::NotFlagReporter);
+        }
+
         let idx = flags
             .iter()
             .position(|f| f.reporter == reporter && !f.resolved)
             .ok_or(ReputationError::NoActiveFlag)?;
-        // Distinguish between "no flags exist at all" and "flags exist but
-        // none are from this reporter" so callers get a precise error.
-        let idx = if flags.is_empty() {
-            return Err(ReputationError::NoActiveFlag);
-        } else {
-            flags
-                .iter()
-                .position(|f| f.reporter == reporter && !f.resolved)
-                .ok_or(ReputationError::NotFlagReporter)?
-        };
-            .position(|f| f.reporter == reporter)
-            .ok_or(ReputationError::NotFlagReporter)?;
-            .position(|f| f.reporter == reporter && !f.resolved);
-        let Some(idx) = idx else {
-            // Distinguish why there is no active flag to clear for `reporter`
-            // so off-chain tooling can react appropriately.
-            if !flags.iter().any(|f| !f.resolved) || flags.iter().any(|f| f.reporter == reporter) {
-                // Nothing active on the entity at all, or `reporter`'s own
-                // flags are all already resolved.
-                return Err(ReputationError::NoActiveFlag);
-            }
-            // Some other reporter's flag is active; `reporter` has never
-            // flagged this entity.
-            return Err(ReputationError::NotFlagReporter);
         let mut flag = flags.get(idx as u32).unwrap();
-        if flag.resolved {
-            return Err(ReputationError::NoActiveFlag);
-        }
         flag.resolved = true;
         flags.set(idx as u32, flag);
         env.storage().persistent().set(&key, &flags);
@@ -1278,10 +1273,10 @@ impl ReputationContract {
             return Self::recompute_score(env, entity);
         }
 
-        let mut accumulator: ScoreAccumulator = match env
-            .storage()
-            .persistent()
-            .get(&DataKey::ScoreAccumulator(entity.clone()))
+        let mut accumulator: ScoreAccumulator = match env.storage().persistent().get::<
+            DataKey,
+            ScoreAccumulator,
+        >(&DataKey::ScoreAccumulator(entity.clone()))
         {
             Some(acc) if acc.decay_window_seconds == config.decay_window_seconds => acc,
             None if history_len_before == 0 => ScoreAccumulator {
@@ -1373,7 +1368,7 @@ impl ReputationContract {
         env: &Env,
         entity: &Address,
         total_transactions: u64,
-    ) -> Result<(ScoreDecomposition, u32, u64), ReputationError> {
+    ) -> Result<(ScoreDecomposition, u32, u64, ScoreAccumulator), ReputationError> {
         let config = Self::get_config(env.clone())?;
 
         let history: Vec<u64> = env
@@ -1456,6 +1451,7 @@ impl ReputationContract {
             },
             avg_rating,
             now,
+            accumulator,
         ))
     }
 
@@ -1481,7 +1477,7 @@ impl ReputationContract {
     /// and [`Self::apply_outcome_change_counts`] — so they are left as-is here.
     fn recompute_score(env: &Env, entity: &Address) -> Result<ReputationScore, ReputationError> {
         let mut rep = Self::load_or_default_reputation(env, entity);
-        let (decomposition, avg_rating, now) =
+        let (decomposition, avg_rating, now, accumulator) =
             Self::compute_score_components(env, entity, rep.total_transactions)?;
         rep.score = decomposition.final_score;
         rep.avg_rating = avg_rating;
@@ -1507,6 +1503,7 @@ impl ReputationContract {
         env.events().publish(
             (symbol_short!("reput"), symbol_short!("score_dec")),
             decomposition,
+        );
         Ok(rep)
     }
 }
