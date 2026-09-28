@@ -127,6 +127,9 @@ pub enum PermissionError {
     InvalidExpiry = 2412,
     /// Admin-gated call made before `set_admin` has ever been called
     NotInitialized = 2500,
+    /// Nonce cancellation targets a nonce that was already consumed or
+    /// would overflow the nonce counter (issue #297)
+    NonceAlreadyUsed = 2413,
 }
 
 #[cfg(test)]
@@ -170,6 +173,7 @@ mod error_code_tests {
         PermissionError::LimitBelowSpent as u32,
         PermissionError::ExceedsAllowance as u32,
         PermissionError::NotInitialized as u32,
+        PermissionError::NonceAlreadyUsed as u32,
     ];
 
     #[test]
@@ -380,6 +384,44 @@ pub struct RelayedSpendMessage {
     pub amount: i128,
     pub nonce: u64,
     pub expiration_ledger: u32,
+}
+
+/// Owner-controlled, seller-specific allowlist enforced on every spend for a
+/// sensitive `(owner, delegate)` delegation (issue #296).
+///
+/// When `is_enabled` is true, spends (direct and relayed) are only permitted
+/// to merchants in `merchants`; an enabled allowlist with no entries blocks
+/// all spends (fail-closed). Bounded by `MAX_MERCHANTS_PER_PERMISSION`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub struct MerchantAllowlist {
+    pub is_enabled: bool,
+    pub merchants: Vec<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+/// Emitted when a delegation's seller allowlist is set or updated (issue #296).
+#[allow(missing_docs)]
+pub struct MerchantAllowlistUpdatedEvent {
+    pub owner: Address,
+    pub delegate: Address,
+    pub is_enabled: bool,
+    pub merchant_count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+/// Emitted when an owner cancels stalled relayer nonces (issue #297).
+#[allow(missing_docs)]
+pub struct NonceCancelledEvent {
+    pub owner: Address,
+    pub delegate: Address,
+    /// Highest nonce invalidated by this call.
+    pub cancelled_nonce: u64,
+    /// Next nonce a relayed spend must use after the cancellation.
+    pub next_nonce: u64,
 }
 
 #[contracttype]
@@ -743,6 +785,8 @@ pub enum DataKey {
     AuditLogCount(Address, Address),
     /// Index of delegate addresses granted by a given owner.
     UserPermissions(Address),
+    /// Seller-specific allowlist for a sensitive (owner, delegate) delegation.
+    MerchantAllowlist(Address, Address),
 }
 
 #[contract]
@@ -1617,7 +1661,101 @@ impl PermissionsContract {
             }
         }
 
+        Self::check_merchant_allowlist(&env, &owner, &delegate, &merchant)?;
+
         Ok(())
+    }
+
+    /// Rejects a spend to `merchant` when the `(owner, delegate)` pair has an
+    /// enabled seller allowlist that does not contain it (issue #296). Runs
+    /// from `can_spend`, so direct and relayed spends are both covered.
+    fn check_merchant_allowlist(
+        env: &Env,
+        owner: &Address,
+        delegate: &Address,
+        merchant: &Address,
+    ) -> Result<(), PermissionError> {
+        if let Some(allowlist) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, MerchantAllowlist>(&DataKey::MerchantAllowlist(
+                owner.clone(),
+                delegate.clone(),
+            ))
+        {
+            if allowlist.is_enabled && !allowlist.merchants.contains(merchant) {
+                return Err(PermissionError::MerchantNotAllowed);
+            }
+        }
+        Ok(())
+    }
+
+    /// Sets the seller-specific allowlist for a sensitive `(owner, delegate)`
+    /// delegation (issue #296). Must be authorized by the owner, and a
+    /// permission must already exist for the pair.
+    ///
+    /// While `is_enabled` is true, spends to any merchant not in `merchants`
+    /// fail with [`PermissionError::MerchantNotAllowed`]. `merchants` must
+    /// contain no duplicates and at most `MAX_MERCHANTS_PER_PERMISSION`
+    /// entries, otherwise [`PermissionError::InvalidParam`] is returned.
+    pub fn set_merchant_allowlist(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        is_enabled: bool,
+        merchants: Vec<Address>,
+    ) -> Result<(), PermissionError> {
+        owner.require_auth();
+
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Permission(owner.clone(), delegate.clone()))
+        {
+            return Err(PermissionError::PermissionNotFound);
+        }
+
+        Self::validate_merchant_list(&env, &merchants)?;
+
+        let merchant_count = merchants.len();
+        env.storage().persistent().set(
+            &DataKey::MerchantAllowlist(owner.clone(), delegate.clone()),
+            &MerchantAllowlist {
+                is_enabled,
+                merchants,
+            },
+        );
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("allowlst")),
+            MerchantAllowlistUpdatedEvent {
+                owner: owner.clone(),
+                delegate: delegate.clone(),
+                is_enabled,
+                merchant_count,
+            },
+        );
+
+        Self::append_audit_log(
+            &env,
+            &owner,
+            &delegate,
+            owner.clone(),
+            symbol_short!("allowlst"),
+        );
+
+        Ok(())
+    }
+
+    /// Returns the seller allowlist configured for `(owner, delegate)`, if any.
+    pub fn get_merchant_allowlist(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+    ) -> Option<MerchantAllowlist> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantAllowlist(owner, delegate))
     }
 
     pub fn execute_spend(
@@ -1811,6 +1949,67 @@ impl PermissionsContract {
             .unwrap_or(0)
     }
 
+    /// Invalidates a stalled relayer nonce (and every nonce below it) for the
+    /// `(owner, delegate)` pair so later signed spends are no longer blocked
+    /// behind a dropped or censored submission (issue #297).
+    ///
+    /// Must be authorized by the owner. `nonce` must be at least the current
+    /// expected nonce; the expected nonce is advanced to `nonce + 1`, so any
+    /// outstanding signed message carrying a cancelled nonce is rejected with
+    /// [`PermissionError::InvalidNonce`]. The delegation itself is untouched.
+    ///
+    /// # Errors
+    /// - [`PermissionError::PermissionNotFound`] if no permission exists.
+    /// - [`PermissionError::NonceAlreadyUsed`] if `nonce` was already consumed
+    ///   or cancelled, or if advancing past it would overflow.
+    pub fn cancel_nonce(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        nonce: u64,
+    ) -> Result<(), PermissionError> {
+        owner.require_auth();
+
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Permission(owner.clone(), delegate.clone()))
+        {
+            return Err(PermissionError::PermissionNotFound);
+        }
+
+        let nonce_key = DataKey::RelayerNonce(owner.clone(), delegate.clone());
+        let expected_nonce: u64 = env.storage().persistent().get(&nonce_key).unwrap_or(0);
+        if nonce < expected_nonce {
+            return Err(PermissionError::NonceAlreadyUsed);
+        }
+        let next_nonce = nonce
+            .checked_add(1)
+            .ok_or(PermissionError::NonceAlreadyUsed)?;
+
+        env.storage().persistent().set(&nonce_key, &next_nonce);
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("nonce_cxl")),
+            NonceCancelledEvent {
+                owner: owner.clone(),
+                delegate: delegate.clone(),
+                cancelled_nonce: nonce,
+                next_nonce,
+            },
+        );
+
+        Self::append_audit_log(
+            &env,
+            &owner,
+            &delegate,
+            owner.clone(),
+            symbol_short!("nonce_cxl"),
+        );
+
+        Ok(())
+    }
+
     /// Execute a spend on the delegate's behalf from a relayer, without
     /// requiring the delegate to submit (or pay fees for) the transaction
     /// themselves.
@@ -1885,7 +2084,8 @@ impl PermissionsContract {
 
         // Advance the nonce before mutating spend state so a replay attempt
         // within the same ledger is rejected even if apply_spend panics.
-        env.storage().persistent().set(&nonce_key, &(nonce + 1));
+        let next_nonce = nonce.checked_add(1).ok_or(PermissionError::InvalidNonce)?;
+        env.storage().persistent().set(&nonce_key, &next_nonce);
 
         // apply_spend increments the child record, walks the full parent chain,
         // updates usage stats, and records the last spend ledger — identical to

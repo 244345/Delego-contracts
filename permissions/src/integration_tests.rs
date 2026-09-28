@@ -1,8 +1,8 @@
 #![cfg(test)]
 
 use crate::{
-    PermissionError, PermissionStatus, PermissionsContract, PermissionsContractClient,
-    RelayedSpendMessage,
+    MerchantAllowlist, PermissionError, PermissionStatus, PermissionsContract,
+    PermissionsContractClient, RelayedSpendMessage,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
@@ -1343,4 +1343,262 @@ fn test_validate_chain_prevents_mutation_on_exceeds_parent_limit() {
     assert_eq!(client.get_remaining_allowance(&t.agent, &child_delegate), 100);
     // Parent state should not be further mutated (spent is 50, remaining is 50)
     assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 50);
+}
+
+// ── Issue #296: seller-specific allowlist ─────────────────────────────────
+
+#[test]
+fn test_merchant_allowlist_blocks_non_allowlisted_merchant() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let rogue = Address::generate(&t.env);
+
+    // Unrestricted grant: without an allowlist any merchant is accepted.
+    client.grant(&t.buyer, &t.agent, &1000, &100, &Vec::new(&t.env), &3600u32);
+    assert_eq!(
+        client.try_can_spend(&t.buyer, &t.agent, &10, &rogue),
+        Ok(Ok(()))
+    );
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+    client.set_merchant_allowlist(&t.buyer, &t.agent, &true, &merchants);
+
+    assert_eq!(
+        client.get_merchant_allowlist(&t.buyer, &t.agent),
+        Some(MerchantAllowlist {
+            is_enabled: true,
+            merchants: merchants.clone(),
+        })
+    );
+    assert_eq!(
+        client.try_execute_spend(&t.buyer, &t.agent, &10, &rogue),
+        Err(Ok(PermissionError::MerchantNotAllowed))
+    );
+    client.execute_spend(&t.buyer, &t.agent, &10, &t.seller);
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 990);
+
+    // Disabling the allowlist lifts the restriction.
+    client.set_merchant_allowlist(&t.buyer, &t.agent, &false, &merchants);
+    client.execute_spend(&t.buyer, &t.agent, &10, &rogue);
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 980);
+}
+
+#[test]
+fn test_merchant_allowlist_enabled_but_empty_blocks_all_spends() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+
+    client.grant(&t.buyer, &t.agent, &1000, &100, &Vec::new(&t.env), &3600u32);
+    client.set_merchant_allowlist(&t.buyer, &t.agent, &true, &Vec::new(&t.env));
+
+    assert_eq!(
+        client.try_execute_spend(&t.buyer, &t.agent, &10, &t.seller),
+        Err(Ok(PermissionError::MerchantNotAllowed))
+    );
+}
+
+#[test]
+fn test_merchant_allowlist_enforced_on_relayed_spend() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+    let rogue = Address::generate(&t.env);
+
+    client.grant(&t.buyer, &t.agent, &1000, &100, &Vec::new(&t.env), &3600u32);
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+    client.set_merchant_allowlist(&t.buyer, &t.agent, &true, &merchants);
+
+    let (signing_key, public_key) = test_keypair(&t.env, 21);
+    client.set_relayer_key(&t.agent, &public_key);
+
+    let expiration_ledger = t.env.ledger().sequence() + 100;
+    let signature = sign_relayed_spend(
+        &t.env,
+        &signing_key,
+        RelayedSpendMessage {
+            owner: t.buyer.clone(),
+            delegate: t.agent.clone(),
+            merchant: rogue.clone(),
+            amount: 20,
+            nonce: 0,
+            expiration_ledger,
+        },
+    );
+
+    assert_eq!(
+        client.try_execute_spend_via_relayer(
+            &relayer,
+            &t.buyer,
+            &t.agent,
+            &20,
+            &rogue,
+            &0u64,
+            &expiration_ledger,
+            &signature,
+        ),
+        Err(Ok(PermissionError::MerchantNotAllowed))
+    );
+    assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 0);
+}
+
+#[test]
+fn test_merchant_allowlist_enforces_max_size_and_uniqueness() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+
+    client.grant(&t.buyer, &t.agent, &1000, &100, &Vec::new(&t.env), &3600u32);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    for _ in 0..crate::MAX_MERCHANTS_PER_PERMISSION {
+        merchants.push_back(Address::generate(&t.env));
+    }
+    client.set_merchant_allowlist(&t.buyer, &t.agent, &true, &merchants);
+
+    merchants.push_back(Address::generate(&t.env));
+    assert_eq!(
+        client.try_set_merchant_allowlist(&t.buyer, &t.agent, &true, &merchants),
+        Err(Ok(PermissionError::InvalidParam))
+    );
+
+    let mut duplicates = Vec::<Address>::new(&t.env);
+    duplicates.push_back(t.seller.clone());
+    duplicates.push_back(t.seller.clone());
+    assert_eq!(
+        client.try_set_merchant_allowlist(&t.buyer, &t.agent, &true, &duplicates),
+        Err(Ok(PermissionError::InvalidParam))
+    );
+}
+
+#[test]
+fn test_merchant_allowlist_requires_existing_permission() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+
+    assert_eq!(
+        client.try_set_merchant_allowlist(&t.buyer, &t.agent, &true, &Vec::new(&t.env)),
+        Err(Ok(PermissionError::PermissionNotFound))
+    );
+}
+
+// ── Issue #297: relayer nonce cancellation ────────────────────────────────
+
+#[test]
+fn test_cancel_nonce_unblocks_subsequent_relayed_spends() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &3600u32);
+
+    let (signing_key, public_key) = test_keypair(&t.env, 22);
+    client.set_relayer_key(&t.agent, &public_key);
+    let expiration_ledger = t.env.ledger().sequence() + 100;
+
+    let sign = |nonce: u64| {
+        sign_relayed_spend(
+            &t.env,
+            &signing_key,
+            RelayedSpendMessage {
+                owner: t.buyer.clone(),
+                delegate: t.agent.clone(),
+                merchant: t.seller.clone(),
+                amount: 20,
+                nonce,
+                expiration_ledger,
+            },
+        )
+    };
+    let stalled = sign(0);
+    let next = sign(1);
+
+    // Nonce 0 was dropped/censored, so nonce 1 is stuck behind it.
+    assert_eq!(
+        client.try_execute_spend_via_relayer(
+            &relayer,
+            &t.buyer,
+            &t.agent,
+            &20,
+            &t.seller,
+            &1u64,
+            &expiration_ledger,
+            &next,
+        ),
+        Err(Ok(PermissionError::InvalidNonce))
+    );
+
+    client.cancel_nonce(&t.buyer, &t.agent, &0u64);
+    assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 1);
+
+    // The stalled message can no longer be replayed later...
+    assert_eq!(
+        client.try_execute_spend_via_relayer(
+            &relayer,
+            &t.buyer,
+            &t.agent,
+            &20,
+            &t.seller,
+            &0u64,
+            &expiration_ledger,
+            &stalled,
+        ),
+        Err(Ok(PermissionError::InvalidNonce))
+    );
+    // ...and the next one now goes through without revoking the delegation.
+    client.execute_spend_via_relayer(
+        &relayer,
+        &t.buyer,
+        &t.agent,
+        &20,
+        &t.seller,
+        &1u64,
+        &expiration_ledger,
+        &next,
+    );
+    assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 2);
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 980);
+    assert!(client.is_active(&t.buyer, &t.agent));
+}
+
+#[test]
+fn test_cancel_nonce_can_skip_a_window_of_nonces() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+
+    client.grant(&t.buyer, &t.agent, &1000, &100, &Vec::new(&t.env), &3600u32);
+    client.cancel_nonce(&t.buyer, &t.agent, &4u64);
+    assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 5);
+}
+
+#[test]
+fn test_cancel_nonce_rejects_consumed_nonce_and_overflow() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+
+    client.grant(&t.buyer, &t.agent, &1000, &100, &Vec::new(&t.env), &3600u32);
+    client.cancel_nonce(&t.buyer, &t.agent, &2u64);
+
+    assert_eq!(
+        client.try_cancel_nonce(&t.buyer, &t.agent, &1u64),
+        Err(Ok(PermissionError::NonceAlreadyUsed))
+    );
+    assert_eq!(
+        client.try_cancel_nonce(&t.buyer, &t.agent, &u64::MAX),
+        Err(Ok(PermissionError::NonceAlreadyUsed))
+    );
+    assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 3);
+}
+
+#[test]
+fn test_cancel_nonce_requires_existing_permission() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+
+    assert_eq!(
+        client.try_cancel_nonce(&t.buyer, &t.agent, &0u64),
+        Err(Ok(PermissionError::PermissionNotFound))
+    );
 }
