@@ -3,8 +3,9 @@
 mod test {
     use crate::{
         DataKey, EscrowConfig, EscrowContract, EscrowContractClient, EscrowError,
-        EscrowMetadataEvent,
+        EscrowMetadataEvent, SignedDeliveryPayload, SignedDeliveryProof,
     };
+    use ed25519_dalek::{Signer, SigningKey};
     const MAX_DEPOSIT_CPU_INSTRUCTIONS: u64 = 3_000_000;
     const MAX_DEPOSIT_MEMORY_BYTES: u64 = 3_000_000;
 
@@ -15,11 +16,36 @@ mod test {
 }
 
 use soroban_sdk::{
+        contract, contractimpl, contracttype,
         symbol_short,
         testutils::{Address as _, Events, Ledger},
         token::TokenClient,
         Address, BytesN, Env, IntoVal, TryIntoVal,
     };
+
+    #[contracttype]
+    enum SellerStatusKey {
+        Trading(Address),
+    }
+
+    #[contract]
+    struct SellerStatusRegistry;
+
+    #[contractimpl]
+    impl SellerStatusRegistry {
+        pub fn is_merchant_trading(env: Env, seller: Address) -> bool {
+            env.storage()
+                .persistent()
+                .get(&SellerStatusKey::Trading(seller))
+                .unwrap_or(true)
+        }
+
+        pub fn set_trading(env: Env, seller: Address, allowed: bool) {
+            env.storage()
+                .persistent()
+                .set(&SellerStatusKey::Trading(seller), &allowed);
+        }
+    }
 
     fn setup_client(env: &Env) -> (EscrowContractClient<'_>, Address, Address) {
         let admin = Address::generate(env);
@@ -2755,6 +2781,125 @@ use soroban_sdk::{
             "batch_deposit should maintain buyer index for each order"
         );
         assert_eq!(page.items.len(), 2);
+        env.as_contract(&_contract_id, || {
+            assert_eq!(
+                env.storage()
+                    .persistent()
+                    .get::<_, u32>(&DataKey::BuyerEscrowCount(buyer.clone())),
+                Some(2)
+            );
+            assert_eq!(
+                env.storage()
+                    .persistent()
+                    .get::<_, u64>(&DataKey::BuyerEscrowAt(buyer.clone(), 0)),
+                Some(page.items.get(0).unwrap().escrow_id)
+            );
+            assert_eq!(
+                env.storage()
+                    .persistent()
+                    .get::<_, u64>(&DataKey::BuyerEscrowAt(buyer.clone(), 1)),
+                Some(page.items.get(1).unwrap().escrow_id)
+            );
+        });
+    }
+
+    #[test]
+    fn test_create_rejects_suspended_marketplace_seller() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+        let registry_id = env.register(SellerStatusRegistry, ());
+        let registry = SellerStatusRegistryClient::new(&env, &registry_id);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.set_merchant_registry(&admin, &registry_id);
+        registry.set_trading(&seller, &false);
+
+        assert_eq!(
+            client.try_create(
+                &buyer,
+                &seller,
+                &token,
+                &1_000i128,
+                &BytesN::from_array(&env, &[77u8; 32]),
+                &1_000u32,
+                &None,
+                &None,
+            ),
+            Err(Ok(EscrowError::MerchantNotTrading))
+        );
+    }
+
+    #[test]
+    fn test_signed_delivery_proof_releases_only_the_bound_escrow() {
+        use soroban_sdk::xdr::ToXdr;
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let oracle_key = SigningKey::from_bytes(&[31u8; 32]);
+        let oracle_pubkey = BytesN::from_array(&env, &oracle_key.verifying_key().to_bytes());
+        client.set_oracle_public_key(&admin, &oracle_pubkey);
+
+        let escrow_id = deposit_one(&env, &client, &admin, &buyer, &seller, 88);
+        let delivery_timestamp = env.ledger().timestamp();
+        let tracking_hash = BytesN::from_array(&env, &[90u8; 32]);
+        let payload = SignedDeliveryPayload {
+            escrow_id,
+            carrier_code: symbol_short!("ups"),
+            tracking_hash: tracking_hash.clone(),
+            delivery_timestamp,
+        }
+        .to_xdr(&env);
+        let mut payload_bytes = [0u8; 128];
+        let payload_len = payload.len() as usize;
+        payload.copy_into_slice(&mut payload_bytes[..payload_len]);
+        let signature = oracle_key.sign(&payload_bytes[..payload_len]).to_bytes();
+        let proof = SignedDeliveryProof {
+            escrow_id,
+            carrier_code: symbol_short!("ups"),
+            tracking_hash,
+            delivery_timestamp,
+            oracle_pubkey,
+            signature: BytesN::from_array(&env, &signature),
+        };
+
+        assert_eq!(
+            client.try_verify_delivery_and_release(&(escrow_id + 1), &buyer, &proof),
+            Err(Ok(EscrowError::InvalidSignedDeliveryProof))
+        );
+        let mut future_proof = proof.clone();
+        future_proof.delivery_timestamp = delivery_timestamp.saturating_add(1);
+        assert_eq!(
+            client.try_verify_delivery_and_release(&escrow_id, &buyer, &future_proof),
+            Err(Ok(EscrowError::InvalidSignedDeliveryProof))
+        );
+        let mut tampered_proof = proof.clone();
+        tampered_proof.tracking_hash = BytesN::from_array(&env, &[91u8; 32]);
+        assert!(client
+            .try_verify_delivery_and_release(&escrow_id, &buyer, &tampered_proof)
+            .is_err());
+        assert_eq!(
+            client.get_escrow(&escrow_id).status,
+            crate::EscrowStatus::Funded
+        );
+        let result = client.verify_delivery_and_release(&escrow_id, &buyer, &proof);
+        assert!(result.fully_released);
+        assert_eq!(client.get_escrow(&escrow_id).status, crate::EscrowStatus::Released);
+    }
+
+    #[test]
+    fn test_legacy_boolean_oracle_cannot_release_funds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _contract_id) = setup_client(&env);
+        assert_eq!(
+            client.try_evaluate_and_release(&1u64, &Address::generate(&env)),
+            Err(Ok(EscrowError::SignedProofRequired))
+        );
     }
 
     #[test]

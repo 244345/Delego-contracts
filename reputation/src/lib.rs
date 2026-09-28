@@ -200,8 +200,9 @@ mod error_code_allocation {
             );
         }
         codes.sort_unstable();
-        codes.dedup();
-        assert_eq!(codes.len(), 11, "ReputationError codes must be unique");
+        for pair in codes.windows(2) {
+            assert_ne!(pair[0], pair[1], "duplicate ReputationError code");
+        }
     }
 }
 
@@ -268,6 +269,7 @@ pub struct EntityHistoryPrunedEvent {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScoreAccumulator {
     pub decay_window_seconds: u64,
     pub weighted_value_sum: i128,
@@ -833,35 +835,28 @@ impl ReputationContract {
         admin.require_auth();
         Self::require_caller_is_admin(&env, &admin)?;
 
-        let key = DataKey::Flags(entity.clone());
+        let key = DataKey::Flags(entity);
         let mut flags: Vec<Flag> = env
             .storage()
             .persistent()
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
 
-        if flags.is_empty() {
-            let entity_known = env
-                .storage()
-                .persistent()
-                .has(&DataKey::Reputation(entity.clone()))
-                || Self::has_transacted_with(&env, &entity, &reporter);
-            return Err(if entity_known {
-                ReputationError::NoActiveFlag
-            } else {
-                ReputationError::EntityNotFound
-            });
-        }
-
-        let has_any_flag = flags.iter().any(|f| f.reporter == reporter);
-        if !has_any_flag {
-            return Err(ReputationError::NotFlagReporter);
-        }
-
         let idx = flags
             .iter()
-            .position(|f| f.reporter == reporter && !f.resolved)
-            .ok_or(ReputationError::NoActiveFlag)?;
+            .position(|f| f.reporter == reporter && !f.resolved);
+        let Some(idx) = idx else {
+            // Distinguish why there is no active flag to clear for `reporter`
+            // so off-chain tooling can react appropriately.
+            if !flags.iter().any(|f| !f.resolved) || flags.iter().any(|f| f.reporter == reporter) {
+                // Nothing active on the entity at all, or `reporter`'s own
+                // flags are all already resolved.
+                return Err(ReputationError::NoActiveFlag);
+            }
+            // Some other reporter's flag is active; `reporter` has never
+            // flagged this entity.
+            return Err(ReputationError::NotFlagReporter);
+        };
         let mut flag = flags.get(idx as u32).unwrap();
         flag.resolved = true;
         flags.set(idx as u32, flag);
@@ -1273,10 +1268,10 @@ impl ReputationContract {
             return Self::recompute_score(env, entity);
         }
 
-        let mut accumulator: ScoreAccumulator = match env.storage().persistent().get::<
-            DataKey,
-            ScoreAccumulator,
-        >(&DataKey::ScoreAccumulator(entity.clone()))
+        let mut accumulator: ScoreAccumulator = match env
+            .storage()
+            .persistent()
+            .get::<_, ScoreAccumulator>(&DataKey::ScoreAccumulator(entity.clone()))
         {
             Some(acc) if acc.decay_window_seconds == config.decay_window_seconds => acc,
             None if history_len_before == 0 => ScoreAccumulator {

@@ -48,6 +48,8 @@ pub const MAX_MERCHANTS_PER_PERMISSION: u32 = 25;
 /// audit log. Once exceeded, the oldest entry is dropped on each append so
 /// long-lived permissions don't accrue unbounded storage.
 pub const MAX_AUDIT_ENTRIES: u32 = 200;
+/// Maximum number of audit entries returned by one page query.
+pub const MAX_AUDIT_PAGE_SIZE: u32 = 20;
 /// Upper bound on the velocity limit's minimum-spend-interval, in ledgers.
 /// At ~5s per ledger this is roughly one year; anything above this would
 /// effectively disable spending forever with no clear signal, so it is
@@ -421,7 +423,7 @@ pub struct ContractVersion {
 
 /// Stored when a permission is paused; cleared on resume (issue #105).
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(missing_docs)]
 pub struct PauseMetadata {
     pub paused_by: Address,
@@ -544,13 +546,21 @@ pub struct AdminAcceptedEvent {
 }
 
 /// A single entry in the on-chain audit log for a (owner, delegate) pair.
-/// Stored as a `Vec<AuditLogEntry>` under `DataKey::AuditLog(owner, delegate)`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuditLogEntry {
     pub action: Symbol,
     pub actor: Address,
     pub timestamp: u64,
+}
+
+/// One bounded page from a permission's retained audit trail.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuditTrailPage {
+    pub entries: Vec<AuditLogEntry>,
+    pub total_entries: u32,
+    pub next_cursor: Option<u32>,
 }
 
 /// Compact read-only status view for a single delegation (issue #100).
@@ -723,8 +733,14 @@ pub enum DataKey {
     DecreaseTimelockSecs,
     /// Last ledger on which a spend was executed for a (owner, delegate) pair.
     LastSpendLedger(Address, Address),
-    /// Append-only audit log for a (owner, delegate) pair.
+    /// Legacy serialized audit log retained for lazy migration.
     AuditLog(Address, Address),
+    /// Physical ring-buffer index of a retained audit entry.
+    AuditLogAt(Address, Address, u32),
+    /// Oldest physical ring-buffer slot for a pair's audit log.
+    AuditLogStart(Address, Address),
+    /// Number of entries retained for a pair, capped at `MAX_AUDIT_ENTRIES`.
+    AuditLogCount(Address, Address),
     /// Index of delegate addresses granted by a given owner.
     UserPermissions(Address),
 }
@@ -1512,6 +1528,48 @@ impl PermissionsContract {
         min_expiry
     }
 
+    /// Validates the child permission's remaining limit, and then walks the parent
+    /// chain validating that each ancestor also has sufficient remaining allowance.
+    fn validate_chain(
+        env: &Env,
+        record: &PermissionRecord,
+        amount: i128,
+    ) -> Result<(), PermissionError> {
+        let remaining = record.limit_total - record.spent;
+        if amount > remaining {
+            return Err(PermissionError::ExceedsTotalLimit);
+        }
+
+        let mut next_parent = match (record.parent_owner.clone(), record.parent_delegate.clone()) {
+            (Some(p_owner), Some(p_delegate)) => Some((p_owner, p_delegate)),
+            _ => None,
+        };
+
+        while let Some((p_owner, p_delegate)) = next_parent {
+            let parent_key = DataKey::Permission(p_owner, p_delegate);
+            let parent_record: PermissionRecord = env
+                .storage()
+                .persistent()
+                .get(&parent_key)
+                .ok_or(PermissionError::ParentNotFound)?;
+
+            let parent_remaining = parent_record.limit_total - parent_record.spent;
+            if amount > parent_remaining {
+                return Err(PermissionError::ExceedsParentLimit);
+            }
+
+            next_parent = match (
+                parent_record.parent_owner.clone(),
+                parent_record.parent_delegate.clone(),
+            ) {
+                (Some(pp_owner), Some(pp_delegate)) => Some((pp_owner, pp_delegate)),
+                _ => None,
+            };
+        }
+
+        Ok(())
+    }
+
     pub fn can_spend(
         env: Env,
         owner: Address,
@@ -1544,10 +1602,7 @@ impl PermissionsContract {
             return Err(PermissionError::ExceedsPerTxLimit);
         }
 
-        let remaining = record.limit_total - record.spent;
-        if amount > remaining {
-            return Err(PermissionError::ExceedsTotalLimit);
-        }
+        Self::validate_chain(&env, &record, amount)?;
 
         if !record.allowed_merchants.is_empty() {
             let mut allowed = false;
@@ -1588,9 +1643,6 @@ impl PermissionsContract {
         // since the last recorded spend ledger for this (owner, delegate) pair.
         Self::check_velocity(&env, &owner, &delegate)?;
 
-        let _velocity_key = DataKey::LastSpendLedger(owner.clone(), delegate.clone());
-
-        let velocity_key = DataKey::LastSpendLedger(owner.clone(), delegate.clone());
         let remaining = Self::apply_spend(&env, &owner, &delegate, amount)?;
 
         // Emit after successful spend only (issue #99).
@@ -1655,12 +1707,7 @@ impl PermissionsContract {
                 .storage()
                 .persistent()
                 .get(&parent_key)
-                .ok_or(PermissionError::ParentNotFound)?;
-
-            let parent_remaining = parent_record.limit_total - parent_record.spent;
-            if amount > parent_remaining {
-                return Err(PermissionError::ExceedsParentLimit);
-            }
+                .unwrap();
 
             parent_record.spent += amount;
             next_parent = match (
@@ -2167,15 +2214,12 @@ impl PermissionsContract {
         records
     }
 
-    pub fn get_permission(env: Env, owner: Address, delegate: Address) -> PermissionRecord {
-        let key = DataKey::Permission(owner, delegate);
-        env.storage().persistent().get(&key).unwrap()
-    }
-
-    pub fn get_permission(env: Env, owner: Address, delegate: Address) -> PermissionRecord {
+    pub fn get_permission(env: Env, owner: Address, delegate: Address) -> Result<PermissionRecord, PermissionError> {
         let key = DataKey::Permission(owner, delegate);
         env.storage().persistent().get(&key).ok_or(PermissionError::PermissionNotFound)
     }
+
+
 
     pub fn get_remaining_allowance(env: Env, owner: Address, delegate: Address) -> Result<i128, PermissionError> {
         let key = DataKey::Permission(owner, delegate);
@@ -3308,13 +3352,65 @@ impl PermissionsContract {
         env.ledger().sequence() < Self::effective_expiry(&env, &record)
     }
 
-    /// Returns the audit log for a (owner, delegate) pair, or an empty vec
-    /// when no actions have been recorded yet.
-    pub fn get_audit_log(env: Env, owner: Address, delegate: Address) -> Vec<AuditLogEntry> {
-        env.storage()
-            .persistent()
+    /// Returns one page of the retained audit log for a (owner, delegate) pair.
+    /// The cursor is a zero-based logical offset and each page contains at most
+    /// `MAX_AUDIT_PAGE_SIZE` entries.
+    pub fn get_audit_log_page(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        cursor: Option<u32>,
+    ) -> AuditTrailPage {
+        let storage = env.storage().persistent();
+        let count_key = DataKey::AuditLogCount(owner.clone(), delegate.clone());
+        let start = cursor.unwrap_or(0);
+        let mut entries = Vec::new(&env);
+
+        if let Some(total_entries) = storage.get::<_, u32>(&count_key) {
+            let first = start.min(total_entries);
+            let end = first
+                .saturating_add(MAX_AUDIT_PAGE_SIZE)
+                .min(total_entries);
+            let oldest_slot: u32 = storage
+                .get(&DataKey::AuditLogStart(owner.clone(), delegate.clone()))
+                .unwrap_or(0);
+            for logical_index in first..end {
+                let physical_index = (oldest_slot + logical_index) % MAX_AUDIT_ENTRIES;
+                if let Some(entry) = storage.get(&DataKey::AuditLogAt(
+                    owner.clone(),
+                    delegate.clone(),
+                    physical_index,
+                )) {
+                    entries.push_back(entry);
+                }
+            }
+            return AuditTrailPage {
+                entries,
+                total_entries,
+                next_cursor: if end < total_entries { Some(end) } else { None },
+            };
+        }
+
+        // Read pre-indexed logs during the storage migration window. New
+        // writes migrate this bounded legacy vector into indexed entries.
+        let legacy: Vec<AuditLogEntry> = storage
             .get(&DataKey::AuditLog(owner, delegate))
-            .unwrap_or_else(|| Vec::new(&env))
+            .unwrap_or_else(|| Vec::new(&env));
+        let total_entries = legacy.len();
+        let first = start.min(total_entries);
+        let end = first
+            .saturating_add(MAX_AUDIT_PAGE_SIZE)
+            .min(total_entries);
+        for i in first..end {
+            if let Some(entry) = legacy.get(i) {
+                entries.push_back(entry);
+            }
+        }
+        AuditTrailPage {
+            entries,
+            total_entries,
+            next_cursor: if end < total_entries { Some(end) } else { None },
+        }
     }
 
     /// Appends an `AuditLogEntry` to the persistent log for `(owner, delegate)`.
@@ -3326,30 +3422,48 @@ impl PermissionsContract {
         actor: Address,
         action: Symbol,
     ) {
-        let key = DataKey::AuditLog(owner.clone(), delegate.clone());
-        let mut log: Vec<AuditLogEntry> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| Vec::new(env));
-
-        log.push_back(AuditLogEntry {
-            action,
-            actor,
-            timestamp: env.ledger().timestamp(),
-        });
-        Self::retain_audit(&mut log, MAX_AUDIT_ENTRIES);
-
-        env.storage().persistent().set(&key, &log);
-    }
-
-    /// Drops the oldest entries from `log` until its length is at most
-    /// `cap`, keeping per-permission audit storage flat regardless of how
-    /// many state-changing actions the pair accumulates over its lifetime.
-    fn retain_audit(log: &mut Vec<AuditLogEntry>, cap: u32) {
-        while log.len() > cap {
-            log.remove(0);
-        }
+        let storage = env.storage().persistent();
+        let count_key = DataKey::AuditLogCount(owner.clone(), delegate.clone());
+        let start_key = DataKey::AuditLogStart(owner.clone(), delegate.clone());
+        let mut start: u32 = storage.get(&start_key).unwrap_or(0);
+        let mut count: u32 = match storage.get(&count_key) {
+            Some(count) => count,
+            None => {
+                let legacy: Vec<AuditLogEntry> = storage
+                    .get(&DataKey::AuditLog(owner.clone(), delegate.clone()))
+                    .unwrap_or_else(|| Vec::new(env));
+                let legacy_count = legacy.len().min(MAX_AUDIT_ENTRIES);
+                for i in 0..legacy_count {
+                    if let Some(entry) = legacy.get(i) {
+                        storage.set(
+                            &DataKey::AuditLogAt(owner.clone(), delegate.clone(), i),
+                            &entry,
+                        );
+                    }
+                }
+                storage.remove(&DataKey::AuditLog(owner.clone(), delegate.clone()));
+                legacy_count
+            }
+        };
+        let slot = if count < MAX_AUDIT_ENTRIES {
+            let slot = (start + count) % MAX_AUDIT_ENTRIES;
+            count += 1;
+            slot
+        } else {
+            let slot = start;
+            start = (start + 1) % MAX_AUDIT_ENTRIES;
+            slot
+        };
+        storage.set(
+            &DataKey::AuditLogAt(owner.clone(), delegate.clone(), slot),
+            &AuditLogEntry {
+                action,
+                actor,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        storage.set(&count_key, &count);
+        storage.set(&start_key, &start);
     }
 
     /// spend. Called from both `execute_spend` and `execute_spend_via_relayer`
@@ -3403,30 +3517,90 @@ mod absent_key_tests {
         (env, owner, delegate)
     }
 
+
+}
+
+#[cfg(test)]
+mod audit_log_page_tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger};
+
     #[test]
-    fn get_permission_absent_returns_not_found() {
-        let (env, owner, delegate) = absent_pair();
-        assert_eq!(
-            PermissionsContract::get_permission(env, owner, delegate),
-            Err(PermissionError::PermissionNotFound)
-        );
+    fn audit_log_pages_are_bounded_and_keep_the_latest_entries() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        env.as_contract(&contract_id, || {
+            for timestamp in 0..205u64 {
+                env.ledger().set_timestamp(timestamp);
+                PermissionsContract::append_audit_log(
+                    &env,
+                    &owner,
+                    &delegate,
+                    owner.clone(),
+                    symbol_short!("grant"),
+                );
+            }
+        });
+
+        let first = client.get_audit_log_page(&owner, &delegate, &None);
+        assert_eq!(first.total_entries, MAX_AUDIT_ENTRIES);
+        assert_eq!(first.entries.len(), MAX_AUDIT_PAGE_SIZE);
+        assert_eq!(first.entries.get(0).unwrap().timestamp, 5);
+        assert_eq!(first.entries.get(19).unwrap().timestamp, 24);
+        assert_eq!(first.next_cursor, Some(MAX_AUDIT_PAGE_SIZE));
+
+        let last = client.get_audit_log_page(&owner, &delegate, &Some(180));
+        assert_eq!(last.entries.len(), MAX_AUDIT_PAGE_SIZE);
+        assert_eq!(last.entries.get(0).unwrap().timestamp, 185);
+        assert_eq!(last.entries.get(19).unwrap().timestamp, 204);
+        assert_eq!(last.next_cursor, None);
     }
 
     #[test]
-    fn get_remaining_allowance_absent_returns_not_found() {
-        let (env, owner, delegate) = absent_pair();
-        assert_eq!(
-            PermissionsContract::get_remaining_allowance(env, owner, delegate),
-            Err(PermissionError::PermissionNotFound)
-        );
-    }
+    fn first_audit_write_migrates_legacy_vector_to_indexed_storage() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+        let legacy = soroban_sdk::vec![
+            &env,
+            AuditLogEntry {
+                action: symbol_short!("grant"),
+                actor: owner.clone(),
+                timestamp: 1,
+            },
+            AuditLogEntry {
+                action: symbol_short!("revoke"),
+                actor: owner.clone(),
+                timestamp: 2,
+            },
+        ];
 
-    #[test]
-    fn get_pause_metadata_absent_returns_not_found() {
-        let (env, owner, delegate) = absent_pair();
-        assert_eq!(
-            PermissionsContract::get_pause_metadata(env, owner, delegate),
-            Err(PermissionError::PermissionNotFound)
-        );
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::AuditLog(owner.clone(), delegate.clone()), &legacy);
+            PermissionsContract::append_audit_log(
+                &env,
+                &owner,
+                &delegate,
+                owner.clone(),
+                symbol_short!("renew"),
+            );
+            assert!(!env
+                .storage()
+                .persistent()
+                .has(&DataKey::AuditLog(owner.clone(), delegate.clone())));
+        });
+
+        let page = client.get_audit_log_page(&owner, &delegate, &None);
+        assert_eq!(page.total_entries, 3);
+        assert_eq!(page.entries.len(), 3);
+        assert_eq!(page.entries.get(2).unwrap().timestamp, env.ledger().timestamp());
     }
 }

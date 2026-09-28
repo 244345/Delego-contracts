@@ -1435,24 +1435,21 @@ fn test_set_release_condition_and_get() {
 }
 
 #[test]
-fn test_evaluate_and_release_when_oracle_returns_true() {
+fn test_legacy_bool_oracle_cannot_release_funds_even_when_true() {
     let t = TestEnv::setup();
     let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
-    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
     let oracle_id = t.env.register(TrueOracle, ());
 
-    let amount = 1000i128;
-    let escrow_id = deposit_escrow(&t, amount, 100);
+    let escrow_id = deposit_escrow(&t, 1000, 100);
     let condition_type = symbol_short!("shipped");
     escrow_client.set_release_condition(&t.seller, &escrow_id, &condition_type, &oracle_id);
 
-    let result = escrow_client.evaluate_and_release(&escrow_id, &t.agent);
-    assert_eq!(result.released, amount);
-    assert!(result.fully_released);
-
-    assert_eq!(token_client.balance(&t.seller), amount);
+    assert_eq!(
+        escrow_client.try_evaluate_and_release(&escrow_id, &t.agent),
+        Err(Ok(EscrowError::SignedProofRequired))
+    );
     let record = escrow_client.get_escrow(&escrow_id);
-    assert_eq!(record.status, EscrowStatus::Released);
+    assert_eq!(record.status, EscrowStatus::Funded);
 }
 
 #[test]
@@ -1467,7 +1464,7 @@ fn test_evaluate_and_release_blocked_when_oracle_returns_false() {
 
     assert_eq!(
         escrow_client.try_evaluate_and_release(&escrow_id, &t.agent),
-        Err(Ok(EscrowError::ConditionNotMet))
+        Err(Ok(EscrowError::SignedProofRequired))
     );
 
     let record = escrow_client.get_escrow(&escrow_id);
@@ -1486,7 +1483,7 @@ fn test_evaluate_and_release_blocked_when_oracle_fails() {
 
     assert_eq!(
         escrow_client.try_evaluate_and_release(&escrow_id, &t.agent),
-        Err(Ok(EscrowError::OracleCallFailed))
+        Err(Ok(EscrowError::SignedProofRequired))
     );
 
     let record = escrow_client.get_escrow(&escrow_id);
@@ -1502,7 +1499,7 @@ fn test_evaluate_and_release_without_condition_fails() {
 
     assert_eq!(
         escrow_client.try_evaluate_and_release(&escrow_id, &t.agent),
-        Err(Ok(EscrowError::ReleaseConditionNotSet))
+        Err(Ok(EscrowError::SignedProofRequired))
     );
 }
 

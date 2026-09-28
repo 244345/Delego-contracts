@@ -12,6 +12,7 @@ soroban-sdk = { version = "22.0.0" }
 
 [dev-dependencies]
 soroban-sdk = { version = "22.0.0", features = ["testutils"] }
+ed25519-dalek = "2"
 
 [features]
 testutils = ["soroban-sdk/testutils"]
@@ -19,5 +20,4 @@ testutils = ["soroban-sdk/testutils"]
 # active repair and do not currently compile; they are gated behind this
 # feature so a normal `cargo test` runs the healthy inline test modules only.
 full_suite = []
-
 
