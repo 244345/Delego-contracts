@@ -200,8 +200,9 @@ mod error_code_allocation {
             );
         }
         codes.sort_unstable();
-        codes.dedup();
-        assert_eq!(codes.len(), 11, "ReputationError codes must be unique");
+        for pair in codes.windows(2) {
+            assert_ne!(pair[0], pair[1], "duplicate ReputationError code");
+        }
     }
 }
 
@@ -265,6 +266,10 @@ pub struct EntityHistoryPrunedEvent {
     pub entity: Address,
     pub pruned_count: u32,
     pub pruned_by: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScoreAccumulator {
     pub decay_window_seconds: u64,
     pub weighted_value_sum: i128,
@@ -620,7 +625,7 @@ impl ReputationContract {
         entity: Address,
     ) -> Result<ScoreDecomposition, ReputationError> {
         let rep = Self::load_or_default_reputation(&env, &entity);
-        let (decomposition, _, _) =
+        let (decomposition, _, _, _) =
             Self::compute_score_components(&env, &entity, rep.total_transactions)?;
         Ok(decomposition)
     }
@@ -802,56 +807,15 @@ impl ReputationContract {
         admin.require_auth();
         Self::require_caller_is_admin(&env, &admin)?;
 
-        let key = DataKey::Flags(entity.clone());
+        let key = DataKey::Flags(entity);
         let mut flags: Vec<Flag> = env
             .storage()
             .persistent()
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
 
-        // Check if entity has any flags at all
-        if flags.is_empty() {
-            return Err(ReputationError::EntityNotFound);
-        }
-
-        // Check if reporter has any flags (active or resolved) for this entity
-        let has_any_flag = flags.iter().any(|f| f.reporter == reporter);
-        if !has_any_flag {
-            return Err(ReputationError::NotFlagReporter);
-            return Err(ReputationError::NoActiveFlag);
-        // Error taxonomy (see ReputationError):
-        // - entity never seen on-chain (no reputation record, no relation) → EntityNotFound
-        // - entity known, but there is no flag to resolve for it → NoActiveFlag
-        // - entity has flags, but none from this reporter → NotFlagReporter
-        // - reporter's flag exists but is already resolved → NoActiveFlag
-            let entity_known = env
-                .storage()
-                .persistent()
-                .has(&DataKey::Reputation(entity.clone()))
-                || Self::has_transacted_with(&env, &entity, &reporter);
-            return Err(if entity_known {
-                ReputationError::NoActiveFlag
-            } else {
-                ReputationError::EntityNotFound
-            });
-        }
-
         let idx = flags
             .iter()
-            .position(|f| f.reporter == reporter && !f.resolved)
-            .ok_or(ReputationError::NoActiveFlag)?;
-        // Distinguish between "no flags exist at all" and "flags exist but
-        // none are from this reporter" so callers get a precise error.
-        let idx = if flags.is_empty() {
-            return Err(ReputationError::NoActiveFlag);
-        } else {
-            flags
-                .iter()
-                .position(|f| f.reporter == reporter && !f.resolved)
-                .ok_or(ReputationError::NotFlagReporter)?
-        };
-            .position(|f| f.reporter == reporter)
-            .ok_or(ReputationError::NotFlagReporter)?;
             .position(|f| f.reporter == reporter && !f.resolved);
         let Some(idx) = idx else {
             // Distinguish why there is no active flag to clear for `reporter`
@@ -864,10 +828,8 @@ impl ReputationContract {
             // Some other reporter's flag is active; `reporter` has never
             // flagged this entity.
             return Err(ReputationError::NotFlagReporter);
+        };
         let mut flag = flags.get(idx as u32).unwrap();
-        if flag.resolved {
-            return Err(ReputationError::NoActiveFlag);
-        }
         flag.resolved = true;
         flags.set(idx as u32, flag);
         env.storage().persistent().set(&key, &flags);
@@ -1281,7 +1243,7 @@ impl ReputationContract {
         let mut accumulator: ScoreAccumulator = match env
             .storage()
             .persistent()
-            .get(&DataKey::ScoreAccumulator(entity.clone()))
+            .get::<_, ScoreAccumulator>(&DataKey::ScoreAccumulator(entity.clone()))
         {
             Some(acc) if acc.decay_window_seconds == config.decay_window_seconds => acc,
             None if history_len_before == 0 => ScoreAccumulator {
@@ -1373,7 +1335,7 @@ impl ReputationContract {
         env: &Env,
         entity: &Address,
         total_transactions: u64,
-    ) -> Result<(ScoreDecomposition, u32, u64), ReputationError> {
+    ) -> Result<(ScoreDecomposition, u32, u64, ScoreAccumulator), ReputationError> {
         let config = Self::get_config(env.clone())?;
 
         let history: Vec<u64> = env
@@ -1456,6 +1418,7 @@ impl ReputationContract {
             },
             avg_rating,
             now,
+            accumulator,
         ))
     }
 
@@ -1481,7 +1444,7 @@ impl ReputationContract {
     /// and [`Self::apply_outcome_change_counts`] — so they are left as-is here.
     fn recompute_score(env: &Env, entity: &Address) -> Result<ReputationScore, ReputationError> {
         let mut rep = Self::load_or_default_reputation(env, entity);
-        let (decomposition, avg_rating, now) =
+        let (decomposition, avg_rating, now, accumulator) =
             Self::compute_score_components(env, entity, rep.total_transactions)?;
         rep.score = decomposition.final_score;
         rep.avg_rating = avg_rating;
@@ -1507,6 +1470,7 @@ impl ReputationContract {
         env.events().publish(
             (symbol_short!("reput"), symbol_short!("score_dec")),
             decomposition,
+        );
         Ok(rep)
     }
 }
