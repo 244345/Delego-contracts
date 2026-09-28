@@ -21,7 +21,7 @@
 #![warn(missing_docs)]
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
     InvokeError, Symbol, Vec,
 };
 
@@ -266,6 +266,20 @@ pub struct EscrowResolvedEvent {
     pub release_to_seller: bool,
     /// Address that resolved the dispute.
     pub resolved_by: Address,
+}
+
+/// Merkle proof for a delivery event committed by a published root.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerkleDeliveryProof {
+    /// Daily Merkle root to verify against.
+    pub root: BytesN<32>,
+    /// SHA-256 hash of the escrow's `order_id`.
+    pub leaf: BytesN<32>,
+    /// Sibling hashes from the leaf to the root.
+    pub proof: Vec<BytesN<32>>,
+    /// Zero-based position of the leaf in the tree.
+    pub index: u32,
 }
 
 /// Emitted on each arbiter vote during dispute resolution (#32).
@@ -614,6 +628,8 @@ pub enum DataKey {
     EscrowIds,
     /// Per-buyer append-only list of escrow IDs (issue #49).
     BuyerEscrowIds(Address),
+    /// Daily delivery Merkle root, keyed by epoch date.
+    MerkleRoot(u64),
 }
 
 #[contracterror]
@@ -801,6 +817,10 @@ pub enum EscrowError {
     /// Only one of order_hash/schema was supplied; metadata must be provided
     /// fully (both halves) or not at all (issue #38).
     InvalidMetadata = 401,
+    /// Delivery Merkle proof is invalid or does not match the escrow order.
+    InvalidMerkleProof = 402,
+    /// A daily delivery Merkle root has already been published.
+    MerkleRootAlreadyPublished = 403,
 }
 
 /// Compact receipt returned to buyers after escrow creation via `get_receipt`.
@@ -1996,6 +2016,124 @@ impl EscrowContract {
             .instance()
             .get(&DataKey::LiquidityPool(token))
             .ok_or(EscrowError::PoolNotFound)
+    }
+
+    /// Publish an immutable delivery Merkle root for a UTC date.
+    ///
+    /// Only the primary admin or a co-admin may publish roots. Dates are
+    /// represented as Unix epoch days. A root cannot be replaced after it is
+    /// published, preventing previously accepted proofs from being revoked.
+    pub fn publish_merkle_root(
+        env: Env,
+        caller: Address,
+        date: u64,
+        root: BytesN<32>,
+    ) -> Result<bool, EscrowError> {
+        caller.require_auth();
+        if !Self::is_admin(env.clone(), caller) {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        let key = DataKey::MerkleRoot(date);
+        if env.storage().persistent().has(&key) {
+            return Err(EscrowError::MerkleRootAlreadyPublished);
+        }
+        env.storage().persistent().set(&key, &root);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("merkroot"), date),
+            root,
+        );
+        Ok(true)
+    }
+
+    /// Return the published delivery root for a UTC epoch date, if present.
+    pub fn get_merkle_root(env: Env, date: u64) -> Option<BytesN<32>> {
+        env.storage().persistent().get(&DataKey::MerkleRoot(date))
+    }
+
+    /// Verify a Merkle path against the root carried in `proof`.
+    ///
+    /// Leaves and internal nodes use SHA-256. Sibling ordering is determined
+    /// by the corresponding bit of `index`; paths are limited to 32 levels.
+    pub fn verify_merkle_proof(env: Env, proof: MerkleDeliveryProof) -> bool {
+        Self::verify_merkle_path(&env, &proof)
+    }
+
+    /// Release a funded escrow after proving its order is included in the
+    /// published delivery root for `date`.
+    ///
+    /// The leaf convention is `SHA-256(order_id)`. The buyer must authorize
+    /// the call; a proof for a different order or an unpublished root fails.
+    pub fn release_with_merkle_proof(
+        env: Env,
+        escrow_id: u64,
+        buyer: Address,
+        date: u64,
+        proof: MerkleDeliveryProof,
+    ) -> Result<bool, EscrowError> {
+        buyer.require_auth();
+        let key = DataKey::Escrow(escrow_id);
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+        if buyer != record.buyer {
+            return Err(EscrowError::Unauthorized);
+        }
+        Self::validate_release_status(&record)?;
+
+        let published_root: Option<BytesN<32>> =
+            env.storage().persistent().get(&DataKey::MerkleRoot(date));
+        let published_root = published_root.ok_or(EscrowError::InvalidMerkleProof)?;
+        let expected_leaf: BytesN<32> = env
+            .crypto()
+            .sha256(&Bytes::from_array(&env, &record.order_id.to_array()))
+            .into();
+        if proof.root != published_root
+            || proof.leaf != expected_leaf
+            || !Self::verify_merkle_path(&env, &proof)
+        {
+            return Err(EscrowError::InvalidMerkleProof);
+        }
+
+        Self::execute_release(
+            &env,
+            escrow_id,
+            &key,
+            record.clone(),
+            buyer,
+            record.amount - record.released_amount,
+        )?;
+        Ok(true)
+    }
+
+    fn verify_merkle_path(env: &Env, proof: &MerkleDeliveryProof) -> bool {
+        if proof.proof.len() > u32::BITS {
+            return false;
+        }
+
+        let mut hash = proof.leaf.clone();
+        let mut index = proof.index;
+        for sibling in proof.proof.iter() {
+            let (left, right) = if index & 1 == 0 {
+                (hash, sibling)
+            } else {
+                (sibling, hash)
+            };
+            let mut node = Bytes::new(env);
+            node.append(&Bytes::from_array(env, &left.to_array()));
+            node.append(&Bytes::from_array(env, &right.to_array()));
+            hash = env.crypto().sha256(&node).into();
+            index >>= 1;
+        }
+
+        index == 0 && hash == proof.root
     }
 
     /// Create an escrow in unfunded `Created` status.
@@ -4198,6 +4336,122 @@ impl EscrowContract {
 }
 
 #[cfg(test)]
+mod merkle_delivery_tests {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, token::StellarAssetClient};
+
+    fn setup(env: &Env) -> (
+        EscrowContractClient<'_>,
+        Address,
+        Address,
+        Address,
+        Address,
+        Address,
+    ) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let buyer = Address::generate(env);
+        let seller = Address::generate(env);
+        let token = env
+            .register_stellar_asset_contract_v2(Address::generate(env))
+            .address();
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 250,
+            treasury,
+            min_amount: 100,
+            max_amount: 1_000_000,
+        };
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(env, &contract_id);
+        client.constructor(&config);
+        StellarAssetClient::new(env, &token).mint(&buyer, &10_000);
+        client.add_token(&admin, &token);
+        (client, admin, buyer, seller, token, contract_id)
+    }
+
+    fn order_leaf(env: &Env, order_id: &BytesN<32>) -> BytesN<32> {
+        env.crypto()
+            .sha256(&Bytes::from_array(env, &order_id.to_array()))
+            .into()
+    }
+
+    #[test]
+    fn published_root_releases_only_the_committed_order() {
+        let env = Env::default();
+        let (client, admin, buyer, seller, token, _) = setup(&env);
+        let order_id = BytesN::from_array(&env, &[91; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000, &order_id, &1_000, &None, &None,
+        );
+        let date = 20u64;
+        let leaf = order_leaf(&env, &order_id);
+        client.publish_merkle_root(&admin, &date, &leaf);
+        let proof = MerkleDeliveryProof {
+            root: leaf.clone(),
+            leaf,
+            proof: Vec::new(&env),
+            index: 0,
+        };
+
+        assert_eq!(
+            client.try_publish_merkle_root(&admin, &date, &proof.root),
+            Err(Ok(EscrowError::MerkleRootAlreadyPublished))
+        );
+        assert!(client.release_with_merkle_proof(&escrow_id, &buyer, &date, &proof));
+        assert_eq!(client.get_escrow(&escrow_id).status, EscrowStatus::Released);
+    }
+
+    #[test]
+    fn merkle_path_uses_index_to_order_siblings() {
+        let env = Env::default();
+        let left = BytesN::from_array(&env, &[1; 32]);
+        let right = BytesN::from_array(&env, &[2; 32]);
+        let mut node = Bytes::new(&env);
+        node.append(&Bytes::from_array(&env, &left.to_array()));
+        node.append(&Bytes::from_array(&env, &right.to_array()));
+        let root: BytesN<32> = env.crypto().sha256(&node).into();
+        let proof = MerkleDeliveryProof {
+            root,
+            leaf: right,
+            proof: Vec::from_array(&env, [left]),
+            index: 1,
+        };
+
+        assert!(EscrowContract::verify_merkle_path(&env, &proof));
+        let mut invalid = proof;
+        invalid.index = 0;
+        assert!(!EscrowContract::verify_merkle_path(&env, &invalid));
+    }
+
+    #[test]
+    fn merkle_release_rejects_a_leaf_for_another_order() {
+        let env = Env::default();
+        let (client, admin, buyer, seller, token, _) = setup(&env);
+        let order_id = BytesN::from_array(&env, &[11; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000, &order_id, &1_000, &None, &None,
+        );
+        let date = 21u64;
+        let committed = order_leaf(&env, &order_id);
+        client.publish_merkle_root(&admin, &date, &committed);
+        let proof = MerkleDeliveryProof {
+            root: committed,
+            leaf: BytesN::from_array(&env, &[12; 32]),
+            proof: Vec::new(&env),
+            index: 0,
+        };
+
+        assert_eq!(
+            client.try_release_with_merkle_proof(&escrow_id, &buyer, &date, &proof),
+            Err(Ok(EscrowError::InvalidMerkleProof))
+        );
+        assert_eq!(client.get_escrow(&escrow_id).status, EscrowStatus::Funded);
+    }
+}
+
+#[cfg(test)]
 mod fee_distribution_tests {
     use super::*;
     use soroban_sdk::testutils::{Address as _};
@@ -4633,5 +4887,4 @@ mod error_code_allocation_tests {
             }
         }
     }
-}
 }
