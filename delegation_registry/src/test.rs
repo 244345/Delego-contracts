@@ -8,6 +8,10 @@ use soroban_sdk::{
     Address, BytesN, Env, Symbol, TryFromVal,
 };
 
+/// Mirrors the clamp the contract applies to paginated queries, so the
+/// pagination tests can assert against the same boundary value.
+const MAX_PAGE_LIMIT: u32 = DelegationRegistry::MAX_PAGE_LIMIT;
+
 fn setup() -> (
     Env,
     DelegationRegistryClient<'static>,
@@ -86,8 +90,6 @@ fn test_unauthorized_access() {
         client.try_create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
     assert!(result.is_err());
 }
-
-// ── #322 Typed-error tests ──────────────────────────────────────────────────
 
 #[test]
 fn test_zero_agent_id_rejected_with_typed_error() {
@@ -216,8 +218,6 @@ fn test_rollback_rejects_stale_permissions_pointer() {
     let result = client.try_rollback_delegation(&id, &1u32);
     assert_eq!(result, Err(Ok(DelegationError::InvalidVersion)));
 }
-
-// ── #322 Event-emission tests ───────────────────────────────────────────────
 
 #[test]
 fn test_created_event_emitted() {
@@ -566,13 +566,6 @@ fn test_revoke_paused_delegation_returns_true() {
     assert_eq!(client.get_delegation_version(&id), 3);
 }
 
-// ── TTL bumping on reads (#94) ──────────────────────────────────────────────
-
-/// Large TTL in ledgers so the delegation's `expires_at_ledger` is never
-/// reached when we advance the ledger sequence to the storage-TTL
-/// boundary (thousands of sequences later).
-const LARGE_TTL: u32 = 10_000_000;
-
 #[test]
 fn test_get_delegation_bumps_ttl() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
@@ -733,27 +726,48 @@ fn test_active_authorization_survives_ttl_boundary() {
     assert!(client.is_authorized(&id, &agent_id));
     let record = client.get_delegation(&id);
     assert_eq!(record.status, DelegationStatus::Active);
-// ── #90 checked_add boundary test ───────────────────────────────────────────
+}
+
+#[test]
 fn test_create_delegation_returns_id_exhausted_at_boundary() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
     // Directly set NextId to u64::MAX so the next increment overflows
     env.storage()
         .instance()
         .set(&DataKey::NextId, &u64::MAX);
+
+    let label = Symbol::new(&env, "Boundary_Test");
     let result =
         client.try_create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
     assert_eq!(result, Err(Ok(DelegationError::IdExhausted)));
+}
+
+#[test]
 fn test_rollback_cannot_revive_past_expiry_snapshot() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
     env.ledger().set_sequence_number(100);
     let label = Symbol::new(&env, "Past_Expiry");
     let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+
     // Create a second version so there is a v1 snapshot to roll back to.
+    client.pause_delegation(&id);
+    assert_eq!(client.get_delegation(&id).status, DelegationStatus::Paused);
+
     // Advance the ledger past the original expiry (created at 100, ttl 100 => expires at 200).
     env.ledger().set_sequence_number(300);
+
     // Rolling back to the Active v1 snapshot must NOT revive a delegation
     // that has already expired; it should be marked Expired instead.
     client.rollback_delegation(&id, &1u32);
+
+    let record = client.get_delegation(&id);
     assert_eq!(record.status, DelegationStatus::Expired);
-// ── Lifecycle edge-case tests ─────────────────────────────────────────────
+}
+
 /// Rollback must be rejected when the target snapshot was captured at or
 /// after expiry — reviving an expired delegation must never be allowed.
 ///
@@ -761,113 +775,285 @@ fn test_rollback_cannot_revive_past_expiry_snapshot() {
 /// versioned snapshot. We then bump to the next version via
 /// `revoke_delegation` so the Expired snapshot is a valid lower target,
 /// then verify the rollback is still refused.
+#[test]
 fn test_rollback_to_expired_snapshot_rejected() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
     let label = Symbol::new(&env, "Expired_Rollback");
     let id = client.create_delegation(
+        &owner,
+        &agent_id,
+        &permissions_contract,
         &label,
         &100, // expires at ledger 200
+    );
     // v1 snapshot (Active)
+
     client.pause_delegation(&id); // v2 snapshot (Paused)
+
     // Advance past expiry and sweep — creates v3 Expired snapshot.
+    env.ledger().set_sequence_number(300);
     let mut ids = Vec::new(&env);
     ids.push_back(id);
     let swept = client.sweep_expired(&ids);
     assert_eq!(swept.len(), 1);
+
     assert_eq!(client.get_delegation(&id).status, DelegationStatus::Expired);
     assert_eq!(client.get_delegation_version(&id), 3);
+
     // The history must contain an Expired snapshot at v3.
     let history = client.get_delegation_history(&id);
     assert_eq!(history.len(), 3);
     assert_eq!(
         history.get(2).unwrap().record.status,
         DelegationStatus::Expired
+    );
+
     // Revoke from Expired → bumps to v4 so v3 is now a valid lower target.
     client.revoke_delegation(&id);
     assert_eq!(client.get_delegation_version(&id), 4);
     assert_eq!(client.get_delegation_history(&id).len(), 4);
+
     // Rolling back to v3 (the Expired snapshot) must be rejected.
     let result = client.try_rollback_delegation(&id, &3u32);
     assert_eq!(result, Err(Ok(DelegationError::Expired)));
+
     // Status must remain Revoked, version unchanged.
     assert_eq!(client.get_delegation(&id).status, DelegationStatus::Revoked);
+    assert_eq!(client.get_delegation_version(&id), 4);
+}
+
 /// History must grow by exactly one entry for each state transition.
+#[test]
 fn test_history_grows_across_transitions() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
     let label = Symbol::new(&env, "History_Growth");
     let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
     // After creation: 1 snapshot (v1)
+    let history = client.get_delegation_history(&id);
     assert_eq!(history.len(), 1);
     assert_eq!(history.get(0).unwrap().version, 1);
+
     // After pause: 2 snapshots (v1, v2)
     client.pause_delegation(&id);
+    let history = client.get_delegation_history(&id);
     assert_eq!(history.len(), 2);
     assert_eq!(history.get(1).unwrap().version, 2);
+
     // After resume: 3 snapshots (v1, v2, v3)
     client.resume_delegation(&id);
+    let history = client.get_delegation_history(&id);
+    assert_eq!(history.len(), 3);
     assert_eq!(history.get(2).unwrap().version, 3);
+
     // After revoke: 4 snapshots (v1, v2, v3, v4)
+    client.revoke_delegation(&id);
+    let history = client.get_delegation_history(&id);
     assert_eq!(history.len(), 4);
     assert_eq!(history.get(3).unwrap().version, 4);
+
     // Each snapshot must carry the correct status.
+    assert_eq!(
         history.get(0).unwrap().record.status,
         DelegationStatus::Active
+    );
+    assert_eq!(
         history.get(1).unwrap().record.status,
         DelegationStatus::Paused
+    );
+    assert_eq!(
+        history.get(2).unwrap().record.status,
+        DelegationStatus::Active
+    );
+    assert_eq!(
         history.get(3).unwrap().record.status,
         DelegationStatus::Revoked
+    );
+}
+
 /// Delegation IDs must be strictly increasing even when created by
 /// different owners.
+#[test]
 fn test_cross_owner_delegation_id_monotonicity() {
     let (env, client, _, _, _, _) = setup();
+    env.mock_all_auths();
+
     let owner_a = Address::generate(&env);
     let owner_b = Address::generate(&env);
     let owner_c = Address::generate(&env);
     let agent_id = BytesN::from_array(&env, &[1; 32]);
     let permissions_contract = Address::generate(&env);
+
     let label_a = Symbol::new(&env, "OwnerA_Agt");
     let label_b = Symbol::new(&env, "OwnerB_Agt");
     let label_c = Symbol::new(&env, "OwnerC_Agt");
+
     let id_a =
         client.create_delegation(&owner_a, &agent_id, &permissions_contract, &label_a, &1000);
     let id_b =
         client.create_delegation(&owner_b, &agent_id, &permissions_contract, &label_b, &1000);
     let id_c =
         client.create_delegation(&owner_c, &agent_id, &permissions_contract, &label_c, &1000);
+
     // IDs must be strictly increasing: id_a < id_b < id_c
     assert!(id_a < id_b, "id_a ({id_a}) must be < id_b ({id_b})");
     assert!(id_b < id_c, "id_b ({id_b}) must be < id_c ({id_c})");
+
     // Each delegation belongs to the correct owner.
     assert_eq!(client.get_delegation(&id_a).owner, owner_a);
     assert_eq!(client.get_delegation(&id_b).owner, owner_b);
     assert_eq!(client.get_delegation(&id_c).owner, owner_c);
+}
+
+#[test]
 fn test_get_delegations_by_owner_paged_paginates() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
     for _ in 0..=MAX_PAGE_LIMIT {
         let label = Symbol::new(&env, "Owner_Page");
         client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
     }
+
     let page = client.get_delegations_by_owner_paged(&owner, &0u32, &(MAX_PAGE_LIMIT + 1));
     assert_eq!(page.total, MAX_PAGE_LIMIT + 1);
     assert_eq!(page.items.len(), MAX_PAGE_LIMIT);
     assert_eq!(page.next_offset, Some(MAX_PAGE_LIMIT));
+
     let next = client.get_delegations_by_owner_paged(&owner, &MAX_PAGE_LIMIT, &MAX_PAGE_LIMIT);
     assert_eq!(next.items.len(), 1);
     assert_eq!(next.total, MAX_PAGE_LIMIT + 1);
     assert_eq!(next.next_offset, None);
+}
+
+#[test]
 fn test_get_delegation_history_paged_paginates() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
     let label = Symbol::new(&env, "History_Page");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
     for _ in 0..MAX_PAGE_LIMIT {
         client.pause_delegation(&id);
         client.resume_delegation(&id);
+    }
+
     let page = client.get_delegation_history_paged(&id, &0u32, &(MAX_PAGE_LIMIT + 1));
     assert_eq!(page.total, 1 + (2 * MAX_PAGE_LIMIT));
+    assert_eq!(page.items.len(), MAX_PAGE_LIMIT);
+    assert_eq!(page.next_offset, Some(MAX_PAGE_LIMIT));
+
     let next = client.get_delegation_history_paged(&id, &MAX_PAGE_LIMIT, &MAX_PAGE_LIMIT);
     assert_eq!(next.items.len(), MAX_PAGE_LIMIT);
     assert_eq!(next.next_offset, Some(2 * MAX_PAGE_LIMIT));
+
     let last = client.get_delegation_history_paged(&id, &(2 * MAX_PAGE_LIMIT), &MAX_PAGE_LIMIT);
     assert_eq!(last.items.len(), 1);
     assert_eq!(last.next_offset, None);
+}
+
+#[test]
 fn test_get_expired_delegations_paged_paginates() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    for _ in 0..=MAX_PAGE_LIMIT {
         let label = Symbol::new(&env, "Expired_Page");
         client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+    }
+
+    env.ledger().set_sequence_number(300);
+
     let page = client.get_expired_delegations_paged(&owner, &0u32, &(MAX_PAGE_LIMIT + 1));
+    assert_eq!(page.total, MAX_PAGE_LIMIT + 1);
+    assert_eq!(page.items.len(), MAX_PAGE_LIMIT);
+    assert_eq!(page.next_offset, Some(MAX_PAGE_LIMIT));
+
     let next = client.get_expired_delegations_paged(&owner, &MAX_PAGE_LIMIT, &MAX_PAGE_LIMIT);
+    assert_eq!(next.items.len(), 1);
+    assert_eq!(next.total, MAX_PAGE_LIMIT + 1);
+    assert_eq!(next.next_offset, None);
+}
+
+#[test]
+fn test_get_active_delegations_returns_only_active() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Active_Only");
+    let active_id =
+        client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    let paused_id =
+        client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    let revoked_id =
+        client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    client.pause_delegation(&paused_id);
+    client.revoke_delegation(&revoked_id);
+
+    let active = client.get_active_delegations(&owner);
+    assert_eq!(active.len(), 1);
+    assert_eq!(active.get(0).unwrap().id, active_id);
+    assert_eq!(active.get(0).unwrap().status, DelegationStatus::Active);
+}
+
+#[test]
+fn test_get_active_delegations_excludes_paused_revoked_and_expired() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "Active_Mixed");
+    let active_id =
+        client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    let expiring_id =
+        client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+    let paused_id =
+        client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    let revoked_id =
+        client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    client.pause_delegation(&paused_id);
+    client.revoke_delegation(&revoked_id);
+
+    // Advance past expiring_id's expiry (ledger 200) and sweep it to Expired.
+    env.ledger().set_sequence_number(300);
+    let mut ids = Vec::new(&env);
+    ids.push_back(expiring_id);
+    let swept = client.sweep_expired(&ids);
+    assert_eq!(swept.len(), 1);
+    assert_eq!(
+        client.get_delegation(&expiring_id).status,
+        DelegationStatus::Expired
+    );
+
+    let active = client.get_active_delegations(&owner);
+    assert_eq!(active.len(), 1);
+    assert_eq!(active.get(0).unwrap().id, active_id);
+}
+
+#[test]
+fn test_get_active_delegations_excludes_unswept_ledger_expiry() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "Active_Stale");
+    // Expires at ledger 150 but is never swept, so its stored status stays Active.
+    client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &50);
+    let live_id =
+        client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    env.ledger().set_sequence_number(200);
+
+    let active = client.get_active_delegations(&owner);
+    assert_eq!(active.len(), 1);
+    assert_eq!(active.get(0).unwrap().id, live_id);
 }
