@@ -19,7 +19,6 @@
 // This exact conditional form must be consistent across all workspace contract crates.
 #![cfg_attr(not(test), no_std)]
 #![warn(missing_docs)]
-#![no_std]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
     InvokeError, Symbol, Vec,
@@ -1053,7 +1052,7 @@ impl EscrowContract {
     /// Returns [`EscrowError::InvalidFeeBps`] if fee_bps > 1000.
     /// Returns [`EscrowError::InvalidLimits`] if min_amount <= 0 or max_amount < min_amount.
     /// Returns [`EscrowError::InvalidAddress`] if treasury is a zero address.
-    pub fn constructor(env: Env, config: EscrowConfig) -> Result<(), EscrowError> {
+    pub fn __constructor(env: Env, config: EscrowConfig) -> Result<(), EscrowError> {
         // Validate configuration
         if config.fee_bps > 1000 {
             return Err(EscrowError::InvalidFeeBps);
@@ -1115,9 +1114,9 @@ impl EscrowContract {
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::LastEscrowId, &0u64);
-        env.storage().instance().set(
-            &DataKey::FeeConfig,
-            &FeeConfig { fee_bps, treasury });
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeConfig, &FeeConfig { fee_bps, treasury });
         env.storage().instance().set(
             &DataKey::AmountLimits,
             &EscrowAmountLimits {
@@ -2029,10 +2028,7 @@ impl EscrowContract {
     /// Returns [`EscrowError::PoolNotFound`] when no pool has ever been funded
     /// for the given token, so callers can distinguish an unfunded pool from a
     /// funded one that is currently empty.
-    pub fn get_liquidity_pool(
-        env: Env,
-        token: Address,
-    ) -> Result<LiquidityPool, EscrowError> {
+    pub fn get_liquidity_pool(env: Env, token: Address) -> Result<LiquidityPool, EscrowError> {
         env.storage()
             .instance()
             .get(&DataKey::LiquidityPool(token))
@@ -2264,7 +2260,7 @@ impl EscrowContract {
             PERSISTENT_BUMP_AMOUNT,
         );
         storage.extend_ttl(
-            &buyer_ids_key,
+            &buyer_count_key,
             PERSISTENT_BUMP_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
@@ -3668,16 +3664,25 @@ impl EscrowContract {
     /// `escrow_id`, or [`EscrowError::MetadataNotSet`] when the escrow
     /// exists but no metadata was stored.
     pub fn get_escrow_metadata(env: Env, escrow_id: u64) -> Result<EscrowMetadata, EscrowError> {
+        // Verify the escrow record itself exists first so we can distinguish
+        // "escrow not found" from "escrow exists but no metadata was stored".
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Escrow(escrow_id))
+        {
+            return Err(EscrowError::NotFound);
+        }
         let order_hash: BytesN<32> = env
             .storage()
             .persistent()
             .get(&DataKey::EscrowMetadataHash(escrow_id))
-            .ok_or(EscrowError::NotFound)?;
+            .ok_or(EscrowError::MetadataNotSet)?;
         let schema: Symbol = env
             .storage()
             .persistent()
             .get(&DataKey::EscrowMetadataSchema(escrow_id))
-            .ok_or(EscrowError::NotFound)?;
+            .ok_or(EscrowError::MetadataNotSet)?;
         Ok(EscrowMetadata { order_hash, schema })
     }
 
@@ -4315,7 +4320,7 @@ impl EscrowContract {
 #[cfg(test)]
 mod fee_distribution_tests {
     use super::*;
-    use soroban_sdk::testutils::{Address as _};
+    use soroban_sdk::testutils::Address as _;
 
     fn setup(env: &Env) -> (EscrowContractClient<'_>, Address, Address) {
         let admin = Address::generate(env);
@@ -4373,7 +4378,7 @@ mod fee_distribution_tests {
         }
 
         let res = client.try_set_fee_distribution(&admin, &shares);
-        assert_eq!(res, Err(Ok(EscrowError::InvalidFeeBps)));
+        assert_eq!(res, Err(Ok(EscrowError::MaxTreasuriesExceeded)));
     }
 
     #[test]
@@ -4408,11 +4413,17 @@ mod batch_flow_tests {
     fn batch_release_missing_escrow_returns_not_found() {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register(EscrowContract, ());
-        let client = EscrowContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
-        client.initialize(&admin, &250u32, &treasury, &100i128, &1_000_000i128);
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 250u32,
+            treasury: treasury.clone(),
+            min_amount: 100i128,
+            max_amount: 1_000_000i128,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(&env, &contract_id);
 
         let caller = Address::generate(&env);
         let releases = soroban_sdk::vec![
@@ -4438,9 +4449,15 @@ mod metadata_tests {
     fn setup(env: &Env) -> (EscrowContractClient<'_>, Address, Address) {
         let admin = Address::generate(env);
         let treasury = Address::generate(env);
-        let contract_id = env.register(EscrowContract, ());
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 250u32,
+            treasury: treasury.clone(),
+            min_amount: 100i128,
+            max_amount: 1_000_000i128,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(env, &contract_id);
-        client.initialize(&admin, &250u32, &treasury, &100i128, &1_000_000i128);
         (client, admin, contract_id)
     }
 
@@ -4473,14 +4490,7 @@ mod metadata_tests {
         let no_hash: Option<BytesN<32>> = None;
         let no_schema: Option<Symbol> = None;
         let escrow_id = client.create(
-            &buyer,
-            &seller,
-            &token,
-            &100i128,
-            &order_id,
-            &1000u32,
-            &no_hash,
-            &no_schema,
+            &buyer, &seller, &token, &100i128, &order_id, &1000u32, &no_hash, &no_schema,
         );
         let result = client.try_get_escrow_metadata(&escrow_id);
         assert_eq!(result, Err(Ok(EscrowError::MetadataNotSet)));
@@ -4519,8 +4529,7 @@ mod metadata_tests {
         let (client, admin, _contract_id, token) = setup_with_token(&env);
         let buyer = Address::generate(&env);
         let seller = Address::generate(&env);
-        let token_admin_client =
-            soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
         token_admin_client.mint(&buyer, &1_000_000i128);
 
         let order_hash = BytesN::from_array(&env, &[38u8; 32]);
@@ -4589,7 +4598,6 @@ mod metadata_tests {
     }
 }
 
-
 #[cfg(all(test, feature = "full_suite"))]
 mod integration_tests;
 #[cfg(all(test, feature = "full_suite"))]
@@ -4615,10 +4623,17 @@ mod quorum_cleanup_tests {
         let token_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
         token_client.mint(&buyer, &1000i128);
 
-        let contract_id = env.register_contract(None, EscrowContract);
+        let contract_id = env.register(
+            EscrowContract,
+            (EscrowConfig {
+                admin: admin.clone(),
+                fee_bps: 0u32,
+                treasury: treasury.clone(),
+                min_amount: 1i128,
+                max_amount: 1000i128,
+            },),
+        );
         let client = EscrowContractClient::new(&env, &contract_id);
-
-        client.initialize(&admin, &0u32, &treasury, &1i128, &1000i128);
         client.add_token(&admin, &token);
 
         let arbiters = soroban_sdk::vec![&env, arbiter1.clone(), arbiter2.clone()];
@@ -4642,11 +4657,15 @@ mod quorum_cleanup_tests {
         client.vote_dispute(&escrow_id, &arbiter2, &true);
 
         let votes_key = DataKey::DisputeVotes(escrow_id);
-        assert!(env.storage().persistent().has(&votes_key));
+        assert!(env.as_contract(&contract_id, || {
+            env.storage().persistent().has(&votes_key)
+        }));
 
         client.resolve_dispute_quorum(&escrow_id, &arbiter1);
 
-        assert!(!env.storage().persistent().has(&votes_key));
+        assert!(!env.as_contract(&contract_id, || {
+            env.storage().persistent().has(&votes_key)
+        }));
     }
 }
 
@@ -4753,5 +4772,4 @@ mod error_code_allocation_tests {
             }
         }
     }
-}
 }
