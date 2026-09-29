@@ -80,6 +80,43 @@ pub struct YieldConfig {
     pub apr_bps: u32,
 }
 
+/// Bitflag indicating the escrow has been funded by the buyer.
+pub const ESCROW_FLAG_FUNDED: u32 = 1 << 0;
+/// Bitflag indicating the escrow is currently disputed.
+pub const ESCROW_FLAG_DISPUTED: u32 = 1 << 1;
+/// Bitflag indicating the escrow dispute has been appealed.
+pub const ESCROW_FLAG_APPEALED: u32 = 1 << 2;
+/// Bitflag indicating the escrow has been inspected.
+pub const ESCROW_FLAG_INSPECTED: u32 = 1 << 3;
+/// Bitflag indicating yield accrual is enabled for the escrow.
+pub const ESCROW_FLAG_YIELD_ON: u32 = 1 << 4;
+
+/// Packed lifecycle flags for an escrow, stored as a single `u32` bitmask.
+///
+/// Consolidating the former boolean fields (`is_funded`, `is_disputed`,
+/// `is_appealed`, `is_inspected`) into one integer reduces the serialized
+/// size of `EscrowRecord` in persistent storage.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct EscrowFlags(pub u32);
+
+impl EscrowFlags {
+    /// Returns `true` if the given flag bit is set.
+    pub fn has_flag(&self, flag: u32) -> bool {
+        (self.0 & flag) != 0
+    }
+
+    /// Sets the given flag bit and returns the updated flags.
+    pub fn set_flag(&mut self, flag: u32) {
+        self.0 |= flag;
+    }
+
+    /// Clears the given flag bit and returns the updated flags.
+    pub fn clear_flag(&mut self, flag: u32) {
+        self.0 &= !flag;
+    }
+}
+
 /// Full on-chain record for a single escrow.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,6 +137,8 @@ pub struct EscrowRecord {
     pub refunded_amount: i128,
     /// Current lifecycle state of the escrow.
     pub status: EscrowStatus,
+    /// Packed lifecycle flags (funded, disputed, appealed, inspected, yield).
+    pub flags: EscrowFlags,
     /// Off-chain order ID this escrow is associated with.
     pub order_id: BytesN<32>,
     /// Ledger timestamp when the escrow was created.
