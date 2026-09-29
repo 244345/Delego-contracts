@@ -213,7 +213,9 @@ fn test_rollback_rejects_stale_permissions_pointer() {
     record.permissions_contract = rotated_permissions.clone();
 
     env.as_contract(&client.address, || {
-        env.storage().persistent().set(&DataKey::Delegation(id), &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Delegation(id), &record);
     });
 
     let result = client.try_rollback_delegation(&id, &1u32);
@@ -1051,8 +1053,7 @@ fn test_get_active_delegations_excludes_unswept_ledger_expiry() {
     let label = Symbol::new(&env, "Active_Stale");
     // Expires at ledger 150 but is never swept, so its stored status stays Active.
     client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &50);
-    let live_id =
-        client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    let live_id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
 
     env.ledger().set_sequence_number(200);
 
@@ -1112,7 +1113,10 @@ fn test_resume_expired_emits_no_expired_event() {
             && Symbol::try_from_val(&env, &t.get(0).unwrap()).ok() == Some(symbol_short!("deleg"))
             && Symbol::try_from_val(&env, &t.get(1).unwrap()).ok() == Some(symbol_short!("expired"))
     });
-    assert!(!emitted_expired, "failed resume must not emit a deleg/expired event");
+    assert!(
+        !emitted_expired,
+        "failed resume must not emit a deleg/expired event"
+    );
 }
 
 #[test]
@@ -1222,11 +1226,17 @@ fn test_admin_transfer_emits_propose_and_transfer_events() {
     let (env, client, _, _, _, _) = setup();
     env.mock_all_auths();
 
-    let has_topic = |events: &soroban_sdk::Vec<(Address, soroban_sdk::Vec<soroban_sdk::Val>, soroban_sdk::Val)>, wanted: Symbol| {
+    let has_topic = |events: &soroban_sdk::Vec<(
+        Address,
+        soroban_sdk::Vec<soroban_sdk::Val>,
+        soroban_sdk::Val,
+    )>,
+                     wanted: Symbol| {
         events.iter().any(|(_, topics, _)| {
             let t: soroban_sdk::Vec<soroban_sdk::Val> = topics;
             t.len() >= 2
-                && Symbol::try_from_val(&env, &t.get(0).unwrap()).ok() == Some(symbol_short!("deleg"))
+                && Symbol::try_from_val(&env, &t.get(0).unwrap()).ok()
+                    == Some(symbol_short!("deleg"))
                 && Symbol::try_from_val(&env, &t.get(1).unwrap()).ok() == Some(wanted.clone())
         })
     };
@@ -1458,4 +1468,3 @@ fn test_get_delegations_by_agent_bumps_ttl() {
     });
     assert!(refreshed_ttl > 17_280);
 }
-

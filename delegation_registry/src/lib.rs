@@ -599,7 +599,11 @@ impl DelegationRegistry {
     ///
     /// Returns `Ok(true)` if the delegation transitioned to `Revoked`.
     /// Returns `Ok(false)` if the delegation was already `Revoked` (idempotent no-op).
-    pub fn admin_revoke(env: Env, caller: Address, delegation_id: u64) -> Result<bool, DelegationError> {
+    pub fn admin_revoke(
+        env: Env,
+        caller: Address,
+        delegation_id: u64,
+    ) -> Result<bool, DelegationError> {
         caller.require_auth();
 
         let admin = env
@@ -735,17 +739,9 @@ impl DelegationRegistry {
     /// Walks the `1..NextId` id range, collects records whose stored status is
     /// `Expired`, then pages the result. `next_offset` is `None` on the final
     /// page.
-    pub fn get_expired_delegations_paged(
-        env: Env,
-        offset: u32,
-        limit: u32,
-    ) -> DelegationPage {
+    pub fn get_expired_delegations_paged(env: Env, offset: u32, limit: u32) -> DelegationPage {
         let current_ledger = env.ledger().sequence();
-        let next_id: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::NextId)
-            .unwrap_or(1);
+        let next_id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
         let mut expired = Vec::new(&env);
         let mut id = 1u64;
         while id < next_id {
