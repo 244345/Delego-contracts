@@ -357,6 +357,63 @@ fn test_permission_events() {
 }
 
 #[test]
+fn test_decrease_allowance_timelock_defaults_to_one_day() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+
+    assert_eq!(client.get_decrease_timelock_secs(), 86400);
+
+    let merchants = Vec::<soroban_sdk::Address>::new(&t.env);
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &36000);
+    client.decrease_allowance(&t.buyer, &t.agent, &200);
+
+    t.env
+        .ledger()
+        .set_timestamp(t.env.ledger().timestamp() + 86399);
+    assert_eq!(
+        client.try_execute_decrease_allowance(&t.buyer, &t.agent),
+        Err(Ok(PermissionError::TimeLockActive))
+    );
+}
+
+#[test]
+fn test_set_decrease_allowance_timelock_custom_value() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    client.set_admin(&t.admin);
+
+    assert_eq!(
+        client.try_set_decrease_timelock_secs(&t.admin, &0),
+        Err(Ok(PermissionError::InvalidParam))
+    );
+    assert_eq!(
+        client.try_set_decrease_timelock_secs(&t.admin, &2592001),
+        Err(Ok(PermissionError::InvalidParam))
+    );
+
+    client.set_decrease_timelock_secs(&t.admin, &3600);
+    assert_eq!(client.get_decrease_timelock_secs(), 3600);
+
+    let merchants = Vec::<soroban_sdk::Address>::new(&t.env);
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &36000);
+    client.decrease_allowance(&t.buyer, &t.agent, &200);
+
+    t.env
+        .ledger()
+        .set_timestamp(t.env.ledger().timestamp() + 3599);
+    assert_eq!(
+        client.try_execute_decrease_allowance(&t.buyer, &t.agent),
+        Err(Ok(PermissionError::TimeLockActive))
+    );
+
+    t.env
+        .ledger()
+        .set_timestamp(t.env.ledger().timestamp() + 1);
+    client.execute_decrease_allowance(&t.buyer, &t.agent);
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 800);
+}
+
+#[test]
 fn test_decrease_allowance_timelock() {
     let t = TestEnv::setup();
     let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
@@ -421,6 +478,34 @@ fn test_decrease_allowance_timelock_blocked() {
 }
 
 #[test]
+fn test_decrease_allowance_rejects_non_positive_amounts() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let merchants = Vec::<soroban_sdk::Address>::new(&t.env);
+
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &36000);
+
+    for amount in [-1i128, 0i128] {
+        assert_eq!(
+            client.try_decrease_allowance(&t.buyer, &t.agent, &amount),
+            Err(Ok(PermissionError::InvalidParam))
+        );
+    }
+
+    client.decrease_allowance(&t.buyer, &t.agent, &200);
+}
+
+#[test]
+fn test_decrease_allowance_accepts_positive_amount() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let merchants = Vec::<soroban_sdk::Address>::new(&t.env);
+
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &36000);
+    client.decrease_allowance(&t.buyer, &t.agent, &1);
+}
+
+#[test]
 fn test_decrease_allowance_rejects_pending_decrease() {
     let t = TestEnv::setup();
     let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
@@ -436,7 +521,7 @@ fn test_decrease_allowance_rejects_pending_decrease() {
 }
 
 #[test]
-fn test_execute_decrease_allowance_rejects_below_spent_amount() {
+fn test_decrease_allowance_rejects_below_spent_at_schedule_time() {
     let t = TestEnv::setup();
     let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
     let merchant = soroban_sdk::Address::generate(&t.env);
@@ -444,14 +529,35 @@ fn test_execute_decrease_allowance_rejects_below_spent_amount() {
 
     client.grant(&t.buyer, &t.agent, &1000, &1000, &merchants, &36000);
     client.execute_spend(&t.buyer, &t.agent, &800, &merchant);
-    client.decrease_allowance(&t.buyer, &t.agent, &300);
+
+    let decrease = client.try_decrease_allowance(&t.buyer, &t.agent, &300);
+    assert_eq!(decrease, Err(Ok(PermissionError::LimitBelowSpent)));
+
+    // No pending decrement should have been scheduled: allowance is untouched.
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 200);
+}
+
+#[test]
+fn test_execute_decrease_allowance_rejects_below_spent_at_execution_time() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let merchant = soroban_sdk::Address::generate(&t.env);
+    let merchants = Vec::<soroban_sdk::Address>::new(&t.env);
+
+    client.grant(&t.buyer, &t.agent, &1000, &1000, &merchants, &36000);
+
+    // Valid at schedule time: 900 <= 1000 remaining.
+    client.decrease_allowance(&t.buyer, &t.agent, &900);
+
+    // Spend moves during the timelock, undercutting the scheduled decrease.
+    client.execute_spend(&t.buyer, &t.agent, &500, &merchant);
     t.env
         .ledger()
         .set_timestamp(t.env.ledger().timestamp() + 86401);
 
     assert_eq!(
         client.try_execute_decrease_allowance(&t.buyer, &t.agent),
-        Err(Ok(PermissionError::ExceedsTotalLimit))
+        Err(Ok(PermissionError::LimitBelowSpent))
     );
 }
 
@@ -504,6 +610,101 @@ fn test_execute_spend_via_relayer_succeeds() {
 
     assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 60);
     assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 1);
+}
+
+/// A second relayed spend inside the configured velocity interval is rejected
+/// with `VelocityLimitExceeded`, while a later spend after the interval has
+/// elapsed succeeds (issue #54).
+#[test]
+fn test_execute_spend_via_relayer_enforces_velocity_limit() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &3600u32);
+
+    // Configure a 10-ledger minimum spend interval.
+    client.set_admin(&t.admin);
+    client.set_velocity_limit(&t.admin, &10u32);
+
+    let (signing_key, public_key) = test_keypair(&t.env, 9);
+    client.set_relayer_key(&t.agent, &public_key);
+
+    let expiration_ledger = t.env.ledger().sequence() + 1000;
+
+    // First relayed spend succeeds and records the current ledger.
+    let message = RelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 20,
+        nonce: 0,
+        expiration_ledger,
+    };
+    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+    client.execute_spend_via_relayer(
+        &relayer,
+        &t.buyer,
+        &t.agent,
+        &20,
+        &t.seller,
+        &0u64,
+        &expiration_ledger,
+        &signature,
+    );
+
+    // Second relayed spend within the interval (same ledger) is rejected.
+    let message = RelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 20,
+        nonce: 1,
+        expiration_ledger,
+    };
+    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+    assert_eq!(
+        client.try_execute_spend_via_relayer(
+            &relayer,
+            &t.buyer,
+            &t.agent,
+            &20,
+            &t.seller,
+            &1u64,
+            &expiration_ledger,
+            &signature,
+        ),
+        Err(Ok(PermissionError::VelocityLimitExceeded))
+    );
+
+    // After the interval elapses, a relayed spend succeeds again. The rejected
+    // spend above never advanced the nonce, so it is still 1.
+    t.env.ledger().with_mut(|li| {
+        li.sequence_number += 10;
+    });
+    let message = RelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 20,
+        nonce: 1,
+        expiration_ledger,
+    };
+    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+    client.execute_spend_via_relayer(
+        &relayer,
+        &t.buyer,
+        &t.agent,
+        &20,
+        &t.seller,
+        &1u64,
+        &expiration_ledger,
+        &signature,
+    );
+    // Only the first and third relayed spends succeeded (40 total spent).
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 960);
 }
 
 #[test]
@@ -955,4 +1156,191 @@ fn test_transfer_permission_fails_if_new_delegate_already_has_permission() {
         client.try_transfer_permission(&t.buyer, &t.agent, &new_agent),
         Err(Ok(PermissionError::InvalidParam))
     );
+}
+
+// ── Issue #55: Relayed spend propagates through parent-chain budget ─────────
+
+/// A relayed child spend must decrement the parent budget just like a direct
+/// spend does.  Before this fix, `execute_spend_via_relayer` only touched the
+/// child record; after it the parent's `spent` counter must also increase.
+#[test]
+fn test_relayed_child_spend_decrements_parent_budget() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+    let child_delegate = Address::generate(&t.env);
+
+    // ── Set up parent permission: buyer → agent, total 200 ──────────────────
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+    client.grant(
+        &t.buyer, &t.agent, &200i128, // parent total
+        &100i128, // parent per-tx
+        &merchants, &3600u32,
+    );
+
+    // ── Set up child permission: agent → child_delegate, total 100 ──────────
+    // grant_child requires parent_delegate (= agent) to auth.
+    client.grant_child(
+        &t.buyer,
+        &t.agent,
+        &child_delegate,
+        &100i128, // child total — carved out of parent's 200
+        &100i128, // child per-tx
+        &merchants,
+        &3600u32,
+    );
+
+    // Confirm initial parent remaining = 200, child remaining = 100.
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 200);
+    assert_eq!(
+        client.get_remaining_allowance(&t.agent, &child_delegate),
+        100
+    );
+
+    // ── Register an ed25519 key for the child delegate ───────────────────────
+    let (signing_key, public_key) = test_keypair(&t.env, 55);
+    client.set_relayer_key(&child_delegate, &public_key);
+
+    // ── Build and sign a relayed spend of 75 on the child permission ─────────
+    let expiration_ledger = t.env.ledger().sequence() + 200;
+    let message = RelayedSpendMessage {
+        owner: t.agent.clone(), // child's owner == parent delegate
+        delegate: child_delegate.clone(),
+        merchant: t.seller.clone(),
+        amount: 75,
+        nonce: 0,
+        expiration_ledger,
+    };
+    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+
+    client.execute_spend_via_relayer(
+        &relayer,
+        &t.agent, // owner of child permission
+        &child_delegate,
+        &75i128,
+        &t.seller,
+        &0u64,
+        &expiration_ledger,
+        &signature,
+    );
+
+    // ── Assertions ───────────────────────────────────────────────────────────
+    // Child's remaining should drop by 75.
+    assert_eq!(
+        client.get_remaining_allowance(&t.agent, &child_delegate),
+        25,
+        "child remaining should be 100 - 75 = 25"
+    );
+
+    // Parent's remaining MUST ALSO drop by 75 (the whole point of issue #55).
+    assert_eq!(
+        client.get_remaining_allowance(&t.buyer, &t.agent),
+        125,
+        "parent remaining should be 200 - 75 = 125 (relayed spend must decrement parent)"
+    );
+}
+
+/// Verify that after the fix, both direct and relayed spends through the same
+/// child permission equally consume the shared parent budget, and the parent
+/// cap is enforced on the relayed path.
+#[test]
+fn test_relayed_spend_respects_parent_budget_cap() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+    let child_delegate = Address::generate(&t.env);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+
+    // Parent: 100 total; child: 100 total.
+    client.grant(&t.buyer, &t.agent, &100i128, &100i128, &merchants, &3600u32);
+    client.grant_child(
+        &t.buyer,
+        &t.agent,
+        &child_delegate,
+        &100i128,
+        &100i128,
+        &merchants,
+        &3600u32,
+    );
+
+    // Spend 90 directly on the child, which should propagate to the parent.
+    client.execute_spend(&t.agent, &child_delegate, &90, &t.seller);
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 10);
+    assert_eq!(
+        client.get_remaining_allowance(&t.agent, &child_delegate),
+        10
+    );
+
+    // Now attempt a relayed spend of 20, which should be blocked by the parent
+    // cap (only 10 remaining there).
+    let (signing_key, public_key) = test_keypair(&t.env, 56);
+    client.set_relayer_key(&child_delegate, &public_key);
+    let expiration_ledger = t.env.ledger().sequence() + 200;
+    let message = RelayedSpendMessage {
+        owner: t.agent.clone(),
+        delegate: child_delegate.clone(),
+        merchant: t.seller.clone(),
+        amount: 20,
+        nonce: 0,
+        expiration_ledger,
+    };
+    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+
+    // The child still has 10 remaining, but even before reaching apply_spend
+    // the can_spend check on the child will block the 20 spend (child limit
+    // is also only 10).
+    assert_eq!(
+        client.try_execute_spend_via_relayer(
+            &relayer,
+            &t.agent,
+            &child_delegate,
+            &20,
+            &t.seller,
+            &0u64,
+            &expiration_ledger,
+            &signature,
+        ),
+        Err(Ok(PermissionError::ExceedsTotalLimit))
+    );
+}
+
+#[test]
+fn test_validate_chain_prevents_mutation_on_exceeds_parent_limit() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let child_delegate = Address::generate(&t.env);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+
+    // Parent: 100 total; child: 100 total.
+    client.grant(&t.buyer, &t.agent, &100i128, &100i128, &merchants, &3600u32);
+    client.grant_child(
+        &t.buyer,
+        &t.agent,
+        &child_delegate,
+        &100i128,
+        &100i128,
+        &merchants,
+        &3600u32,
+    );
+
+    // Spend 50 directly on the parent. Parent remaining = 50.
+    client.execute_spend(&t.buyer, &t.agent, &50, &t.seller);
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 50);
+
+    // Child attempts to spend 60. Child has 100 limit, so child check passes.
+    // Parent only has 50 remaining, so parent check fails.
+    assert_eq!(
+        client.try_execute_spend(&t.agent, &child_delegate, &60, &t.seller),
+        Err(Ok(PermissionError::ExceedsParentLimit))
+    );
+
+    // Child state should not be mutated (spent is 0, remaining is 100)
+    assert_eq!(client.get_remaining_allowance(&t.agent, &child_delegate), 100);
+    // Parent state should not be further mutated (spent is 50, remaining is 50)
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 50);
 }

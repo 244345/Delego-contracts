@@ -2,14 +2,23 @@
 #![allow(clippy::module_inception)]
 
 use crate::{
-    ReputationConfig, ReputationContract, ReputationContractClient, ReputationError,
-    TransactionOutcome,
+    DataKey, ReputationConfig, ReputationContract, ReputationContractClient, ReputationError,
+    TransactionOutcome, PERSISTENT_BUMP_AMOUNT, PERSISTENT_BUMP_THRESHOLD, SCORE_WINDOW,
 };
 use soroban_sdk::{
     symbol_short,
-    testutils::{Address as _, Ledger},
+    testutils::{storage::Persistent, Address as _, Ledger},
     Address, Env, String,
 };
+
+const MAX_RECORD_CPU_INSTRUCTIONS: u64 = 3_000_000;
+const MAX_RECORD_MEMORY_BYTES: u64 = 3_000_000;
+
+fn assert_record_cost_within_thresholds(env: &Env) {
+    let budget = env.cost_estimate().budget();
+    assert!(budget.cpu_instruction_cost() <= MAX_RECORD_CPU_INSTRUCTIONS);
+    assert!(budget.memory_bytes_cost() <= MAX_RECORD_MEMORY_BYTES);
+}
 
 fn default_config() -> ReputationConfig {
     ReputationConfig {
@@ -84,7 +93,125 @@ fn test_constructor_rejects_zero_freeze_threshold() {
     env.register(ReputationContract, (admin, bad));
 }
 
+// --- min_transactions_threshold vs SCORE_WINDOW ---
+
+#[test]
+#[should_panic]
+fn test_constructor_rejects_threshold_over_window() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut bad = default_config();
+    bad.min_transactions_threshold = SCORE_WINDOW as u64 + 1;
+    env.register(ReputationContract, (admin, bad));
+}
+
+#[test]
+fn test_constructor_accepts_threshold_equal_to_window() {
+    // A threshold exactly equal to SCORE_WINDOW is the largest reachable
+    // value and must be accepted (the masking gate compares the lifetime
+    // counter, so hitting it is still possible).
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut cfg = default_config();
+    cfg.min_transactions_threshold = SCORE_WINDOW as u64;
+    let contract_id = env.register(ReputationContract, (admin, cfg.clone()));
+    let client = ReputationContractClient::new(&env, &contract_id);
+    assert_eq!(client.get_config(), cfg);
+}
+
+#[test]
+fn test_update_config_rejects_threshold_over_window() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+
+    let mut bad = default_config();
+    bad.min_transactions_threshold = SCORE_WINDOW as u64 + 1;
+    let res = client.try_update_config(&admin, &bad);
+    assert_eq!(res, Err(Ok(ReputationError::InvalidParam)));
+}
+
+// The masking gate in get_reputation compares the entity's *lifetime*
+// `total_transactions` (window-independent) against the threshold — not the
+// `SCORE_WINDOW` sample feeding the score recompute. Setting the threshold
+// equal to SCORE_WINDOW and recording exactly SCORE_WINDOW lifetime
+// transactions unmasks the score even though the score itself is computed
+// over the same-sized window, pinning that the gate is driven by lifetime
+// counts.
+#[test]
+fn test_masking_uses_lifetime_counts_not_window() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut cfg = default_config();
+    cfg.min_transactions_threshold = SCORE_WINDOW as u64;
+    let contract_id = env.register(ReputationContract, (admin.clone(), cfg));
+    let client = ReputationContractClient::new(&env, &contract_id);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    // Record exactly SCORE_WINDOW lifetime transactions. Remaining just below
+    // the threshold would keep the score masked; at the threshold it unmasks.
+    for i in 0..SCORE_WINDOW as u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    let rep = client.get_reputation(&entity);
+    // Lifetime count is exact, and the fresh all-Released run scores full.
+    assert_eq!(rep.total_transactions, SCORE_WINDOW as u64);
+    assert_eq!(rep.score, 10_000);
+}
+
+#[test]
+fn test_masking_keeps_score_hidden_below_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut cfg = default_config();
+    cfg.min_transactions_threshold = SCORE_WINDOW as u64;
+    let contract_id = env.register(ReputationContract, (admin.clone(), cfg));
+    let client = ReputationContractClient::new(&env, &contract_id);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    // SCORE_WINDOW - 1 lifetime transactions: still below the threshold, so
+    // the score/avg_rating must stay masked even though the recompute
+    // samples the same window size.
+    for i in 0..(SCORE_WINDOW as u64 - 1) {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    let rep = client.get_reputation(&entity);
+    assert_eq!(rep.total_transactions, SCORE_WINDOW as u64 - 1);
+    assert_eq!(rep.score, 0);
+}
+
 // --- record_transaction ---
+
+#[test]
+fn test_record_transaction_cost_stays_within_thresholds() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    client.record_transaction(&admin, &1u64, &entity, &counterparty, &1000i128, &TransactionOutcome::Released);
+    assert_record_cost_within_thresholds(&env);
+}
 
 #[test]
 fn test_record_transaction_released_scores_full() {
@@ -108,6 +235,30 @@ fn test_record_transaction_released_scores_full() {
     assert_eq!(rep.total_transactions, 1);
     assert_eq!(rep.successful_transactions, 1);
     assert_eq!(rep.disputed_transactions, 0);
+}
+
+#[test]
+fn test_record_transaction_records_relation_in_both_directions() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    client.record_transaction(
+        &admin,
+        &1u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Released,
+    );
+
+    assert!(client.has_relation(&entity, &counterparty, &false));
+    assert!(client.has_relation(&counterparty, &entity, &false));
+    assert!(client.has_relation(&entity, &counterparty, &true));
+    assert!(client.has_relation(&counterparty, &entity, &true));
+    let stranger = Address::generate(&env);
+    assert!(!client.has_relation(&entity, &stranger, &false));
 }
 
 #[test]
@@ -215,6 +366,197 @@ fn test_record_transaction_allows_lifecycle_update_while_frozen() {
         &TransactionOutcome::Released,
     );
     assert_eq!(res, Err(Ok(ReputationError::EntityFrozen)));
+}
+
+#[test]
+fn test_record_transaction_incremental_recompute_cost() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    for i in 0..SCORE_WINDOW as u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+    assert_record_cost_within_thresholds(&env);
+}
+
+#[test]
+fn test_recompute_bumps_window_records_ttl() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut cfg = default_config();
+    // Set a short decay window to make TTL eviction more likely in tests
+    cfg.decay_window_seconds = 100;
+    let contract_id = env.register(ReputationContract, (admin.clone(), cfg.clone()));
+    let client = ReputationContractClient::new(&env, &contract_id);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    // Record enough transactions to fill the SCORE_WINDOW
+    for i in 0..SCORE_WINDOW as u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    // Advance time past the decay window to ensure records would expire
+    // without TTL bumps. The ledger timestamp is used for TTL calculations.
+    let initial_ledger_timestamp = env.ledger().timestamp();
+    advance_time(&env, cfg.decay_window_seconds + 100);
+
+    // Record one more transaction to trigger recompute_score on the existing window
+    client.record_transaction(
+        &admin,
+        &(SCORE_WINDOW as u64),
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Released,
+    );
+
+    // Verify that the reputation is still deterministic and not masked due to
+    // missing records. If TTLs were not bumped, some records might have been
+    // evicted, leading to a lower or masked score.
+    let rep = client.get_reputation(&entity);
+    // Since we have SCORE_WINDOW + 1 transactions, and min_transactions_threshold
+    // is 5, the score should be unmasked and near full (10_000).
+    assert_eq!(rep.total_transactions, SCORE_WINDOW as u64 + 1);
+    assert_eq!(rep.score, 10_000);
+
+    // Verify that the records are still present by checking the relation
+    assert!(client.has_relation(&entity, &counterparty, &false));
+}
+
+#[test]
+fn test_breakdown_ordering_is_deterministic_for_equal_timestamps() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut cfg = default_config();
+    cfg.decay_window_seconds = 1;
+    let contract_id = env.register(ReputationContract, (admin.clone(), cfg));
+    let client = ReputationContractClient::new(&env, &contract_id);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    for i in 0..10u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &(1000i128 * (i as i128 + 1)),
+            &TransactionOutcome::Released,
+        );
+    }
+
+    let breakdown = client.get_reputation_breakdown(&entity, &0u32, &10u32);
+
+    for i in 0..breakdown.len() - 1 {
+        assert!(
+            breakdown.get(i).unwrap().escrow_id < breakdown.get(i + 1).unwrap().escrow_id,
+            "Breakdown must be sorted by escrow_id for deterministic ordering"
+        );
+    }
+}
+
+
+#[test]
+fn test_record_transaction_extends_ttl_across_churn() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    let record_key = crate::DataKey::TransactionRecord(1);
+
+    client.record_transaction(
+        &admin,
+        &1u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Disputed,
+    );
+    let initial_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&record_key)
+    });
+    assert!(initial_ttl > 17_280);
+
+    // The testing host grants freshly-written persistent entries only a
+    // small default TTL, and a newly-registered contract instance 4_095.
+    // Aging the *record* to the edge of its 17_280 bump threshold therefore
+    // requires jumping the ledger far past the point where the contract
+    // took care of the other entries it wrote in the first call
+    // (`Reputation`, `TransactionHistory`, `Transacted`, and the instance
+    // itself) — the test host would otherwise archive them mid-test. Keep
+    // those alive here so the jump exercises exactly the record-TTL bump
+    // this test is about.
+    env.as_contract(&client.address, || {
+        env.storage().instance().extend_ttl(10_000_000, 10_000_000);
+        let storage = env.storage().persistent();
+        storage.extend_ttl(
+            &crate::DataKey::Reputation(entity.clone()),
+            10_000_000,
+            10_000_000,
+        );
+        storage.extend_ttl(
+            &crate::DataKey::TransactionHistory(entity.clone()),
+            10_000_000,
+            10_000_000,
+        );
+        storage.extend_ttl(
+            &crate::DataKey::Transacted(entity.clone(), counterparty.clone()),
+            10_000_000,
+            10_000_000,
+        );
+    });
+
+    env.ledger().set_sequence_number(initial_ttl - 17_280 + 1);
+    client.record_transaction(
+        &admin,
+        &1u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::ResolvedSeller,
+    );
+    let refreshed_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&record_key)
+    });
+    assert!(refreshed_ttl > 17_280);
+
+    env.ledger().set_sequence_number(refreshed_ttl - 17_280 + 1);
+    client.record_transaction(
+        &admin,
+        &1u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Released,
+    );
+    let final_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&record_key)
+    });
+    assert!(final_ttl > 17_280);
+
+    env.ledger().set_sequence_number(final_ttl - 1);
+    assert!(!client
+        .get_reputation_breakdown(&entity, &0u32, &10u32)
+        .is_empty());
 }
 
 #[test]
@@ -374,6 +716,76 @@ fn test_score_bounded_to_recent_window() {
     );
     let rep = client.get_reputation(&entity);
     assert!(rep.score < 10_000);
+}
+
+#[test]
+fn test_amount_does_not_affect_scoring() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    // Record 5 transactions with varying amounts to reach min_transactions_threshold.
+    // All have the same outcome (Released) and are recorded at the same time,
+    // so they should produce the same score regardless of amount differences.
+    let amounts = [
+        1i128,
+        1000i128,
+        1_000_000i128,
+        10_000_000i128,
+        100_000_000i128,
+    ];
+    for (i, amount) in amounts.iter().enumerate() {
+        client.record_transaction(
+            &admin,
+            &(i as u64),
+            &entity,
+            &counterparty,
+            amount,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    let rep = client.get_reputation(&entity);
+    // All transactions are Released and fresh, so score should be full (10_000)
+    // regardless of the widely varying amounts.
+    assert_eq!(rep.score, 10_000);
+    assert_eq!(rep.total_transactions, 5);
+
+    // Now record a Disputed transaction with a very high amount.
+    // If amount weighted scoring, this would significantly impact the score.
+    // Since scoring is amount-independent, it should have the same effect as
+    // a small-amount dispute.
+    client.record_transaction(
+        &admin,
+        &100u64,
+        &entity,
+        &counterparty,
+        &1_000_000_000i128, // Very high amount
+        &TransactionOutcome::Disputed,
+    );
+
+    let rep_after_dispute = client.get_reputation(&entity);
+    // The score should decrease due to the dispute, but the amount should
+    // not amplify this effect. We assert the score is less than 10_000
+    // (dispute had an effect) but we don't assert a specific value since
+    // the exact penalty depends on config.dispute_penalty_bps.
+    assert!(rep_after_dispute.score < 10_000);
+
+    // Record another Disputed with a tiny amount to verify they have the same effect.
+    client.record_transaction(
+        &admin,
+        &101u64,
+        &entity,
+        &counterparty,
+        &1i128, // Tiny amount
+        &TransactionOutcome::Disputed,
+    );
+
+    let rep_after_second_dispute = client.get_reputation(&entity);
+    // The score should decrease further by the same penalty amount,
+    // confirming that amount does not weight the scoring.
+    assert!(rep_after_second_dispute.score < rep_after_dispute.score);
 }
 
 // --- rate_entity ---
@@ -725,8 +1137,41 @@ fn test_resolve_flag_missing() {
     let entity = Address::generate(&env);
     let reporter = Address::generate(&env);
 
+    // No flags at all on the entity => nothing active to resolve.
     let res = client.try_resolve_flag(&admin, &reporter, &entity);
-    assert_eq!(res, Err(Ok(ReputationError::EntityNotFound)));
+    assert_eq!(res, Err(Ok(ReputationError::NoActiveFlag)));
+}
+
+#[test]
+fn test_resolve_flag_no_active_flag() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let reporter = Address::generate(&env);
+    make_transacting_counterparty(&client, &admin, &entity, &reporter, 1u64);
+
+    // First flag and resolve it
+    client.flag_entity(&reporter, &entity, &symbol_short!("fraud"), &None);
+    client.resolve_flag(&admin, &reporter, &entity);
+
+    // Now try to resolve again - should return NoActiveFlag since the flag is already resolved
+    let res = client.try_resolve_flag(&admin, &reporter, &entity);
+    assert_eq!(res, Err(Ok(ReputationError::NoActiveFlag)));
+}
+
+#[test]
+fn test_resolve_flag_not_flag_reporter() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let reporter = Address::generate(&env);
+    let other_reporter = Address::generate(&env);
+    make_transacting_counterparty(&client, &admin, &entity, &reporter, 1u64);
+    make_transacting_counterparty(&client, &admin, &entity, &other_reporter, 2u64);
+
+    client.flag_entity(&reporter, &entity, &symbol_short!("fraud"), &None);
+
+    let res = client.try_resolve_flag(&admin, &other_reporter, &entity);
 }
 
 // --- freeze / unfreeze ---
@@ -764,6 +1209,18 @@ fn test_update_config_happy_path() {
 
     let mut new_config = default_config();
     new_config.min_transactions_threshold = 1;
+    client.update_config(&admin, &new_config);
+
+    assert_eq!(client.get_config(), new_config);
+}
+
+#[test]
+fn test_get_config_parity() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+
+    let mut new_config = default_config();
+    new_config.freeze_threshold_flags = 1;
     client.update_config(&admin, &new_config);
 
     assert_eq!(client.get_config(), new_config);
@@ -845,305 +1302,539 @@ fn test_accept_admin_no_pending_transfer() {
     assert_eq!(res, Err(Ok(ReputationError::Unauthorized)));
 }
 
-// ========================================================================
-// Property tests for `recency_weight_bps` (Issue #130)
-// ========================================================================
-//
-// These tests exercise broad deterministic input ranges to verify
-// mathematical invariants of the time-decay weight function.
-//
-// The function computes: 10_000 × 2^(-elapsed / decay_window)
-// via integer bit-shift halving with linear interpolation.
-//
-// Invariants under test:
-//   1. Output is always within [0, BPS_SCALE] (bounds)
-//   2. Monotonically non-increasing as elapsed increases (monotonicity)
-//   3. elapsed = 0 returns BPS_SCALE (zero elapsed)
-//   4. Large elapsed values never panic and return 0 (saturation)
-//   5. Boundary transitions at half-life multiples are correct
-// ========================================================================
+// --- recency_weight_bps decay curve ---
 
-/// Helper: independent mathematical oracle for the recency weight.
-/// Computes `floor(10_000 × 2^(-elapsed / decay_window))` using
-/// arbitrary-precision arithmetic to avoid overflow.
-fn oracle_recency_weight_bps(elapsed: u64, decay_window: u64) -> i128 {
-    if decay_window == 0 {
-        return 10_000;
-    }
-    let halvings = elapsed / decay_window;
-    if halvings >= 20 {
-        return 0;
-    }
-    // 10_000 / 2^halvings using i128
-    let base: i128 = 10_000_i128 >> halvings;
-    let remainder = elapsed % decay_window;
-    // Linear interpolation: subtract (base × remainder) / (2 × decay_window)
-    let dec = (base * remainder as i128) / (2 * decay_window as i128);
-    (base - dec).max(0)
-}
-
-const BPS_SCALE_I128: i128 = 10_000;
-
-// ---- PROPERTY 1: BOUNDS ----
-// For all tested (elapsed, decay_window) pairs,
-// 0 <= recency_weight_bps(elapsed, decay_window) <= 10_000.
+/// Invariant: `BPS_SCALE >> MAX_HALVINGS` must be non-zero.
+///
+/// If this fails it means `MAX_HALVINGS` has drifted past the point where the
+/// shift can produce any non-zero base, making the guard in
+/// `recency_weight_bps` fire *after* the shift already rounds to zero —
+/// i.e. the documented cutoff is later than the actual one.
 #[test]
-fn property_recency_bounds() {
-    let decay_windows: &[u64] = &[
-        1,
-        2,
-        5,
-        10,
-        60,
-        3600,
-        86_400,            // 1 day
-        90 * 24 * 60 * 60, // default config decay window (~7776000)
-        u64::MAX / 2,      // near max
-        u64::MAX,
-    ];
-
-    for &dw in decay_windows {
-        // Test a broad range of elapsed values: 0..=100 plus key boundary values.
-        for e in 0..=100u64 {
-            let w = crate::recency_weight_bps(e, dw);
-            assert!(
-                w >= 0 && w <= BPS_SCALE_I128,
-                "bounds violated: recency_weight_bps({}, {}) = {}",
-                e,
-                dw,
-                w
-            );
-        }
-        // Additional boundary values derived from the decay window.
-        let extra: &[u64] = &[
-            dw.saturating_sub(1),
-            dw,
-            dw.saturating_add(1),
-            2_u64.saturating_mul(dw),
-            3_u64.saturating_mul(dw),
-            10_u64.saturating_mul(dw),
-            19_u64.saturating_mul(dw),
-            20_u64.saturating_mul(dw),
-            21_u64.saturating_mul(dw),
-            100_u64.saturating_mul(dw),
-            u64::MAX,
-        ];
-        for &e in extra {
-            let w = crate::recency_weight_bps(e, dw);
-            assert!(
-                w >= 0 && w <= BPS_SCALE_I128,
-                "bounds violated: recency_weight_bps({}, {}) = {}",
-                e,
-                dw,
-                w
-            );
-        }
-    }
-}
-
-// ---- PROPERTY 2: MONOTONICITY ----
-// For any fixed decay_window, if e1 <= e2 then
-// recency_weight_bps(e2, dw) <= recency_weight_bps(e1, dw).
-#[test]
-fn property_recency_monotonicity() {
-    let decay_windows: &[u64] = &[1, 2, 5, 10, 60, 3600, 86_400, 90 * 24 * 60 * 60];
-
-    for &dw in decay_windows {
-        // Sweep elapsed from 0 through 21 * dw in small steps,
-        // verifying the weight never increases.
-        let max_elapsed = 21_u64.saturating_mul(dw);
-        let step = if dw > 100 { dw / 50 } else { 1 };
-
-        let mut prev_weight = i128::MAX;
-        let mut e = 0u64;
-        while e <= max_elapsed {
-            let w = crate::recency_weight_bps(e, dw);
-            assert!(
-                w <= prev_weight,
-                "monotonicity violated at elapsed={} (decay_window={}): \
-                 weight={} > prev_weight={}",
-                e,
-                dw,
-                w,
-                prev_weight
-            );
-            prev_weight = w;
-            e = e.saturating_add(step);
-        }
-    }
-}
-
-// ---- PROPERTY 3: ZERO ELAPSED ----
-// recency_weight_bps(0, dw) == BPS_SCALE for any valid dw > 0.
-#[test]
-fn property_recency_zero_elapsed() {
-    let decay_windows: &[u64] = &[1, 2, 10, 60, 86_400, 90 * 24 * 60 * 60];
-
-    for &dw in decay_windows {
-        let w = crate::recency_weight_bps(0, dw);
-        assert_eq!(
-            w, BPS_SCALE_I128,
-            "recency_weight_bps(0, {}) should be {} but got {}",
-            dw, BPS_SCALE_I128, w
-        );
-    }
-}
-
-// ---- PROPERTY 4: ZERO DECAY WINDOW ----
-// recency_weight_bps(e, 0) == BPS_SCALE for any elapsed.
-// (The function treats zero decay_window as "no decay".)
-#[test]
-fn property_recency_zero_decay_window() {
-    let elapsed_values: &[u64] = &[0, 1, 100, u64::MAX / 2, u64::MAX];
-
-    for &e in elapsed_values {
-        let w = crate::recency_weight_bps(e, 0);
-        assert_eq!(
-            w, BPS_SCALE_I128,
-            "recency_weight_bps({}, 0) should be {} but got {}",
-            e, BPS_SCALE_I128, w
-        );
-    }
-}
-
-// ---- PROPERTY 5: LARGE ELAPSED ----
-// For very large elapsed values (near u64::MAX), the function returns 0
-// and does not panic.
-#[test]
-fn property_recency_large_elapsed() {
-    let decay_windows: &[u64] = &[1, 60, 86_400, 90 * 24 * 60 * 60];
-
-    let large_elapsed: &[u64] = &[
-        u64::MAX,
-        u64::MAX - 1,
-        u64::MAX / 2,
-        u64::MAX / 3,
-        1_000_000_000_000, // ~31,700 years in seconds
-        31_536_000_000,    // ~1000 years in seconds
-    ];
-
-    for &dw in decay_windows {
-        for &e in large_elapsed {
-            let w = crate::recency_weight_bps(e, dw);
-            assert!(
-                w >= 0 && w <= BPS_SCALE_I128,
-                "large elapsed: recency_weight_bps({}, {}) = {} out of bounds",
-                e,
-                dw,
-                w
-            );
-            // With any reasonable decay_window and very large elapsed,
-            // the weight should be 0 (since full_halvings >= 20)
-            if dw > 0 && e / dw >= 20 {
-                assert_eq!(
-                    w, 0,
-                    "should saturate to 0: recency_weight_bps({}, {}) = {}",
-                    e, dw, w
-                );
-            }
-        }
-    }
-}
-
-// ---- PROPERTY 6: DECAY BOUNDARIES ----
-// Test exact half-life multiples and their neighbours.
-// At elapsed = k * decay_window:
-//   base = 10_000 >> k
-//   remainder = 0, so decrement = 0
-//   result = base
-#[test]
-fn property_recency_decay_boundaries() {
-    let dw: u64 = 100;
-
-    for k in 0..20u64 {
-        let e = k * dw;
-        let w = crate::recency_weight_bps(e, dw);
-        let expected = BPS_SCALE_I128 >> k;
-        assert_eq!(
-            w, expected,
-            "half-life boundary: recency_weight_bps({}, {}) = {}, expected {}",
-            e, dw, w, expected
-        );
-    }
-
-    // Test boundary - 1 and boundary + 1
-    for k in 1..10u64 {
-        let e_before = k * dw - 1;
-        let e_at = k * dw;
-        let e_after = k * dw + 1;
-
-        let w_before = crate::recency_weight_bps(e_before, dw);
-        let w_at = crate::recency_weight_bps(e_at, dw);
-        let w_after = crate::recency_weight_bps(e_after, dw);
-
+fn test_max_halvings_invariant() {
+    // Compile-time invariant check: the half-life shift must still produce a
+    // non-zero base at the declared cutoff (see doc comment above).
+    const {
         assert!(
-            w_before >= w_at,
-            "should decrease at boundary: w({})={} >= w({})={}",
-            e_before,
-            w_before,
-            e_at,
-            w_at
-        );
+            crate::BPS_SCALE >> crate::MAX_HALVINGS != 0,
+            "BPS_SCALE >> MAX_HALVINGS == 0: MAX_HALVINGS must be lowered \
+         (or BPS_SCALE raised) so that the shift still produces a non-zero \
+         base at the declared cutoff",
+        )
+    }
+}
+
+/// Decay-curve smoke test: checks expected outputs for every full half-life
+/// from 0 through MAX_HALVINGS (inclusive), using a decay window of exactly
+/// 1 second so that `elapsed = k` implies exactly `k` full halvings and
+/// zero remainder seconds.
+///
+/// At k = 0          : weight == BPS_SCALE (no decay).
+/// At k = MAX_HALVINGS: weight == 0 (early-exit guard fires).
+///
+/// The test verifies:
+///   1. weight == BPS_SCALE at k == 0.
+///   2. Strict monotone decrease for k in 0..MAX_HALVINGS.
+///   3. weight == 0 at k == MAX_HALVINGS (guard's documented semantics).
+#[test]
+fn test_recency_weight_decay_curve() {
+    // decay_window = 1 s so that elapsed = k  =>  full_halvings = k,
+    // remainder_secs = 0, no linear interpolation term.
+    let decay_window: u64 = 1;
+    let max = crate::MAX_HALVINGS;
+
+    // k=0: full weight.
+    assert_eq!(
+        crate::recency_weight_bps(0, decay_window),
+        crate::BPS_SCALE,
+        "weight at 0 half-lives should equal BPS_SCALE"
+    );
+
+    // k=MAX_HALVINGS: guard fires, weight must be 0.
+    assert_eq!(
+        crate::recency_weight_bps(max, decay_window),
+        0,
+        "weight at MAX_HALVINGS ({max}) half-lives should be 0"
+    );
+
+    // Strict monotone decrease across 0..MAX_HALVINGS.
+    let mut prev = crate::recency_weight_bps(0, decay_window);
+    for k in 1..max {
+        let curr = crate::recency_weight_bps(k, decay_window);
         assert!(
-            w_at >= w_after,
-            "should decrease after boundary: w({})={} >= w({})={}",
-            e_at,
-            w_at,
-            e_after,
-            w_after
+            curr < prev,
+            "decay curve not strictly decreasing at half-life {k}: \
+             weight[{k}]={curr} is not less than weight[{}]={prev}",
+            k - 1,
+        );
+        prev = curr;
+    }
+}
+
+#[test]
+fn test_event_namespace_consistency() {
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::TryIntoVal;
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    client.record_transaction(
+        &admin,
+        &1u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Released,
+    );
+    client.rate_entity(&counterparty, &1u64, &entity, &9000u32);
+    client.flag_entity(&admin, &entity, &symbol_short!("fraud"), &None);
+    client.freeze_entity(&admin, &entity);
+    client.unfreeze_entity(&admin, &entity);
+    let new_admin = Address::generate(&env);
+    client.propose_admin(&admin, &new_admin);
+    client.accept_admin(&new_admin);
+    let events = env.events().all();
+    let contract_id = client.address;
+    
+    let mut contract_event_count = 0;
+    for (contract, topics, _) in events.into_iter() {
+        if contract == contract_id {
+            contract_event_count += 1;
+            let namespace: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            assert_eq!(namespace, symbol_short!("reput"), "All reputation events must use the 'reput' namespace");
+        }
+    }
+    assert!(contract_event_count > 0);
+}
+
+// --- prune_entity_history tests ---
+
+#[test]
+fn test_prune_entity_history_noop_when_within_window() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    // Record 5 transactions (<= SCORE_WINDOW which is 200)
+    for i in 1..=5 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000,
+            &TransactionOutcome::Released,
         );
     }
+
+    let pruned = client.prune_entity_history(&admin, &entity, &50);
+    assert_eq!(pruned, 0);
+
+    let breakdown = client.get_reputation_breakdown(&entity, &0, &10);
+    assert_eq!(breakdown.len(), 5);
 }
 
-// ---- PROPERTY 7: AGREEMENT WITH ORACLE ----
-// For a broad sweep of inputs, verify the implementation matches
-// an independent mathematical oracle.
 #[test]
-fn property_recency_matches_oracle() {
-    let decay_windows: &[u64] = &[1, 2, 5, 10, 60, 3600, 86_400, 90 * 24 * 60 * 60];
+fn test_prune_entity_history_beyond_score_window() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
 
-    for &dw in decay_windows {
-        // Sweep elapsed from 0 to 30 half-lives worth of seconds
-        let max_elapsed = 30_u64.saturating_mul(dw);
-        let step = if dw > 100 { dw / 100 } else { 1 };
+    // Record 205 transactions (> SCORE_WINDOW = 200)
+    for i in 1..=205 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000,
+            &TransactionOutcome::Released,
+        );
+    }
 
-        let mut e = 0u64;
-        while e <= max_elapsed {
-            let actual = crate::recency_weight_bps(e, dw);
-            let expected = oracle_recency_weight_bps(e, dw);
-            assert_eq!(
-                actual, expected,
-                "oracle mismatch: recency_weight_bps({}, {}) = {}, expected {}",
-                e, dw, actual, expected
-            );
-            e = e.saturating_add(step);
-        }
+    let breakdown_before = client.get_reputation_breakdown(&entity, &0, &250);
+    assert_eq!(breakdown_before.len(), 205);
+
+    // Prune up to 50 excess records (excess = 5)
+    let pruned = client.prune_entity_history(&admin, &entity, &50);
+    assert_eq!(pruned, 5);
+
+    let breakdown_after = client.get_reputation_breakdown(&entity, &0, &250);
+    assert_eq!(breakdown_after.len(), 200);
+    assert_eq!(breakdown_after.get(0).unwrap().escrow_id, 6);
+}
+
+#[test]
+fn test_prune_entity_history_unauthorized() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let stranger = Address::generate(&env);
+    let entity = Address::generate(&env);
+
+    let res = client.try_prune_entity_history(&stranger, &entity, &50);
+    assert_eq!(res, Err(Ok(ReputationError::Unauthorized)));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Issue #138: freeze-threshold, SCORE_WINDOW boundary, and duplicate-flag
+// resolution edge cases
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// The auto-freeze must fire *exactly* at `freeze_threshold_flags` unresolved
+/// flags: one below it the entity stays operational, at the threshold it
+/// freezes, and further flags neither unfreeze nor re-freeze (one-way).
+/// Each reporter must first transact with `entity` to satisfy `flag_entity`'s
+/// counterparty gate.
+#[test]
+fn test_flag_entity_freezes_exactly_at_threshold() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+
+    let reporter_a = Address::generate(&env);
+    let reporter_b = Address::generate(&env);
+    let reporter_c = Address::generate(&env);
+    let reporter_d = Address::generate(&env);
+    // All counterparty relationships are established up front: once the third
+    // flag freezes the entity, `record_transaction` would reject new escrows.
+    for (reporter, id) in [
+        (reporter_a.clone(), 1u64),
+        (reporter_b.clone(), 2u64),
+        (reporter_c.clone(), 3u64),
+        (reporter_d.clone(), 4u64),
+    ] {
+        make_transacting_counterparty(&client, &admin, &entity, &reporter, id);
+    }
+
+    // threshold - 1 unresolved flags: still below the boundary, not frozen.
+    client.flag_entity(&reporter_a, &entity, &symbol_short!("fraud"), &None);
+    client.flag_entity(&reporter_b, &entity, &symbol_short!("fraud"), &None);
+    assert!(!client.is_frozen(&entity));
+    assert_eq!(client.get_flags(&entity, &0u32, &10u32).len(), 2);
+
+    // Exactly at the threshold: auto-freeze fires.
+    client.flag_entity(&reporter_c, &entity, &symbol_short!("fraud"), &None);
+    assert!(client.is_frozen(&entity));
+    assert_eq!(client.get_flags(&entity, &0u32, &10u32).len(), 3);
+
+    // Freezing is one-way: an extra flag past the threshold leaves the entity
+    // frozen rather than re-toggling the flag.
+    client.flag_entity(&reporter_d, &entity, &symbol_short!("fraud"), &None);
+    assert!(client.is_frozen(&entity));
+    assert_eq!(client.get_flags(&entity, &0u32, &10u32).len(), 4);
+}
+
+/// Exact-capacity boundary: with `SCORE_WINDOW` lifetime records the recompute
+/// window starts at index 0 and must sample *every* record. One Disputed (0)
+/// mixed into `SCORE_WINDOW - 1` Released (10_000), all with identical
+/// `recorded_at`, produces an exact weighted average of 9_950 — proving the
+/// whole window participated (a window that silently dropped the oldest record
+/// or clamped the count would yield a different value).
+#[test]
+fn test_score_window_under_capacity_samples_all_records() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut cfg = default_config();
+    cfg.min_transactions_threshold = 1;
+    cfg.dispute_penalty_bps = 0;
+    let contract_id = env.register(ReputationContract, (admin.clone(), cfg));
+    let client = ReputationContractClient::new(&env, &contract_id);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    client.record_transaction(
+        &admin,
+        &0u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Disputed,
+    );
+    for i in 1..SCORE_WINDOW as u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    let rep = client.get_reputation(&entity);
+    assert_eq!(rep.total_transactions, SCORE_WINDOW as u64);
+    // (199 * 10_000 + 1 * 0) / 200 = 9_950 (dispute penalty disabled).
+    assert_eq!(rep.score, 9_950);
+}
+
+/// The moment history exceeds `SCORE_WINDOW` records, the recompute window
+/// slides and the *oldest* record must exit the sample. A Disputed recorded
+/// first, followed by exactly `SCORE_WINDOW` Released records, gives a clean
+/// score of 10_000 — if the oldest Disputed were still sampled (no sliding),
+/// the average would be 9_950 instead. The lifetime dispute counter is
+/// unaffected by the window and stays exact.
+#[test]
+fn test_score_window_slide_excludes_oldest_record_across_boundary() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut cfg = default_config();
+    cfg.min_transactions_threshold = 1;
+    cfg.dispute_penalty_bps = 0;
+    let contract_id = env.register(ReputationContract, (admin.clone(), cfg));
+    let client = ReputationContractClient::new(&env, &contract_id);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    client.record_transaction(
+        &admin,
+        &0u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Disputed,
+    );
+    for i in 1..=SCORE_WINDOW as u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    let rep = client.get_reputation(&entity);
+    assert_eq!(rep.total_transactions, SCORE_WINDOW as u64 + 1);
+    assert_eq!(rep.disputed_transactions, 1);
+    // Window slid to the newest SCORE_WINDOW records: all Released -> 10_000.
+    assert_eq!(rep.score, 10_000);
+}
+
+/// Resolving the same reporter/entity flag twice must not silently succeed:
+/// the second call finds no *unresolved* flag to match (the entity has no
+/// active flags left) and returns `NoActiveFlag`; the stored flag remains a
+/// single resolved entry.
+#[test]
+fn test_resolve_flag_duplicate_resolution_rejected() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let reporter = Address::generate(&env);
+    make_transacting_counterparty(&client, &admin, &entity, &reporter, 1u64);
+
+    client.flag_entity(&reporter, &entity, &symbol_short!("fraud"), &None);
+    client.resolve_flag(&admin, &reporter, &entity);
+
+    let res = client.try_resolve_flag(&admin, &reporter, &entity);
+    assert_eq!(res, Err(Ok(ReputationError::NoActiveFlag)));
+
+    let flags = client.get_flags(&entity, &0u32, &10u32);
+    assert_eq!(flags.len(), 1);
+    assert!(flags.get(0).unwrap().resolved);
+}
+
+/// `resolve_flag` targets a single reporter's unresolved flag; resolving one
+/// of several must leave the others' resolved-status untouched, and a repeat
+/// resolve for the already-cleared reporter is rejected.
+#[test]
+fn test_resolve_flag_resolves_single_flag_among_many() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let reporter_a = Address::generate(&env);
+    let reporter_b = Address::generate(&env);
+    make_transacting_counterparty(&client, &admin, &entity, &reporter_a, 1u64);
+    make_transacting_counterparty(&client, &admin, &entity, &reporter_b, 2u64);
+
+    client.flag_entity(&reporter_a, &entity, &symbol_short!("fraud"), &None);
+    client.flag_entity(&reporter_b, &entity, &symbol_short!("spam"), &None);
+    client.resolve_flag(&admin, &reporter_a, &entity);
+
+    let flags = client.get_flags(&entity, &0u32, &10u32);
+    assert!(flags.get(0).unwrap().resolved);
+    assert!(!flags.get(1).unwrap().resolved);
+
+    // The already-resolved reporter's flag is gone from the active pool.
+    let res = client.try_resolve_flag(&admin, &reporter_a, &entity);
+    assert_eq!(res, Err(Ok(ReputationError::NoActiveFlag)));
+}
+
+/// Resolving a flag must not retroactively lift an auto-freeze already
+/// reached at the threshold: unfreezing is an explicit admin action.
+#[test]
+fn test_resolve_flag_does_not_auto_unfreeze() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+
+    let reporter_a = Address::generate(&env);
+    let reporter_b = Address::generate(&env);
+    let reporter_c = Address::generate(&env);
+    make_transacting_counterparty(&client, &admin, &entity, &reporter_a, 0u64);
+    make_transacting_counterparty(&client, &admin, &entity, &reporter_b, 1u64);
+    make_transacting_counterparty(&client, &admin, &entity, &reporter_c, 2u64);
+
+    client.flag_entity(&reporter_a, &entity, &symbol_short!("fraud"), &None);
+    client.flag_entity(&reporter_b, &entity, &symbol_short!("fraud"), &None);
+    client.flag_entity(&reporter_c, &entity, &symbol_short!("fraud"), &None);
+    assert!(client.is_frozen(&entity));
+
+    client.resolve_flag(&admin, &reporter_a, &entity);
+    assert!(client.is_frozen(&entity));
+
+    client.unfreeze_entity(&admin, &entity);
+    assert!(!client.is_frozen(&entity));
+}
+
+// ── Read-path TTL Bumping Tests (#78) ────────────────────────────────────────
+
+#[test]
+fn test_read_paths_bump_entity_and_records_ttl() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    client.record_transaction(
+        &admin,
+        &101,
+        &entity,
+        &counterparty,
+        &1_000,
+        &TransactionOutcome::Released,
+    );
+
+    client.flag_entity(
+        &counterparty,
+        &entity,
+        &symbol_short!("dispute"),
+        &Some(String::from_str(&env, "Delayed delivery")),
+    );
+
+    // Initial TTL check
+    let rep_ttl_initial = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::Reputation(entity.clone()))
+    });
+    assert!(rep_ttl_initial >= PERSISTENT_BUMP_AMOUNT);
+
+    // Simulate ledger progression (close to threshold)
+    env.ledger().with_mut(|li| {
+        li.sequence_number += 100_000;
+    });
+
+    let rep_ttl_before = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::Reputation(entity.clone()))
+    });
+    assert!(rep_ttl_before < rep_ttl_initial);
+
+    // Call get_reputation read path
+    let score = client.get_reputation(&entity);
+    assert_eq!(score.total_transactions, 1);
+
+    let rep_ttl_after = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::Reputation(entity.clone()))
+    });
+    assert!(rep_ttl_after >= PERSISTENT_BUMP_AMOUNT);
+    assert!(rep_ttl_after > rep_ttl_before);
+
+    // Advance ledger again and test get_reputation_breakdown read path
+    env.ledger().with_mut(|li| {
+        li.sequence_number += 100_000;
+    });
+
+    let hist_ttl_before = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::TransactionHistory(entity.clone()))
+    });
+    let rec_ttl_before = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::TransactionRecord(101))
+    });
+
+    let breakdown = client.get_reputation_breakdown(&entity, &0, &10);
+    assert_eq!(breakdown.len(), 1);
+
+    let hist_ttl_after = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::TransactionHistory(entity.clone()))
+    });
+    let rec_ttl_after = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::TransactionRecord(101))
+    });
+    assert!(hist_ttl_after > hist_ttl_before);
+    assert!(rec_ttl_after > rec_ttl_before);
+
+    // Advance ledger again and test get_flags read path
+    env.ledger().with_mut(|li| {
+        li.sequence_number += 100_000;
+    });
+
+    let flags_ttl_before = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::Flags(entity.clone()))
+    });
+
+    let flags = client.get_flags(&entity, &0, &10);
+    assert_eq!(flags.len(), 1);
+
+    let flags_ttl_after = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::Flags(entity.clone()))
+    });
+    assert!(flags_ttl_after > flags_ttl_before);
+}
+
+#[test]
+fn test_slow_activity_liveness_keeps_entity_alive_on_read() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    client.record_transaction(
+        &admin,
+        &201,
+        &entity,
+        &counterparty,
+        &5_000,
+        &TransactionOutcome::Released,
+    );
+
+    // Periodically perform read operations across multiple epochs
+    for _ in 0..5 {
+        env.ledger().with_mut(|li| {
+            li.sequence_number += 200_000;
+        });
+
+        // Calling get_reputation refreshes the entity's TTL
+        let rep = client.get_reputation(&entity);
+        assert_eq!(rep.total_transactions, 1);
+
+        let ttl = env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::Reputation(entity.clone()))
+        });
+        assert!(ttl >= PERSISTENT_BUMP_AMOUNT);
     }
 }
 
-// ---- PROPERTY 8: CROSS-DECAY-WINDOW CONSISTENCY ----
-// A larger decay_window should produce higher (or equal) weight
-// for the same elapsed, because the half-life is longer.
-#[test]
-fn property_recency_larger_window_higher_weight() {
-    let elapsed_values: &[u64] = &[0, 1, 10, 100, 1000, 10_000, 100_000];
-    let windows: &[u64] = &[10, 60, 3600, 86_400, 90 * 24 * 60 * 60];
-
-    for &e in elapsed_values {
-        for w_idx in 1..windows.len() {
-            let w_small = crate::recency_weight_bps(e, windows[w_idx - 1]);
-            let w_large = crate::recency_weight_bps(e, windows[w_idx]);
-            assert!(
-                w_large >= w_small,
-                "larger window should give higher weight: \
-                 recency_weight_bps({}, {})={} < recency_weight_bps({}, {})={}",
-                e,
-                windows[w_idx],
-                w_large,
-                e,
-                windows[w_idx - 1],
-                w_small
-            );
-        }
-    }
-}

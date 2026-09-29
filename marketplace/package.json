@@ -1,5 +1,5 @@
 {
-  "name": "@delego/contract-escrow",
+  "name": "@delego/contract-marketplace",
   "version": "0.0.1",
   "private": true,
   "scripts": {

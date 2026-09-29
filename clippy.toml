@@ -1,0 +1,15 @@
+# Soroban contract ABI entry points legitimately carry up to 9 arguments
+# (env + 8). With clippy's default 7-argument limit, every multi-arg entry
+# point tripped the lint, which led to crate-level
+# `#![allow(clippy::too_many_arguments)]` — hiding new violations.
+#
+# Instead, the threshold is raised to 8 (so only functions with 9+ arguments
+# are flagged) and the individual 9-argument ABI functions carry a scoped
+# `#[allow(clippy::too_many_arguments)]` with a reason comment. The
+# `contractimpl`/`contractargs` proc macros generate client and args-accessor
+# wrappers that mirror those signatures and cannot be annotated from user
+# code, so the corresponding impl blocks carry a scoped allow as well.
+#
+# New functions with 9+ arguments are still flagged by clippy and must add
+# their own scoped allow.
+too-many-arguments-threshold = 8
