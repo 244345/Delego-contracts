@@ -27,6 +27,104 @@ mod test {
         );
     }
 
+    // --- Calendar-bounded spending grants (not_before_ledger / not_after_ledger) ---
+
+    #[test]
+    fn test_grant_not_yet_active_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let merchant = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        // Grant activates at ledger 100, expires at ledger 200.
+        client.grant_bounded(
+            &owner,
+            &delegate,
+            &1000,
+            &100,
+            &merchants,
+            &100,
+            &200,
+        );
+
+        // Current ledger is 0, before not_before_ledger.
+        assert_eq!(
+            client.try_can_spend(&owner, &delegate, &50, &merchant),
+            Err(Ok(PermissionError::GrantNotYetActive))
+        );
+        assert_eq!(
+            client.try_execute_spend(&owner, &delegate, &50, &merchant),
+            Err(Ok(PermissionError::GrantNotYetActive))
+        );
+    }
+
+    #[test]
+    fn test_grant_active_within_window() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let merchant = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        client.grant_bounded(
+            &owner,
+            &delegate,
+            &1000,
+            &100,
+            &merchants,
+            &100,
+            &200,
+        );
+
+        env.ledger().set_sequence_number(150);
+        assert_eq!(
+            client.try_can_spend(&owner, &delegate, &50, &merchant),
+            Ok(Ok(()))
+        );
+    }
+
+    #[test]
+    fn test_grant_expired_after_not_after_ledger() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let merchant = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        client.grant_bounded(
+            &owner,
+            &delegate,
+            &1000,
+            &100,
+            &merchants,
+            &100,
+            &200,
+        );
+
+        env.ledger().set_sequence_number(201);
+        assert_eq!(
+            client.try_can_spend(&owner, &delegate, &50, &merchant),
+            Err(Ok(PermissionError::Expired))
+        );
+        assert_eq!(
+            client.try_execute_spend(&owner, &delegate, &50, &merchant),
+            Err(Ok(PermissionError::Expired))
+        );
+    }
+
     #[test]
     fn test_merchant_in_whitelist_succeeds() {
         let env = Env::default();

@@ -134,6 +134,8 @@ pub enum PermissionError {
     /// Nonce cancellation targets a nonce that was already consumed or
     /// would overflow the nonce counter (issue #297)
     NonceAlreadyUsed = 2413,
+    /// Spend attempted before the grant's `not_before_ledger` activation ledger
+    GrantNotYetActive = 2414,
 }
 
 #[cfg(test)]
@@ -179,11 +181,12 @@ mod error_code_tests {
         PermissionError::InvalidExpiry as u32,
         PermissionError::NotInitialized as u32,
         PermissionError::NonceAlreadyUsed as u32,
+        PermissionError::GrantNotYetActive as u32,
     ];
 
     #[test]
     fn permission_error_codes_are_unique_and_in_reserved_range() {
-        assert_eq!(PERMISSION_ERROR_CODES.len(), 29);
+        assert_eq!(PERMISSION_ERROR_CODES.len(), 30);
 
         let permission_range = ERROR_CODE_RANGES
             .iter()
@@ -239,6 +242,18 @@ pub enum PermissionStatus {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Ledger-bounded activation window for a permission grant.
+///
+/// A spend is only permitted while
+/// `not_before_ledger <= current_ledger <= not_after_ledger`.
+#[allow(missing_docs)]
+pub struct ActiveWindow {
+    pub not_before_ledger: u32,
+    pub not_after_ledger: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 /// A record describing a delegated permission from an owner to a delegate.
 #[allow(missing_docs)]
 pub struct PermissionRecord {
@@ -251,6 +266,11 @@ pub struct PermissionRecord {
     pub status: PermissionStatus,
     pub expires_at_ledger: u32,
     pub created_at: u64,
+    /// Ledger at which this grant becomes spendable. `0` means immediately
+    /// active (the pre-existing behaviour).
+    pub not_before_ledger: u32,
+    /// Ledger after which this grant is no longer spendable.
+    pub not_after_ledger: u32,
     /// Owner half of the parent permission's `(owner, delegate)` key, for
     /// permissions created via `grant_child`. `None` for top-level grants.
     pub parent_owner: Option<Address>,
@@ -1685,6 +1705,8 @@ impl PermissionsContract {
             return Err(PermissionError::Expired);
         }
 
+        Self::check_active_window(&env, &record)?;
+
         if amount > record.limit_per_tx {
             return Err(PermissionError::ExceedsPerTxLimit);
         }
@@ -1706,6 +1728,24 @@ impl PermissionsContract {
 
         Self::check_merchant_allowlist(&env, &owner, &delegate, &merchant)?;
 
+        Ok(())
+    }
+
+    /// Enforces a permission's calendar activation window (issue: calendar
+    /// bounded spending grants). Rejects spends before `not_before_ledger`
+    /// with `GrantNotYetActive` and after `not_after_ledger` with `Expired`.
+    /// A `not_before_ledger`/`not_after_ledger` of `0` means "unbounded".
+    fn check_active_window(
+        env: &Env,
+        record: &PermissionRecord,
+    ) -> Result<(), PermissionError> {
+        let current = env.ledger().sequence();
+        if record.not_before_ledger != 0 && current < record.not_before_ledger {
+            return Err(PermissionError::GrantNotYetActive);
+        }
+        if record.not_after_ledger != 0 && current > record.not_after_ledger {
+            return Err(PermissionError::Expired);
+        }
         Ok(())
     }
 
