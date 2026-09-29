@@ -1,23 +1,9 @@
 use crate::{
-    AdminAcceptedEvent, AdminProposedEvent, MarketplaceContract, MarketplaceContractClient,
-    MarketplaceError, MerchantRegisteredEvent, MerchantStatus, RegisterParams, Verifier,
-    DataKey, MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantStatus,
-    RegisterParams, Verifier,
-    MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantCursor,
-    MerchantRegisteredEvent, MerchantStatus, RegisterParams, Verifier,
-    normalize_symbol, CategoryEntry, DataKey, MarketplaceContract, MarketplaceContractClient,
-    MarketplaceError, Merchant, MerchantRegisteredEvent, MerchantStatus, RegisterParams,
-    VerificationPolicy, Verifier,
-    AdminProposedEvent, MarketplaceContract, MarketplaceContractClient, MarketplaceError,
-    MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantRegisteredEvent,
-    MerchantStatus, RegisterParams, Verifier,
-    MerchantStatus, MerchantValidationError, RegisterParams, Verifier,
-    MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantOperationalView,
-    CategoryChange, MarketplaceContract, MarketplaceContractClient, MarketplaceError,
-    MerchantCategoryChangedEvent, MerchantRegisteredEvent, MerchantStatus, RegisterParams,
-    Verifier,
-    MerchantStats, MerchantStatus, RegisterParams, Verifier,
-    MerchantStatus, RegisterParams, Verifier, MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN,
+    normalize_symbol, AdminAcceptedEvent, AdminProposedEvent, CategoryChange, CategoryEntry,
+    DataKey, MarketplaceContract, MarketplaceContractClient, MarketplaceError, Merchant,
+    MerchantCategoryChangedEvent, MerchantCursor, MerchantOperationalView,
+    MerchantRegisteredEvent, MerchantStats, MerchantStatus, MerchantValidationError,
+    RegisterParams, VerificationPolicy, Verifier, MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN,
     MAX_METADATA_LEN, MAX_NAME_LEN,
 };
 use delego_reputation::{
@@ -26,8 +12,7 @@ use delego_reputation::{
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Events as _, Ledger as _},
-    Address, Env, IntoVal, String, Symbol, TryFromVal, Val,
-    Address, Env, String, Symbol, TryIntoVal,
+    Address, Env, IntoVal, String, Symbol, TryFromVal, TryIntoVal, Val,
 };
 
 const MAX_DISCOVERY_CPU_INSTRUCTIONS: u64 = 2_000_000;

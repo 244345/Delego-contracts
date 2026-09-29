@@ -428,6 +428,11 @@ pub enum DataKey {
     LastMetadataUpdate(u64),
     GlobalReputationContract,
     Categories,
+    /// Records the ledger timestamp at which a merchant's verification policy
+    /// was raised, so a grace period can be applied before enforcement.
+    PolicyRaisedAt(u64),
+    /// Records the previous `required` value before a policy increase.
+    PolicyPreviousRequired(u64),
 }
 
 /// Mirror of `ReputationScore` from `delego-reputation` for cross-contract deserialization.
@@ -451,6 +456,11 @@ const MAX_METADATA_COOLDOWN_SECS: u64 = 30 * 24 * 60 * 60;
 const MAX_PAGE_LIMIT: u32 = 50;
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280; // ~1 day of ledgers (5s/ledger)
 const PERSISTENT_BUMP_AMOUNT: u32 = 518_400; // ~30 days of ledgers
+
+/// Grace period (in seconds) granted to pre-existing merchants after a
+/// verification policy threshold increase, during which they retain their
+/// verified status while acquiring the additional attestations.
+pub const VERIFICATION_POLICY_GRACE_PERIOD_SECS: u64 = 30 * 24 * 60 * 60;
 
 pub(crate) fn normalize_symbol(env: &Env, sym: &Symbol) -> Symbol {
     use soroban_sdk::xdr::ToXdr;
@@ -1158,6 +1168,162 @@ impl MarketplaceContract {
                 verifier,
                 removed_by: admin,
             },
+        );
+
+        Ok(())
+    }
+
+    // --- Verification Policy Revalidation ---
+
+    /// Returns the number of verifications currently collected for a merchant.
+    fn get_merchant_verifications_count(env: &Env, merchant_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::VerifiedCount(merchant_id))
+            .unwrap_or(0)
+    }
+
+    /// Dynamic verification check: a merchant is verified iff the number of
+    /// collected verifications meets or exceeds the policy's required count.
+    /// This replaces reliance on the static `Merchant.verified` boolean.
+    pub fn recheck_merchant_verification(
+        env: &Env,
+        merchant_id: u64,
+        policy: &VerificationPolicy,
+    ) -> bool {
+        let current_verifications = Self::get_merchant_verifications_count(env, merchant_id);
+        current_verifications >= policy.required
+    }
+
+    /// Re-evaluates a merchant's verification status against the current
+    /// policy. If the policy's `required` count exceeds the merchant's
+    /// collected verifications, the merchant is downgraded from `Verified`
+    /// to `Registered` — unless it is still within the 30-day grace period
+    /// that begins when the policy threshold was raised.
+    ///
+    /// Returns `true` when the merchant is (still) considered verified under
+    /// the current policy, `false` otherwise.
+    pub fn revalidate_merchant_status(
+        env: Env,
+        merchant_id: u64,
+    ) -> Result<bool, MarketplaceError> {
+        let mut merchant = Self::get_merchant(env.clone(), merchant_id)?;
+        Self::check_not_frozen_or_closed(&merchant)?;
+
+        let policy: VerificationPolicy = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VerificationPolicy(merchant_id))
+            .unwrap_or(VerificationPolicy {
+                required: 1,
+                max_verifications: MAX_REQUIRED_VERIFICATIONS,
+            });
+
+        let meets_policy = Self::recheck_merchant_verification(&env, merchant_id, &policy);
+
+        if meets_policy {
+            if !merchant.verified {
+                merchant.verified = true;
+                merchant.status = MerchantStatus::Verified;
+                merchant.updated_at = env.ledger().timestamp();
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Merchant(merchant_id), &merchant);
+            }
+            return Ok(true);
+        }
+
+        // Merchant does not meet the current policy. Check grace period.
+        let raised_at: Option<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PolicyRaisedAt(merchant_id));
+
+        let now = env.ledger().timestamp();
+        let within_grace = match raised_at {
+            Some(ts) => now < ts.saturating_add(VERIFICATION_POLICY_GRACE_PERIOD_SECS),
+            None => false,
+        };
+
+        if within_grace {
+            // Keep verified status during grace period.
+            return Ok(merchant.verified);
+        }
+
+        // Grace period expired (or never set): downgrade.
+        if merchant.verified || merchant.status == MerchantStatus::Verified {
+            merchant.verified = false;
+            if merchant.status == MerchantStatus::Verified {
+                merchant.status = MerchantStatus::Registered;
+            }
+            merchant.updated_at = now;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Merchant(merchant_id), &merchant);
+        }
+
+        Ok(false)
+    }
+
+    /// Admin-only: raise the required verification count for a merchant's
+    /// policy. Records the timestamp so the 30-day grace period applies to
+    /// pre-existing merchants that were verified under the old policy.
+    pub fn set_verification_policy(
+        env: Env,
+        admin: Address,
+        merchant_id: u64,
+        required: u32,
+    ) -> Result<(), MarketplaceError> {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone())? {
+            return Err(MarketplaceError::Unauthorized);
+        }
+        if required > MAX_REQUIRED_VERIFICATIONS {
+            return Err(MarketplaceError::InvalidParam);
+        }
+
+        let verifiers_len: u32 = Self::get_verifiers(env.clone()).len();
+        if verifiers_len > 0 && required > verifiers_len {
+            return Err(MarketplaceError::InvalidParam);
+        }
+
+        let mut policy: VerificationPolicy = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VerificationPolicy(merchant_id))
+            .unwrap_or(VerificationPolicy {
+                required: 1,
+                max_verifications: verifiers_len.min(MAX_REQUIRED_VERIFICATIONS),
+            });
+
+        let previous_required = policy.required;
+        if required > previous_required {
+            // Threshold increase: start grace period for pre-existing merchants.
+            let now = env.ledger().timestamp();
+            env.storage()
+                .persistent()
+                .set(&DataKey::PolicyRaisedAt(merchant_id), &now);
+            env.storage()
+                .persistent()
+                .set(&DataKey::PolicyPreviousRequired(merchant_id), &previous_required);
+            env.storage().persistent().extend_ttl(
+                &DataKey::PolicyRaisedAt(merchant_id),
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+
+        policy.required = required;
+        if policy.max_verifications < required {
+            policy.max_verifications = required;
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerificationPolicy(merchant_id), &policy);
+        env.storage().persistent().extend_ttl(
+            &DataKey::VerificationPolicy(merchant_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
         );
 
         Ok(())
