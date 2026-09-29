@@ -677,6 +677,7 @@ fn test_relayed_spend_replay_with_old_nonce_reverts() {
         amount: 100,
         nonce: 0,
         expiration_ledger,
+        epoch: 0,
     };
     let signature = sign_relayed_spend(&t.env, &signing_key, message);
 
@@ -688,6 +689,7 @@ fn test_relayed_spend_replay_with_old_nonce_reverts() {
         &t.seller,
         &0u64,
         &expiration_ledger,
+        &0u32,
         &signature,
     );
     assert_eq!(perm_client.get_relayer_nonce(&t.buyer, &t.agent), 1);
@@ -702,6 +704,7 @@ fn test_relayed_spend_replay_with_old_nonce_reverts() {
         &t.seller,
         &0u64,
         &expiration_ledger,
+        &0u32,
         &signature,
     );
     assert_eq!(replay, Err(Ok(PermissionError::InvalidNonce)));
