@@ -1128,7 +1128,6 @@ fn test_transfer_permission_fails_if_old_permission_not_found() {
     );
 }
 
-
 #[test]
 fn test_transfer_permission_fails_for_self_transfer() {
     let t = TestEnv::setup();
@@ -1602,4 +1601,154 @@ fn test_cancel_nonce_requires_existing_permission() {
         client.try_cancel_nonce(&t.buyer, &t.agent, &0u64),
         Err(Ok(PermissionError::PermissionNotFound))
     );
+}
+
+// ── Issue: Handle Verification Policy Threshold Increases ─────────────────
+
+/// Helper: register a merchant with the given number of verifications under
+/// the currently configured policy, returning the merchant id.
+fn register_verified_merchant(
+    t: &TestEnv,
+    client: &PermissionsContractClient,
+    verifications: u32,
+) -> u64 {
+    let merchant = Address::generate(&t.env);
+    let id = client.register_merchant(&t.admin, &merchant);
+    for _ in 0..verifications {
+        client.add_merchant_verification(&t.admin, &id);
+    }
+    id
+}
+
+/// A merchant verified under a 1-of-N policy must not remain "verified"
+/// indefinitely once governance raises the required threshold to 2. The
+/// dynamic check must report them as failing the new policy, and the
+/// revalidation entrypoint must transition them out of the verified state.
+#[test]
+fn test_policy_threshold_increase_invalidates_pre_existing_merchant() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    client.set_admin(&t.admin);
+
+    // Governance starts with a 1-verification policy.
+    client.set_verification_policy(&t.admin, &1u32);
+
+    // Merchant is registered and fully verified under the old policy.
+    let merchant_id = register_verified_merchant(&t, &client, 1);
+    assert!(client.is_merchant_verified(&merchant_id));
+
+    // Governance raises the required verifications to 2.
+    client.set_verification_policy(&t.admin, &2u32);
+
+    // The dynamic check must immediately reflect the new policy: the merchant
+    // only holds 1 attestation, so they no longer satisfy the requirement.
+    assert!(!client.is_merchant_verified(&merchant_id));
+
+    // Revalidation must transition the merchant out of the verified state.
+    let still_verified = client.revalidate_merchant_status(&merchant_id);
+    assert!(!still_verified);
+    assert!(!client.is_merchant_verified(&merchant_id));
+}
+
+/// A merchant that acquires the additional attestation within the grace
+/// period must be re-validated back into the verified state.
+#[test]
+fn test_policy_threshold_increase_grace_period_allows_recovery() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    client.set_admin(&t.admin);
+
+    client.set_verification_policy(&t.admin, &1u32);
+    let merchant_id = register_verified_merchant(&t, &client, 1);
+    assert!(client.is_merchant_verified(&merchant_id));
+
+    // Policy is raised; merchant is now under-verified but within grace.
+    client.set_verification_policy(&t.admin, &2u32);
+    assert!(!client.is_merchant_verified(&merchant_id));
+
+    // Merchant acquires the second attestation before the grace period ends.
+    client.add_merchant_verification(&t.admin, &merchant_id);
+
+    // Revalidation succeeds and the merchant is verified again.
+    assert!(client.revalidate_merchant_status(&merchant_id));
+    assert!(client.is_merchant_verified(&merchant_id));
+}
+
+/// Once the 30-day grace period elapses without the merchant acquiring the
+/// additional attestation, revalidation must permanently fail and the
+/// merchant must remain unverified.
+#[test]
+fn test_policy_threshold_increase_grace_period_expiry() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    client.set_admin(&t.admin);
+
+    client.set_verification_policy(&t.admin, &1u32);
+    let merchant_id = register_verified_merchant(&t, &client, 1);
+    assert!(client.is_merchant_verified(&merchant_id));
+
+    // Raise the policy and let the 30-day grace period expire.
+    client.set_verification_policy(&t.admin, &2u32);
+    let thirty_days_secs: u64 = 30 * 24 * 60 * 60;
+    t.env
+        .ledger()
+        .set_timestamp(t.env.ledger().timestamp() + thirty_days_secs + 1);
+
+    // Even if the merchant later acquires the attestation, the grace window
+    // has closed and revalidation must not silently re-verify them.
+    client.add_merchant_verification(&t.admin, &merchant_id);
+    assert!(!client.revalidate_merchant_status(&merchant_id));
+    assert!(!client.is_merchant_verified(&merchant_id));
+}
+
+/// A merchant already meeting the raised policy must be unaffected by the
+/// transition and revalidation must keep them verified.
+#[test]
+fn test_policy_threshold_increase_leaves_compliant_merchant_verified() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    client.set_admin(&t.admin);
+
+    client.set_verification_policy(&t.admin, &1u32);
+    let merchant_id = register_verified_merchant(&t, &client, 2);
+    assert!(client.is_merchant_verified(&merchant_id));
+
+    // Raising the policy to 2 leaves this merchant compliant.
+    client.set_verification_policy(&t.admin, &2u32);
+    assert!(client.is_merchant_verified(&merchant_id));
+    assert!(client.revalidate_merchant_status(&merchant_id));
+    assert!(client.is_merchant_verified(&merchant_id));
+}
+
+/// Revalidating an unknown merchant must surface a deterministic error
+/// rather than silently succeeding.
+#[test]
+fn test_revalidate_merchant_status_unknown_merchant_fails() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    client.set_admin(&t.admin);
+    client.set_verification_policy(&t.admin, &1u32);
+
+    assert_eq!(
+        client.try_revalidate_merchant_status(&999u64),
+        Err(Ok(PermissionError::MerchantNotFound))
+    );
+}
+
+/// Lowering the policy threshold must not revoke merchants that were already
+/// verified; the dynamic check should simply continue to pass.
+#[test]
+fn test_policy_threshold_decrease_keeps_merchant_verified() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    client.set_admin(&t.admin);
+
+    client.set_verification_policy(&t.admin, &2u32);
+    let merchant_id = register_verified_merchant(&t, &client, 2);
+    assert!(client.is_merchant_verified(&merchant_id));
+
+    // Governance relaxes the policy back to 1.
+    client.set_verification_policy(&t.admin, &1u32);
+    assert!(client.is_merchant_verified(&merchant_id));
+    assert!(client.revalidate_merchant_status(&merchant_id));
 }
