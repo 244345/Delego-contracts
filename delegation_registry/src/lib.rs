@@ -12,6 +12,7 @@ use soroban_sdk::{
 /// for roughly 30 days, matching the repository's persistent-storage policy.
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280;
 const PERSISTENT_BUMP_AMOUNT: u32 = 518_400;
+pub const MAX_SWEEP_BATCH_SIZE: u32 = 50;
 
 /// Represents the lifecycle status of a delegation.
 /// Contract version information for deployment scripts and runtime compatibility checks.
@@ -248,6 +249,8 @@ pub enum DelegationError {
     InvalidTtl = 313,
     /// The caller is not authorized to perform admin operations.
     NotAuthorized = 314,
+    /// The sweep batch is empty or exceeds the maximum supported size.
+    InvalidBatchSize = 315,
 }
 
 /// The delegation registry contract.
@@ -999,7 +1002,14 @@ impl DelegationRegistry {
     /// the same batch safe and gas-efficient.
     ///
     /// Returns the ids that were actually swept.
-    pub fn sweep_expired(env: Env, delegation_ids: Vec<u64>) -> Vec<u64> {
+    pub fn sweep_expired(
+        env: Env,
+        delegation_ids: Vec<u64>,
+    ) -> Result<Vec<u64>, DelegationError> {
+        if delegation_ids.is_empty() || delegation_ids.len() > MAX_SWEEP_BATCH_SIZE {
+            return Err(DelegationError::InvalidBatchSize);
+        }
+
         let current_ledger = env.ledger().sequence();
         let mut swept = Vec::new(&env);
 
@@ -1031,7 +1041,7 @@ impl DelegationRegistry {
             }
         }
 
-        swept
+        Ok(swept)
     }
 
     /// Returns all delegations owned by `owner` that are currently expired.
