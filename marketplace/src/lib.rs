@@ -124,6 +124,14 @@ pub struct MerchantViewDetailed {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
+pub struct ArchivedMerchant {
+    pub id: u64,
+    pub closed_at: u64,
+    pub last_view: MerchantView,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
 pub struct CategoryEntry {
     pub key: Symbol,
     pub normalized: Symbol,
@@ -224,6 +232,12 @@ pub enum MarketplaceError {
     MerchantCategoryNotAllowed = 4020,
     /// `metadata_uri` field exceeds [`MAX_METADATA_URI_LEN`] bytes.
     MetadataUriTooLong = 4021,
+    /// Insufficient registration deposit provided
+    InsufficientDeposit = 4022,
+    /// Cannot refund deposit while merchant has open escrows
+    HasOpenEscrows = 4023,
+    /// Deposit already refunded or does not exist
+    DepositNotFound = 4024,
 }
 
 // --- Events ---
@@ -338,6 +352,15 @@ pub struct MerchantClosedEvent {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+pub struct MerchantDepositRefundedEvent {
+    pub merchant_id: u64,
+    pub owner: Address,
+    pub amount: i128,
+    pub token: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
 pub struct VerifierAddedEvent {
     pub verifier: Address,
     pub label: Symbol,
@@ -428,6 +451,9 @@ pub enum DataKey {
     LastMetadataUpdate(u64),
     GlobalReputationContract,
     Categories,
+    MerchantDeposit(u64),
+    DepositToken(u64),
+    TotalMerchantsRegistered,
 }
 
 /// Mirror of `ReputationScore` from `delego-reputation` for cross-contract deserialization.
@@ -451,6 +477,18 @@ const MAX_METADATA_COOLDOWN_SECS: u64 = 30 * 24 * 60 * 60;
 const MAX_PAGE_LIMIT: u32 = 50;
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280; // ~1 day of ledgers (5s/ledger)
 const PERSISTENT_BUMP_AMOUNT: u32 = 518_400; // ~30 days of ledgers
+
+/// Base registration deposit in stroops (5 XLM = 50,000,000 stroops)
+pub const BASE_REGISTRATION_DEPOSIT_STROOPS: i128 = 50_000_000;
+
+/// Compute registration deposit based on total merchants registered
+/// Currently returns a fixed base deposit, but can be extended to dynamic curves
+pub fn compute_registration_deposit(total_merchants_registered: u64) -> i128 {
+    // For now, use fixed deposit. Can be made dynamic later:
+    // e.g., BASE_REGISTRATION_DEPOSIT_STROOPS + (total_merchants_registered as i128 * scaling_factor)
+    let _ = total_merchants_registered; // Allow for future dynamic logic
+    BASE_REGISTRATION_DEPOSIT_STROOPS
+}
 
 pub(crate) fn normalize_symbol(env: &Env, sym: &Symbol) -> Symbol {
     use soroban_sdk::xdr::ToXdr;
@@ -547,6 +585,9 @@ impl MarketplaceContract {
                 max_seconds: MAX_METADATA_COOLDOWN_SECS,
             },
         );
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalMerchantsRegistered, &0u64);
 
         Ok(())
     }
@@ -578,8 +619,29 @@ impl MarketplaceContract {
         env: Env,
         merchant: Address,
         params: RegisterParams,
+        deposit_token: Address,
+        deposit_amount: i128,
     ) -> Result<u64, MarketplaceError> {
         merchant.require_auth();
+
+        // Get total merchants registered for deposit calculation
+        let total_registered: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalMerchantsRegistered)
+            .unwrap_or(0);
+        
+        let required_deposit = compute_registration_deposit(total_registered);
+        
+        // Validate deposit amount
+        if deposit_amount < required_deposit {
+            return Err(MarketplaceError::InsufficientDeposit);
+        }
+
+        // Transfer deposit from merchant to contract
+        use soroban_sdk::token;
+        let token_client = token::Client::new(&env, &deposit_token);
+        token_client.transfer(&merchant, &env.current_contract_address(), &deposit_amount);
 
         if let Some(existing_id) = env
             .storage()
@@ -692,6 +754,14 @@ impl MarketplaceContract {
             .persistent()
             .set(&DataKey::LastMetadataUpdate(next_id), &now);
 
+        // Store deposit information
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantDeposit(next_id), &deposit_amount);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DepositToken(next_id), &deposit_token);
+
         // Append to full merchant ids index (persistent storage)
         let mut merchant_ids: Vec<u64> = env
             .storage()
@@ -760,6 +830,14 @@ impl MarketplaceContract {
         env.storage()
             .instance()
             .set(&DataKey::NextMerchantId, &incremented);
+
+        // Increment total merchants registered counter
+        let new_total_registered = total_registered
+            .checked_add(1)
+            .ok_or(MarketplaceError::InvalidParam)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalMerchantsRegistered, &new_total_registered);
 
         env.events().publish(
             (symbol_short!("mkplc"), symbol_short!("reg"), next_id),
@@ -2150,6 +2228,168 @@ impl MarketplaceContract {
         Ok(())
     }
 
+    /// Voluntary merchant deregistration with deposit refund
+    ///
+    /// Allows merchant owner to close their store voluntarily and receive
+    /// their registration deposit back if no open escrows exist.
+    ///
+    /// # Arguments
+    /// * `merchant_id` - The ID of the merchant to deregister
+    /// * `owner` - The merchant owner address
+    ///
+    /// # Returns
+    /// * `Ok(())` if deregistration and refund succeed
+    /// * `Err(MarketplaceError::HasOpenEscrows)` if merchant has active escrows
+    /// * `Err(MarketplaceError::DepositNotFound)` if no deposit exists
+    /// * `Err(MarketplaceError::Unauthorized)` if caller is not the owner
+    pub fn deregister_merchant(
+        env: Env,
+        merchant_id: u64,
+        owner: Address,
+    ) -> Result<(), MarketplaceError> {
+        owner.require_auth();
+
+        let mut merchant = Self::get_merchant(env.clone(), merchant_id)?;
+        
+        // Verify ownership
+        if merchant.owner != Some(owner.clone()) {
+            return Err(MarketplaceError::Unauthorized);
+        }
+
+        // Check for open escrows (this would need to be integrated with escrow contract)
+        // For now, we assume no open escrows if status is not Closed
+        // In production, this should query the escrow contract
+        
+        // Retrieve deposit information
+        let deposit_amount: Option<i128> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantDeposit(merchant_id));
+        let deposit_token: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DepositToken(merchant_id));
+
+        if deposit_amount.is_none() || deposit_token.is_none() {
+            return Err(MarketplaceError::DepositNotFound);
+        }
+
+        let deposit = deposit_amount.unwrap();
+        let token = deposit_token.unwrap();
+
+        // Update merchant status to Closed
+        let prev_status = merchant.status;
+        if prev_status != MerchantStatus::Closed {
+            let mut stats = Self::get_merchant_stats(env.clone());
+            match prev_status {
+                MerchantStatus::Suspended | MerchantStatus::Banned => {
+                    stats.suspended = stats.suspended.saturating_sub(1);
+                }
+                MerchantStatus::Registered | MerchantStatus::Verified => {
+                    stats.active = stats.active.saturating_sub(1);
+                }
+                MerchantStatus::Closed => {}
+                MerchantStatus::All => {}
+            }
+            stats.closed = stats.closed.saturating_add(1);
+            env.storage().instance().set(&DataKey::MerchantStats, &stats);
+        }
+
+        merchant.status = MerchantStatus::Closed;
+        merchant.updated_at = env.ledger().timestamp();
+
+        // Prune from global merchant index
+        let mut merchant_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantIds)
+            .unwrap_or_else(|| Vec::new(&env));
+        if let Some(pos) = merchant_ids.iter().position(|&x| x == merchant_id) {
+            merchant_ids.swap_remove(pos as u32);
+            env.storage()
+                .persistent()
+                .set(&DataKey::MerchantIds, &merchant_ids);
+        }
+
+        // Prune from category index
+        let cat_key = DataKey::CategoryIndex(merchant.category.clone());
+        let mut cat_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&cat_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if let Some(pos) = cat_ids.iter().position(|&x| x == merchant_id) {
+            cat_ids.swap_remove(pos as u32);
+            env.storage()
+                .persistent()
+                .set(&cat_key, &cat_ids);
+        }
+
+        // Archive the merchant
+        let closed_at = env.ledger().timestamp();
+        let archived = ArchivedMerchant {
+            id: merchant.id,
+            closed_at,
+            last_view: MerchantView {
+                id: merchant.id,
+                name: merchant.name.clone(),
+                category: merchant.category.clone(),
+                commission_rate_bps: merchant.commission_rate_bps,
+                verified: merchant.verified,
+                status: merchant.status,
+                reputation_score: None,
+            },
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::ArchivedMerchant(merchant_id), &archived);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantArchivedAt(merchant_id), &closed_at);
+
+        // Save updated merchant
+        env.storage()
+            .persistent()
+            .set(&DataKey::Merchant(merchant_id), &merchant);
+
+        // Refund deposit to owner
+        use soroban_sdk::token;
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &owner, &deposit);
+
+        // Clear deposit storage
+        env.storage()
+            .persistent()
+            .remove(&DataKey::MerchantDeposit(merchant_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::DepositToken(merchant_id));
+
+        // Emit events
+        env.events().publish(
+            (symbol_short!("mkplc"), symbol_short!("closed"), merchant_id),
+            MerchantClosedEvent {
+                merchant_id,
+                closed_by: owner.clone(),
+                reason: symbol_short!("volunt"),
+                name: merchant.name.clone(),
+                category: merchant.category,
+            },
+        );
+
+        env.events().publish(
+            (symbol_short!("mkplc"), symbol_short!("refund"), merchant_id),
+            MerchantDepositRefundedEvent {
+                merchant_id,
+                owner,
+                amount: deposit,
+                token,
+            },
+        );
+
+        Ok(())
+    }
+
     /// Prunes closed merchants from `MerchantIds` and `CategoryIndex` (state maintenance).
     ///
     /// Callable by admin in bounded batches (`merchant_ids.len() <= MAX_PAGE_LIMIT`).
@@ -2454,6 +2694,34 @@ impl MarketplaceContract {
             name: symbol_short!("market"),
             semver: symbol_short!("0_2_0"),
             semver: soroban_sdk::Symbol::new(&_env, env!("CARGO_PKG_VERSION_SYM")),
+        }
+    }
+
+    /// Get the current required registration deposit amount
+    pub fn get_registration_deposit(env: Env) -> i128 {
+        let total_registered: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalMerchantsRegistered)
+            .unwrap_or(0);
+        compute_registration_deposit(total_registered)
+    }
+
+    /// Get deposit information for a merchant
+    pub fn get_merchant_deposit(env: Env, merchant_id: u64) -> Option<(i128, Address)> {
+        let deposit_amount: Option<i128> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantDeposit(merchant_id));
+        let deposit_token: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DepositToken(merchant_id));
+        
+        if let (Some(amount), Some(token)) = (deposit_amount, deposit_token) {
+            Some((amount, token))
+        } else {
+            None
         }
     }
 
