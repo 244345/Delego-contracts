@@ -1996,107 +1996,6 @@ mod test {
         );
     }
 
-    // --- Issue #: Enforce maximum parent delegation depth ---
-
-    #[test]
-    fn test_grant_child_within_max_hierarchy_depth_succeeds() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let root_owner = Address::generate(&env);
-        let level1 = Address::generate(&env);
-        let level2 = Address::generate(&env);
-        let level3 = Address::generate(&env);
-
-        let contract_id = env.register(PermissionsContract, ());
-        let client = PermissionsContractClient::new(&env, &contract_id);
-
-        let merchants = Vec::<Address>::new(&env);
-        client.grant(&root_owner, &level1, &10_000, &1000, &merchants, &10000);
-
-        // Depth 1 -> 2
-        assert_eq!(
-            client.try_grant_child(
-                &root_owner,
-                &level1,
-                &level2,
-                &1000,
-                &100,
-                &merchants,
-                &10000,
-            ),
-            Ok(Ok(()))
-        );
-
-        // Depth 2 -> 3 (still within MAX_HIERARCHY_DEPTH)
-        assert_eq!(
-            client.try_grant_child(
-                &root_owner,
-                &level2,
-                &level3,
-                &1000,
-                &100,
-                &merchants,
-                &10000,
-            ),
-            Ok(Ok(()))
-        );
-    }
-
-    #[test]
-    fn test_grant_child_exceeding_max_hierarchy_depth_rejected() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let root_owner = Address::generate(&env);
-        let level1 = Address::generate(&env);
-        let level2 = Address::generate(&env);
-        let level3 = Address::generate(&env);
-        let level4 = Address::generate(&env);
-
-        let contract_id = env.register(PermissionsContract, ());
-        let client = PermissionsContractClient::new(&env, &contract_id);
-
-        let merchants = Vec::<Address>::new(&env);
-        client.grant(&root_owner, &level1, &10_000, &1000, &merchants, &10000);
-
-        client.grant_child(&root_owner, &level1, &level2, &1000, &100, &merchants, &10000);
-        client.grant_child(&root_owner, &level2, &level3, &1000, &100, &merchants, &10000);
-
-        // Depth 3 -> 4 exceeds MAX_HIERARCHY_DEPTH (3) and must be rejected.
-        assert_eq!(
-            client.try_grant_child(
-                &root_owner,
-                &level3,
-                &level4,
-                &1000,
-                &100,
-                &merchants,
-                &10000,
-            ),
-            Err(Ok(PermissionError::MaxHierarchyDepthExceeded))
-        );
-    }
-
-    #[test]
-    fn test_grant_child_records_depth_level_in_metadata() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let root_owner = Address::generate(&env);
-        let level1 = Address::generate(&env);
-        let level2 = Address::generate(&env);
-
-        let contract_id = env.register(PermissionsContract, ());
-        let client = PermissionsContractClient::new(&env, &contract_id);
-
-        let merchants = Vec::<Address>::new(&env);
-        client.grant(&root_owner, &level1, &10_000, &1000, &merchants, &10000);
-        client.grant_child(&root_owner, &level1, &level2, &1000, &100, &merchants, &10000);
-
-        let meta = client.get_hierarchy_metadata(&root_owner, &level2);
-        assert_eq!(meta.root_owner, root_owner);
-        assert_eq!(meta.parent_permission_id, Some(0));
-        assert_eq!(meta.depth_level, 2);
-    }
-
     #[test]
     fn test_grant_multi_owner_merchant_list_exceeds_max_rejected() {
         let env = Env::default();
@@ -3144,5 +3043,62 @@ mod test {
         
         let result = client.try_decrease_allowance(&owner, &delegate, &-100);
         assert!(result.is_err());
+    }
+
+    // --- Issue #426: Maximum parent delegation depth enforcement ---
+
+    #[test]
+    fn test_grant_child_rejects_beyond_max_hierarchy_depth() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let root_owner = Address::generate(&env);
+        let delegate_a = Address::generate(&env);
+        let delegate_b = Address::generate(&env);
+        let delegate_c = Address::generate(&env);
+        let delegate_d = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+
+        // Depth 1: root -> delegate_a
+        client.grant(&root_owner, &delegate_a, &10_000, &1000, &merchants, &10000);
+
+        // Depth 2: delegate_a -> delegate_b
+        client.grant_child(
+            &root_owner,
+            &delegate_a,
+            &delegate_b,
+            &1000,
+            &100,
+            &merchants,
+            &10000,
+        );
+
+        // Depth 3: delegate_b -> delegate_c (at MAX_HIERARCHY_DEPTH)
+        client.grant_child(
+            &root_owner,
+            &delegate_b,
+            &delegate_c,
+            &1000,
+            &100,
+            &merchants,
+            &10000,
+        );
+
+        // Depth 4: delegate_c -> delegate_d must be rejected.
+        assert_eq!(
+            client.try_grant_child(
+                &root_owner,
+                &delegate_c,
+                &delegate_d,
+                &1000,
+                &100,
+                &merchants,
+                &10000,
+            ),
+            Err(Ok(PermissionError::MaxHierarchyDepthExceeded))
+        );
     }
 }

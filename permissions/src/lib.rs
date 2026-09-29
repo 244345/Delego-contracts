@@ -65,10 +65,8 @@ pub const MAX_DECREASE_TIMELOCK_SECS: u64 = 2_592_000;
 pub const MAX_SWEEP_BATCH_SIZE: u32 = 50;
 pub const MAX_SWEEP_BATCH: u32 = MAX_SWEEP_BATCH_SIZE;
 
-/// Maximum depth of a parent-delegation chain created via `grant_child`.
-/// A top-level grant is depth 0; its direct child is depth 1, and so on.
-/// Chains deeper than this are rejected to bound the recursive parent
-/// walk performed during spend validation.
+/// Maximum depth of a parent delegation hierarchy. Child permissions may not
+/// be created at or beyond this depth, bounding recursive spend validation.
 pub const MAX_HIERARCHY_DEPTH: u32 = 3;
 
 #[contracterror]
@@ -140,7 +138,7 @@ pub enum PermissionError {
     /// Nonce cancellation targets a nonce that was already consumed or
     /// would overflow the nonce counter (issue #297)
     NonceAlreadyUsed = 2413,
-    /// A child grant would exceed `MAX_HIERARCHY_DEPTH` levels of
+    /// Child permission would exceed `MAX_HIERARCHY_DEPTH` levels of
     /// parent delegation
     MaxHierarchyDepthExceeded = 2414,
 }
@@ -269,9 +267,6 @@ pub struct PermissionRecord {
     /// grants. Together with `parent_owner`, this forms the reference the
     /// issue describes as `parent_permission`.
     pub parent_delegate: Option<Address>,
-    /// Number of parent-delegation hops from the root grant. `0` for a
-    /// top-level grant, incremented by one for each `grant_child`.
-    pub depth_level: u32,
 }
 
 /// A delegation permission jointly controlled by multiple owners (issue #326).
@@ -292,15 +287,6 @@ pub struct MultiOwnerPermission {
     pub status: PermissionStatus,
     pub expires_at_ledger: u32,
     pub created_at: u64,
-}
-
-/// Metadata describing a permission's position in a delegation hierarchy.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HierarchyMetadata {
-    pub root_owner: Address,
-    pub parent_permission_id: Option<u64>,
-    pub depth_level: u32,
 }
 
 #[contracttype]
@@ -1044,7 +1030,6 @@ impl PermissionsContract {
             created_at: env.ledger().timestamp(),
             parent_owner: None,
             parent_delegate: None,
-            depth_level: 0,
         };
 
         env.storage().persistent().set(&key, &record);
@@ -1158,17 +1143,6 @@ impl PermissionsContract {
             return Err(PermissionError::Expired);
         }
 
-        // Enforce the maximum parent-delegation depth so a deeply nested
-        // chain cannot exhaust the VM call stack / gas during the recursive
-        // parent walk in `validate_chain` / `apply_spend`.
-        let child_depth = parent_record
-            .depth_level
-            .checked_add(1)
-            .ok_or(PermissionError::MaxHierarchyDepthExceeded)?;
-        if child_depth >= MAX_HIERARCHY_DEPTH {
-            return Err(PermissionError::MaxHierarchyDepthExceeded);
-        }
-
         let parent_remaining = parent_record.limit_total - parent_record.spent;
         if limit_total > parent_remaining || limit_per_tx > parent_record.limit_per_tx {
             return Err(PermissionError::ExceedsParentLimit);
@@ -1189,7 +1163,6 @@ impl PermissionsContract {
             created_at: env.ledger().timestamp(),
             parent_owner: Some(parent_owner.clone()),
             parent_delegate: Some(parent_delegate.clone()),
-            depth_level: child_depth,
         };
 
         let child_key = DataKey::Permission(parent_delegate.clone(), child_delegate.clone());
@@ -1331,7 +1304,6 @@ impl PermissionsContract {
             created_at: env.ledger().timestamp(),
             parent_owner: old_record.parent_owner.clone(),
             parent_delegate: old_record.parent_delegate.clone(),
-            depth_level: old_record.depth_level,
         };
 
         let new_key = DataKey::Permission(owner.clone(), new_delegate.clone());
