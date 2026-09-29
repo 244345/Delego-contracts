@@ -243,6 +243,7 @@ Transitions are enforced by helpers (`check_not_frozen_or_closed`) so that suspe
 - `get_merchants(offset, limit)` / `get_merchants_by_category(category, offset, limit)`: Paginated discovery over `MerchantIds` / `CategoryIndex` (page size capped at 50)
 - `set_merchant_commission(...)` / `get_commission(...)`: Per-merchant commission in basis points (≤ 10_000)
 - `suspend_merchant(...)` / `unsuspend_merchant(...)` / `close_merchant(...)`: Admin moderation lifecycle
+- `set_appeal_bond_token(...)` / `file_merchant_suspension_appeal(...)` / `resolve_merchant_appeal(...)`: Bonded suspension appeals; upheld rulings refund and reinstate, rejected rulings slash to the configured restitution treasury
 - `set_merchant_reputation(...)` / `set_reputation_contract(...)`: Pair a merchant (or the whole registry) with a reputation contract for score injection
 - `propose_admin(...)` / `accept_admin(...)`: Two-step admin handover
 - `set_metadata_cooldown(...)` / `get_metadata_cooldown(...)`: Configure the metadata update cooldown, clamped to `[60s, 30d]` (default 24h)
@@ -250,8 +251,9 @@ Transitions are enforced by helpers (`check_not_frozen_or_closed`) so that suspe
 
 #### State (Storage Keys)
 
-- Instance: `Admin`, `PendingAdmin`, `NextMerchantId`, `Verifiers`, `MetadataCooldown`/`MetadataCooldownConfig`, `GlobalReputationContract`
+- Instance: `Admin`, `PendingAdmin`, `NextMerchantId`, `Verifiers`, `MetadataCooldown`/`MetadataCooldownConfig`, `GlobalReputationContract`, `AppealBondToken`, `AppealTreasury`
 - Persistent per merchant: `Merchant(id)`, `MerchantName(name)`, `FreedName(name)`, `ArchivedMerchant(id)`, `VerifiedCount(id)`, `VerificationPolicy(id)`, `MerchantVerifier(id, verifier)`, `MerchantVerifierList(id)`, `LastMetadataUpdate(id)`
+- Persistent appeal records: `AppealBond(merchant_id)`
 - Persistent indexes: `MerchantIds` (all ids), `CategoryIndex(category)` (ids per category)
 
 #### CategoryIndex & Discovery

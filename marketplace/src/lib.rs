@@ -224,6 +224,86 @@ pub enum MarketplaceError {
     MerchantCategoryNotAllowed = 4020,
     /// `metadata_uri` field exceeds [`MAX_METADATA_URI_LEN`] bytes.
     MetadataUriTooLong = 4021,
+    /// Merchant must be in Suspended status to file an appeal.
+    MerchantNotSuspended = 4022,
+    /// A pending (Pending) appeal bond already exists for this merchant.
+    AppealAlreadyPending = 4023,
+    /// Bond amount must be greater than zero.
+    ZeroBondAmount = 4024,
+    /// No appeal bond found for this merchant.
+    AppealNotFound = 4025,
+    /// Appeal has already been resolved and cannot be resolved again.
+    AppealAlreadyResolved = 4026,
+    /// The treasury address for slashed bonds has not been configured.
+    TreasuryNotSet = 4027,
+    /// The token used for appeal bonds has not been configured.
+    AppealBondTokenNotSet = 4028,
+}
+
+// ---------------------------------------------------------------------------
+// Appeal bond types
+// ---------------------------------------------------------------------------
+
+/// Resolution state of a merchant suspension appeal.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AppealResolution {
+    /// Appeal has been filed and is awaiting governance ruling.
+    Pending,
+    /// Governance upheld the appeal; merchant is reinstated and bond refunded.
+    UpheldAndReinstated,
+    /// Governance rejected the appeal as frivolous; bond is slashed to treasury.
+    RejectedAndSlashed,
+}
+
+/// On-chain record of a merchant's suspension appeal and its staked bond.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantAppealBond {
+    /// ID of the merchant filing the appeal.
+    pub merchant_id: u64,
+    /// Amount of tokens posted as a bond.
+    pub bond_amount: i128,
+    /// Token contract address for the bond asset.
+    pub bond_token: Address,
+    /// Ledger sequence at which the appeal was filed.
+    pub appealed_at_ledger: u32,
+    /// Current resolution status of this appeal.
+    pub resolution_status: AppealResolution,
+}
+
+// ---------------------------------------------------------------------------
+// Appeal bond events
+// ---------------------------------------------------------------------------
+
+/// Emitted when a merchant files a suspension appeal by posting a bond.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MerchantAppealFiledEvent {
+    /// ID of the appealing merchant.
+    pub merchant_id: u64,
+    /// Bond amount locked in the contract.
+    pub bond_amount: i128,
+    /// Token used for the bond.
+    pub bond_token: Address,
+    /// Ledger sequence at which the appeal was recorded.
+    pub appealed_at_ledger: u32,
+}
+
+/// Emitted when governance resolves a merchant appeal (either outcome).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MerchantAppealResolvedEvent {
+    /// ID of the merchant whose appeal was resolved.
+    pub merchant_id: u64,
+    /// Bond amount that was either refunded or slashed.
+    pub bond_amount: i128,
+    /// Final resolution: [`AppealResolution::UpheldAndReinstated`] or
+    /// [`AppealResolution::RejectedAndSlashed`].
+    pub resolution: AppealResolution,
+    /// Address that received the bond (merchant owner on reinstatement,
+    /// treasury on slash).
+    pub recipient: Address,
 }
 
 // --- Events ---
@@ -428,6 +508,12 @@ pub enum DataKey {
     LastMetadataUpdate(u64),
     GlobalReputationContract,
     Categories,
+    /// Stores the [`MerchantAppealBond`] for a given merchant id.
+    AppealBond(u64),
+    /// Address to receive slashed appeal bonds (the customer restitution pool).
+    AppealTreasury,
+    /// Token contract used for merchant suspension appeal bonds.
+    AppealBondToken,
 }
 
 /// Mirror of `ReputationScore` from `delego-reputation` for cross-contract deserialization.
@@ -2448,6 +2534,306 @@ impl MarketplaceContract {
             .get(&DataKey::Verifiers)
             .unwrap_or_else(|| Vec::new(&env))
     }
+
+    // ---------------------------------------------------------------------------
+    // Appeal bond — admin treasury config
+    // ---------------------------------------------------------------------------
+
+    /// Configure the address that receives slashed appeal bonds.
+    ///
+    /// Only the platform admin may call this. The treasury address is required
+    /// before any appeal can be rejected and slashed; calling
+    /// [`resolve_merchant_appeal`] with a rejection ruling will fail with
+    /// [`MarketplaceError::TreasuryNotSet`] if no treasury has been configured.
+    pub fn set_appeal_treasury(
+        env: Env,
+        admin: Address,
+        treasury: Address,
+    ) -> Result<(), MarketplaceError> {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone())? {
+            return Err(MarketplaceError::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::AppealTreasury, &treasury);
+        Ok(())
+    }
+
+    /// Return the currently configured appeal-bond treasury, if any.
+    pub fn get_appeal_treasury(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AppealTreasury)
+    }
+
+    /// Configure the token contract used for all new appeal bonds.
+    ///
+    /// Only the platform admin may call this. Existing appeals retain the
+    /// token address recorded when they were filed.
+    pub fn set_appeal_bond_token(
+        env: Env,
+        admin: Address,
+        bond_token: Address,
+    ) -> Result<(), MarketplaceError> {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone())? {
+            return Err(MarketplaceError::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::AppealBondToken, &bond_token);
+        Ok(())
+    }
+
+    /// Return the currently configured appeal-bond token, if any.
+    pub fn get_appeal_bond_token(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::AppealBondToken)
+    }
+
+    // ---------------------------------------------------------------------------
+    // Appeal bond — file
+    // ---------------------------------------------------------------------------
+
+    /// File a suspension appeal by locking a refundable staking bond.
+    ///
+    /// The calling address must be the registered owner of `merchant_id`, and the
+    /// merchant must currently be in [`MerchantStatus::Suspended`] status.
+    /// Exactly one pending appeal per merchant is allowed at a time.
+    ///
+    /// The configured bond token is pulled from the merchant owner into the
+    /// contract using the SAC `transfer` authorisation flow. The owner must
+    /// authorize the transfer when this transaction is submitted.
+    ///
+    /// # Arguments
+    /// * `env`          — execution environment.
+    /// * `merchant_id`  — ID of the suspended merchant filing the appeal.
+    /// * `bond_amount`  — number of token units to lock (must be > 0).
+    ///
+    /// # Errors
+    /// * [`MarketplaceError::MerchantNotFound`]    — no such merchant.
+    /// * [`MarketplaceError::Unauthorized`]        — caller is not the merchant owner.
+    /// * [`MarketplaceError::MerchantNotSuspended`]— merchant is not suspended.
+    /// * [`MarketplaceError::AppealAlreadyPending`]— a pending appeal already exists.
+    /// * [`MarketplaceError::ZeroBondAmount`]      — `bond_amount` is not positive.
+    /// * [`MarketplaceError::AppealBondTokenNotSet`]— no bond token is configured.
+    pub fn file_merchant_suspension_appeal(
+        env: Env,
+        merchant_id: u64,
+        bond_amount: i128,
+    ) -> Result<(), MarketplaceError> {
+        // Resolve owner and require their authorisation.
+        let merchant = Self::get_merchant(env.clone(), merchant_id)?;
+        let owner = merchant.owner.clone().ok_or(MarketplaceError::Unauthorized)?;
+        owner.require_auth();
+
+        // Only the merchant's own owner may file an appeal.
+        if merchant.owner != Some(owner.clone()) {
+            return Err(MarketplaceError::Unauthorized);
+        }
+
+        // Merchant must be suspended to be eligible for appeal.
+        if merchant.status != MerchantStatus::Suspended {
+            return Err(MarketplaceError::MerchantNotSuspended);
+        }
+
+        // Reject zero / negative bond amounts.
+        if bond_amount <= 0 {
+            return Err(MarketplaceError::ZeroBondAmount);
+        }
+
+        let bond_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::AppealBondToken)
+            .ok_or(MarketplaceError::AppealBondTokenNotSet)?;
+
+        // Only one pending appeal per merchant.
+        if let Some(existing) = env
+            .storage()
+            .persistent()
+            .get::<_, MerchantAppealBond>(&DataKey::AppealBond(merchant_id))
+        {
+            if existing.resolution_status == AppealResolution::Pending {
+                return Err(MarketplaceError::AppealAlreadyPending);
+            }
+        }
+
+        // Pull bond tokens from the owner into this contract.
+        let token_client = soroban_sdk::token::Client::new(&env, &bond_token);
+        token_client.transfer(&owner, &env.current_contract_address(), &bond_amount);
+
+        let appealed_at_ledger = env.ledger().sequence();
+        let bond = MerchantAppealBond {
+            merchant_id,
+            bond_amount,
+            bond_token: bond_token.clone(),
+            appealed_at_ledger,
+            resolution_status: AppealResolution::Pending,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AppealBond(merchant_id), &bond);
+        env.storage().persistent().extend_ttl(
+            &DataKey::AppealBond(merchant_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("ap_filed"),
+                merchant_id,
+            ),
+            MerchantAppealFiledEvent {
+                merchant_id,
+                bond_amount,
+                bond_token,
+                appealed_at_ledger,
+            },
+        );
+
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------------
+    // Appeal bond — resolve
+    // ---------------------------------------------------------------------------
+
+    /// Resolve a pending merchant suspension appeal.
+    ///
+    /// Only the platform admin (or, in a future upgrade, a governance contract)
+    /// may call this function.
+    ///
+    /// **`UpheldAndReinstated`**: the bond is refunded to the merchant owner
+    /// and the merchant's status is restored to its pre-suspension value
+    /// (`Verified` if previously verified, `Registered` otherwise).
+    ///
+    /// **`RejectedAndSlashed`**: the bond is transferred to the address
+    /// configured via [`set_appeal_treasury`]. The merchant remains suspended.
+    ///
+    /// # Arguments
+    /// * `env`         — execution environment.
+    /// * `admin`       — must be the current platform admin.
+    /// * `merchant_id` — ID of the merchant whose appeal is being resolved.
+    /// * `resolution`  — ruling: [`AppealResolution::UpheldAndReinstated`] or
+    ///                   [`AppealResolution::RejectedAndSlashed`]. Passing
+    ///                   [`AppealResolution::Pending`] is rejected.
+    ///
+    /// # Errors
+    /// * [`MarketplaceError::Unauthorized`]       — caller is not admin.
+    /// * [`MarketplaceError::AppealNotFound`]     — no appeal bond on record.
+    /// * [`MarketplaceError::AppealAlreadyResolved`]— bond already resolved.
+    /// * [`MarketplaceError::InvalidParam`]       — `resolution` is `Pending`.
+    /// * [`MarketplaceError::TreasuryNotSet`]     — slash requested but no treasury configured.
+    pub fn resolve_merchant_appeal(
+        env: Env,
+        admin: Address,
+        merchant_id: u64,
+        resolution: AppealResolution,
+    ) -> Result<(), MarketplaceError> {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone())? {
+            return Err(MarketplaceError::Unauthorized);
+        }
+
+        // Pending is not a valid resolution to pass in.
+        if resolution == AppealResolution::Pending {
+            return Err(MarketplaceError::InvalidParam);
+        }
+
+        let mut bond: MerchantAppealBond = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AppealBond(merchant_id))
+            .ok_or(MarketplaceError::AppealNotFound)?;
+
+        if bond.resolution_status != AppealResolution::Pending {
+            return Err(MarketplaceError::AppealAlreadyResolved);
+        }
+
+        let token_client = soroban_sdk::token::Client::new(&env, &bond.bond_token);
+        let contract_addr = env.current_contract_address();
+
+        let recipient = match resolution {
+            AppealResolution::UpheldAndReinstated => {
+                // Reinstate the merchant.
+                let mut merchant = Self::get_merchant(env.clone(), merchant_id)?;
+                if merchant.status == MerchantStatus::Suspended {
+                    let mut stats = Self::get_merchant_stats(env.clone());
+                    stats.suspended = stats.suspended.saturating_sub(1);
+                    stats.active = stats.active.saturating_add(1);
+                    env.storage().instance().set(&DataKey::MerchantStats, &stats);
+
+                    merchant.status = if merchant.verified {
+                        MerchantStatus::Verified
+                    } else {
+                        MerchantStatus::Registered
+                    };
+                    merchant.updated_at = env.ledger().timestamp();
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::Merchant(merchant_id), &merchant);
+                }
+
+                // Refund bond to the merchant owner.
+                let owner = merchant.owner.ok_or(MarketplaceError::Unauthorized)?;
+                token_client.transfer(&contract_addr, &owner, &bond.bond_amount);
+                owner
+            }
+            AppealResolution::RejectedAndSlashed => {
+                // Treasury must be configured before a slash can proceed.
+                let treasury: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::AppealTreasury)
+                    .ok_or(MarketplaceError::TreasuryNotSet)?;
+
+                // Slash bond to the customer restitution pool (treasury).
+                token_client.transfer(&contract_addr, &treasury, &bond.bond_amount);
+                treasury
+            }
+            // Already handled by the Pending guard above; unreachable in practice.
+            AppealResolution::Pending => return Err(MarketplaceError::InvalidParam),
+        };
+
+        bond.resolution_status = resolution.clone();
+        env.storage()
+            .persistent()
+            .set(&DataKey::AppealBond(merchant_id), &bond);
+        env.storage().persistent().extend_ttl(
+            &DataKey::AppealBond(merchant_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("ap_resv"),
+                merchant_id,
+            ),
+            MerchantAppealResolvedEvent {
+                merchant_id,
+                bond_amount: bond.bond_amount,
+                resolution,
+                recipient,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Retrieve the appeal bond record for a merchant, if one exists.
+    pub fn get_appeal_bond(env: Env, merchant_id: u64) -> Option<MerchantAppealBond> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AppealBond(merchant_id))
+    }
+
+    // ---------------------------------------------------------------------------
 
     pub fn version(_env: Env) -> ContractVersion {
         ContractVersion {
