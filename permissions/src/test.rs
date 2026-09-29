@@ -3044,4 +3044,109 @@ mod test {
         let result = client.try_decrease_allowance(&owner, &delegate, &-100);
         assert!(result.is_err());
     }
+
+    // --- Issue #368: rolling-window velocity caps ---
+
+    #[test]
+    fn test_rolling_window_rejects_rapid_micro_spends() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let merchant = Address::generate(&env);
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+        client.set_admin(&admin);
+
+        let mut merchants = Vec::<Address>::new(&env);
+        merchants.push_back(merchant.clone());
+        // Per-tx limit is generous; the rolling window is the binding constraint.
+        client.grant(&owner, &delegate, &10_000, &1_000, &merchants, &10_000);
+        client.set_rolling_window_limit(&admin, &720, &1_000);
+
+        // Three 400 spends exceed the 1,000 cap within the same window.
+        client.execute_spend(&owner, &delegate, &400, &merchant);
+        client.execute_spend(&owner, &delegate, &400, &merchant);
+        assert_eq!(
+            client.try_execute_spend(&owner, &delegate, &400, &merchant),
+            Err(Ok(PermissionError::VelocityLimitExceeded))
+        );
+
+        let state = client.get_rolling_window_state(&owner, &delegate);
+        assert_eq!(state.max_spend_in_window, 1_000);
+        assert_eq!(state.current_window_spend, 800);
+    }
+
+    #[test]
+    fn test_rolling_window_resets_after_window_elapses() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let merchant = Address::generate(&env);
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+        client.set_admin(&admin);
+
+        let mut merchants = Vec::<Address>::new(&env);
+        merchants.push_back(merchant.clone());
+        client.grant(&owner, &delegate, &10_000, &1_000, &merchants, &100_000);
+        client.set_rolling_window_limit(&admin, &720, &1_000);
+
+        env.ledger().set_sequence_number(1_000);
+        client.execute_spend(&owner, &delegate, &1_000, &merchant);
+        assert_eq!(
+            client.try_execute_spend(&owner, &delegate, &1, &merchant),
+            Err(Ok(PermissionError::VelocityLimitExceeded))
+        );
+
+        // Once the window elapses the accumulator rolls over automatically.
+        env.ledger().set_sequence_number(1_000 + 720);
+        client.execute_spend(&owner, &delegate, &1_000, &merchant);
+        let state = client.get_rolling_window_state(&owner, &delegate);
+        assert_eq!(state.current_window_spend, 1_000);
+        assert_eq!(state.window_start_ledger, 1_000 + 720);
+    }
+
+    #[test]
+    fn test_rolling_window_disabled_allows_unbounded_spend() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let merchant = Address::generate(&env);
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let mut merchants = Vec::<Address>::new(&env);
+        merchants.push_back(merchant.clone());
+        client.grant(&owner, &delegate, &10_000, &10_000, &merchants, &10_000);
+
+        // Without a configured cap, back-to-back full-size spends are allowed.
+        client.execute_spend(&owner, &delegate, &5_000, &merchant);
+        client.execute_spend(&owner, &delegate, &5_000, &merchant);
+    }
+
+    #[test]
+    fn test_set_rolling_window_limit_validates_admin_and_params() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let not_admin = Address::generate(&env);
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+        client.set_admin(&admin);
+
+        assert_eq!(
+            client.try_set_rolling_window_limit(&not_admin, &720, &1_000),
+            Err(Ok(PermissionError::Unauthorized))
+        );
+        // A non-zero cap with a zero window is rejected.
+        assert_eq!(
+            client.try_set_rolling_window_limit(&admin, &0, &1_000),
+            Err(Ok(PermissionError::InvalidParam))
+        );
+    }
 }

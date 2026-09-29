@@ -58,6 +58,9 @@ pub const MAX_VELOCITY_INTERVAL: u32 = 6_307_200;
 /// Upper bound on the optional wall-clock velocity floor, in seconds (one
 /// year), mirroring `MAX_VELOCITY_INTERVAL` for the timestamp dimension.
 pub const MAX_VELOCITY_INTERVAL_SECS: u64 = 31_536_000;
+/// Upper bound on the rolling spend window, in ledgers (~one year), mirroring
+/// `MAX_VELOCITY_INTERVAL` (issue #368).
+pub const MAX_ROLLING_WINDOW_LEDGERS: u32 = 6_307_200;
 /// Default allowance-decrease timelock in seconds (24 hours).
 pub const DEFAULT_DECREASE_TIMELOCK_SECS: u64 = 86_400;
 /// Maximum configurable allowance-decrease timelock (30 days).
@@ -183,7 +186,7 @@ mod error_code_tests {
 
     #[test]
     fn permission_error_codes_are_unique_and_in_reserved_range() {
-        assert_eq!(PERMISSION_ERROR_CODES.len(), 29);
+        assert_eq!(PERMISSION_ERROR_CODES.len(), 30);
 
         let permission_range = ERROR_CODE_RANGES
             .iter()
@@ -569,6 +572,35 @@ pub struct VelocityLimit {
     pub last_spend_timestamp: u64,
 }
 
+/// Rolling-window spend cap for a single (owner, delegate) pair (issue #368).
+///
+/// Complements the per-transaction limit: even a delegate that stays under
+/// `limit_per_tx` on every call cannot move more than `max_spend_in_window`
+/// within any `window_ledgers`-long sliding window.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RollingWindowLimit {
+    /// Length of the sliding window, in ledgers.
+    pub window_ledgers: u32,
+    /// Maximum cumulative spend allowed within one window.
+    pub max_spend_in_window: i128,
+    /// Cumulative spend recorded so far in the current window.
+    pub current_window_spend: i128,
+    /// Ledger at which the current window started.
+    pub window_start_ledger: u32,
+}
+
+/// Emitted when the admin configures the rolling-window velocity cap (#368).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RollingWindowSetEvent {
+    pub previous_window_ledgers: u32,
+    pub previous_max_spend: i128,
+    pub window_ledgers: u32,
+    pub max_spend_in_window: i128,
+    pub set_by: Address,
+}
+
 /// Emitted when the expiry of a permission is updated via `update_expiry` (issue #102).
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -818,6 +850,10 @@ pub enum DataKey {
     MinSpendIntervalSecs,
     /// Ledger timestamp of the last spend for a (owner, delegate) pair.
     LastSpendTimestamp(Address, Address),
+    /// Instance-level rolling-window velocity configuration (issue #368).
+    RollingWindowConfig,
+    /// Per-pair rolling-window spend state (issue #368).
+    RollingWindowState(Address, Address),
     /// Legacy serialized audit log retained for lazy migration.
     AuditLog(Address, Address),
     /// Physical ring-buffer index of a retained audit entry.
@@ -1824,6 +1860,10 @@ impl PermissionsContract {
         // since the last recorded spend ledger for this (owner, delegate) pair.
         Self::check_velocity(&env, &owner, &delegate)?;
 
+        // #368: Rolling-window cap — reject if this spend would push the
+        // pair's cumulative spend within the current window past the cap.
+        Self::check_rolling_window(&env, &owner, &delegate, amount)?;
+
         let result = Self::apply_spend(&env, &owner, &delegate, amount)?;
 
         // Emit after successful spend only (issue #99).
@@ -1891,6 +1931,9 @@ impl PermissionsContract {
             &DataKey::LastSpendTimestamp(owner.clone(), delegate.clone()),
             &env.ledger().timestamp(),
         );
+
+        // #368: Accrue this spend into the pair's rolling-window accumulator.
+        Self::record_rolling_window_spend(env, owner, delegate, amount)?;
 
         // Walk the parent chain, deducting the same amount from each ancestor's
         // allowance so a child's spend is also reflected against the allowance
@@ -1986,6 +2029,107 @@ impl PermissionsContract {
             }
         }
 
+        Ok(())
+    }
+
+    /// Load the instance-level rolling-window configuration, if any.
+    fn rolling_window_config(env: &Env) -> Option<RollingWindowLimit> {
+        env.storage()
+            .instance()
+            .get(&DataKey::RollingWindowConfig)
+    }
+
+    /// Load (and lazily roll over) the rolling-window state for a pair.
+    ///
+    /// A window that has fully elapsed is reset to start at the current ledger
+    /// with an accumulator of zero, so the cap applies to a true sliding window
+    /// rather than a fixed bucket (issue #368).
+    fn load_rolling_window_state(
+        env: &Env,
+        owner: &Address,
+        delegate: &Address,
+    ) -> RollingWindowLimit {
+        let config = Self::rolling_window_config(env).unwrap_or(RollingWindowLimit {
+            window_ledgers: 0,
+            max_spend_in_window: 0,
+            current_window_spend: 0,
+            window_start_ledger: 0,
+        });
+        let current_ledger = env.ledger().sequence();
+        let mut state: RollingWindowLimit = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RollingWindowState(owner.clone(), delegate.clone()))
+            .unwrap_or(RollingWindowLimit {
+                window_ledgers: config.window_ledgers,
+                max_spend_in_window: config.max_spend_in_window,
+                current_window_spend: 0,
+                window_start_ledger: current_ledger,
+            });
+        state.window_ledgers = config.window_ledgers;
+        state.max_spend_in_window = config.max_spend_in_window;
+        if state.window_ledgers > 0
+            && current_ledger >= state.window_start_ledger.saturating_add(state.window_ledgers)
+        {
+            state.current_window_spend = 0;
+            state.window_start_ledger = current_ledger;
+        }
+        state
+    }
+
+    /// Reject a spend that would push the pair's cumulative spend within the
+    /// current rolling window past `max_spend_in_window` (issue #368).
+    ///
+    /// No-op when the cap is disabled (`max_spend_in_window == 0`) or the
+    /// window length is zero. Called before any state mutation so a rejected
+    /// spend leaves the accumulator untouched.
+    fn check_rolling_window(
+        env: &Env,
+        owner: &Address,
+        delegate: &Address,
+        amount: i128,
+    ) -> Result<(), PermissionError> {
+        let config = match Self::rolling_window_config(env) {
+            Some(config) if config.window_ledgers > 0 && config.max_spend_in_window > 0 => config,
+            _ => return Ok(()),
+        };
+        if amount <= 0 {
+            return Ok(());
+        }
+        let state = Self::load_rolling_window_state(env, owner, delegate);
+        let projected = state
+            .current_window_spend
+            .checked_add(amount)
+            .ok_or(PermissionError::VelocityLimitExceeded)?;
+        if projected > config.max_spend_in_window {
+            return Err(PermissionError::VelocityLimitExceeded);
+        }
+        Ok(())
+    }
+
+    /// Accrue a successful spend into the pair's rolling-window accumulator,
+    /// rolling the window over first if it has elapsed (issue #368).
+    fn record_rolling_window_spend(
+        env: &Env,
+        owner: &Address,
+        delegate: &Address,
+        amount: i128,
+    ) -> Result<(), PermissionError> {
+        if Self::rolling_window_config(env).is_none() {
+            return Ok(());
+        }
+        let mut state = Self::load_rolling_window_state(env, owner, delegate);
+        if state.window_ledgers == 0 {
+            return Ok(());
+        }
+        state.current_window_spend = state
+            .current_window_spend
+            .checked_add(amount)
+            .ok_or(PermissionError::VelocityLimitExceeded)?;
+        env.storage().persistent().set(
+            &DataKey::RollingWindowState(owner.clone(), delegate.clone()),
+            &state,
+        );
         Ok(())
     }
 
@@ -2178,6 +2322,9 @@ impl PermissionsContract {
         // same throttle (issue #179).
         // Velocity check for relayed spend path
         Self::check_velocity(&env, &owner, &delegate)?;
+
+        // #368: Rolling-window cap, shared with the direct spend path.
+        Self::check_rolling_window(&env, &owner, &delegate, amount)?;
 
         // Advance the nonce before mutating spend state so a replay attempt
         // within the same ledger is rejected even if apply_spend panics.
@@ -2393,6 +2540,9 @@ impl PermissionsContract {
             merchant.clone(),
         )?;
 
+        // #368: Rolling-window cap applies to multi-owner spends too.
+        Self::check_rolling_window(&env, &primary_owner, &delegate, amount)?;
+
         let key = DataKey::MultiPermission(primary_owner.clone(), delegate.clone());
         let mut record: MultiOwnerPermission = env.storage().persistent().get(&key).unwrap();
 
@@ -2402,6 +2552,8 @@ impl PermissionsContract {
             .filter(|spent| *spent <= record.limit_total)
             .ok_or(PermissionError::ExceedsAllowance)?;
         env.storage().persistent().set(&key, &record);
+
+        Self::record_rolling_window_spend(&env, &primary_owner, &delegate, amount)?;
 
         let remaining = record.limit_total - record.spent;
 
@@ -3275,6 +3427,78 @@ impl PermissionsContract {
                 .get(&DataKey::LastSpendTimestamp(owner, delegate))
                 .unwrap_or(0),
         }
+    }
+
+    /// Configure the rolling-window velocity cap (issue #368). Admin-only.
+    ///
+    /// Even a delegate that keeps every transaction under `limit_per_tx` cannot
+    /// move more than `max_spend_in_window` within any `window_ledgers`-long
+    /// sliding window. Set `max_spend_in_window` to `0` to disable the cap; a
+    /// non-zero cap requires a non-zero `window_ledgers`.
+    pub fn set_rolling_window_limit(
+        env: Env,
+        admin: Address,
+        window_ledgers: u32,
+        max_spend_in_window: i128,
+    ) -> Result<(), PermissionError> {
+        Self::require_admin(&env, &admin)?;
+
+        if max_spend_in_window < 0
+            || window_ledgers > MAX_ROLLING_WINDOW_LEDGERS
+            || (max_spend_in_window > 0 && window_ledgers == 0)
+        {
+            return Err(PermissionError::InvalidParam);
+        }
+
+        let previous = Self::rolling_window_config(&env);
+        let config = RollingWindowLimit {
+            window_ledgers,
+            max_spend_in_window,
+            current_window_spend: 0,
+            window_start_ledger: 0,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::RollingWindowConfig, &config);
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("rwset")),
+            RollingWindowSetEvent {
+                previous_window_ledgers: previous
+                    .as_ref()
+                    .map(|p| p.window_ledgers)
+                    .unwrap_or(0),
+                previous_max_spend: previous
+                    .as_ref()
+                    .map(|p| p.max_spend_in_window)
+                    .unwrap_or(0),
+                window_ledgers,
+                max_spend_in_window,
+                set_by: admin,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Returns the configured rolling-window cap, or a zeroed value when unset.
+    pub fn get_rolling_window_limit(env: Env) -> RollingWindowLimit {
+        Self::rolling_window_config(&env).unwrap_or(RollingWindowLimit {
+            window_ledgers: 0,
+            max_spend_in_window: 0,
+            current_window_spend: 0,
+            window_start_ledger: 0,
+        })
+    }
+
+    /// Returns the current rolling-window state for an (owner, delegate) pair
+    /// after applying any pending window roll-over (issue #368).
+    pub fn get_rolling_window_state(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+    ) -> RollingWindowLimit {
+        Self::load_rolling_window_state(&env, &owner, &delegate)
     }
 
     /// Returns contract name and semantic version for deployment verification (issue #103).
