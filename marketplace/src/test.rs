@@ -1,17 +1,27 @@
 use crate::{
     AdminAcceptedEvent, AdminProposedEvent, MarketplaceContract, MarketplaceContractClient,
     MarketplaceError, MerchantRegisteredEvent, MerchantStatus, RegisterParams, Verifier,
-    DataKey, MerchantStatus,
-    MerchantCursor,
-    normalize_symbol, CategoryEntry, Merchant,
-    VerificationPolicy,
-    MerchantValidationError, MerchantOperationalView,
-    CategoryChange, MerchantCategoryChangedEvent,
-    MerchantStats, MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN,
+    PendingPayoutChange, MerchantPayoutChangeScheduledEvent, PAYOUT_CHANGE_COOLDOWN_LEDGERS,
+    AdminAcceptedEvent, AdminProposedEvent, MarketplaceContract, MarketplaceContractClient,
+    MarketplaceError, MerchantRegisteredEvent, MerchantStatus, RegisterParams, Verifier,
+    DataKey, MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantStatus,
+    RegisterParams, Verifier,
+    MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantCursor,
+    MerchantRegisteredEvent, MerchantStatus, RegisterParams, Verifier,
+    normalize_symbol, CategoryEntry, DataKey, MarketplaceContract, MarketplaceContractClient,
+    MarketplaceError, Merchant, MerchantRegisteredEvent, MerchantStatus, RegisterParams,
+    VerificationPolicy, Verifier,
+    AdminProposedEvent, MarketplaceContract, MarketplaceContractClient, MarketplaceError,
+    MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantRegisteredEvent,
+    MerchantStatus, RegisterParams, Verifier,
+    MerchantStatus, MerchantValidationError, RegisterParams, Verifier,
+    MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantOperationalView,
+    CategoryChange, MarketplaceContract, MarketplaceContractClient, MarketplaceError,
+    MerchantCategoryChangedEvent, MerchantRegisteredEvent, MerchantStatus, RegisterParams,
+    Verifier,
+    MerchantStats, MerchantStatus, RegisterParams, Verifier,
+    MerchantStatus, RegisterParams, Verifier, MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN,
     MAX_METADATA_LEN, MAX_NAME_LEN,
-    PendingPayoutChange, PAYOUT_CHANGE_COOLDOWN_LEDGERS,
-    MerchantPayoutChangeScheduledEvent, MerchantPayoutChangeCancelledEvent,
-    MerchantPayoutChangeAppliedEvent,
 };
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
@@ -25,88 +35,6 @@ use soroban_sdk::{
 
 const MAX_DISCOVERY_CPU_INSTRUCTIONS: u64 = 2_000_000;
 const MAX_DISCOVERY_MEMORY_BYTES: u64 = 2_000_000;
-
-fn register_default_merchant(f: &TestFixture, owner: &Address) -> u64 {
-    f.client.register_merchant(
-        owner,
-        &RegisterParams {
-            name: String::from_str(&f.env, "Payout Store"),
-            description: String::from_str(&f.env, "Desc"),
-            category: symbol_short!("tech"),
-            image_url: String::from_str(&f.env, "url"),
-            metadata: None,
-            metadata_uri: None,
-            required_verifications: 1,
-        },
-    )
-}
-
-#[test]
-fn test_payout_change_requires_timelock() {
-    let f = TestFixture::setup();
-    let owner = Address::generate(&f.env);
-    let merchant_id = register_default_merchant(&f, &owner);
-    let new_payout = Address::generate(&f.env);
-
-    f.client
-        .schedule_payout_change(&merchant_id, &new_payout);
-
-    let pending: PendingPayoutChange = f.client.get_pending_payout_change(&merchant_id);
-    assert_eq!(pending.merchant_id, merchant_id);
-    assert_eq!(pending.proposed_payout_address, new_payout);
-    assert_eq!(
-        pending.effective_at_ledger,
-        f.env.ledger().sequence() + PAYOUT_CHANGE_COOLDOWN_LEDGERS
-    );
-
-    // Immediate swap must be rejected.
-    let err = f.client.try_apply_payout_change(&merchant_id);
-    assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::PayoutChangeNotReady);
-
-    // Advance past the cooldown and apply.
-    f.env
-        .ledger()
-        .set_sequence_number(pending.effective_at_ledger);
-    f.client.apply_payout_change(&merchant_id);
-
-    let merchant = f.client.get_merchant(&merchant_id);
-    assert_eq!(merchant.payout_address, Some(new_payout));
-    assert!(f.client.try_get_pending_payout_change(&merchant_id).is_err());
-}
-
-#[test]
-fn test_payout_change_can_be_cancelled_during_timelock() {
-    let f = TestFixture::setup();
-    let owner = Address::generate(&f.env);
-    let merchant_id = register_default_merchant(&f, &owner);
-    let new_payout = Address::generate(&f.env);
-
-    f.client
-        .schedule_payout_change(&merchant_id, &new_payout);
-    f.client.cancel_payout_change(&merchant_id);
-
-    assert!(f.client.try_get_pending_payout_change(&merchant_id).is_err());
-    let err = f.client.try_apply_payout_change(&merchant_id);
-    assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::NoPendingPayoutChange);
-}
-
-#[test]
-fn test_payout_change_scheduling_emits_event() {
-    let f = TestFixture::setup();
-    let owner = Address::generate(&f.env);
-    let merchant_id = register_default_merchant(&f, &owner);
-    let new_payout = Address::generate(&f.env);
-
-    f.client
-        .schedule_payout_change(&merchant_id, &new_payout);
-
-    let expected = MerchantPayoutChangeScheduledEvent {
-        merchant_id,
-        proposed_payout_address: new_payout,
-        effective_at_ledger: f.env.ledger().sequence() + PAYOUT_CHANGE_COOLDOWN_LEDGERS,
-    };
-    assert_eq!(expected.merchant_id, merchant_id);
-}
 
 fn assert_discovery_cost_within_thresholds(env: &Env) {
     let budget = env.cost_estimate().budget();
@@ -165,6 +93,233 @@ fn test_constructor_and_version() {
     assert_eq!(ver.semver, symbol_short!("0_2_0"));
     let expected = env!("CARGO_PKG_VERSION").replace('.', "_");
     assert_eq!(ver.semver, soroban_sdk::Symbol::new(&f.env, &expected));
+}
+
+#[test]
+fn test_payout_change_requires_timelock() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+
+    let id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Payout Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "logo.png"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 1,
+        },
+    );
+
+    let new_payout = Address::generate(&f.env);
+    f.env.ledger().set_sequence_number(100);
+
+    // Scheduling a payout change must not apply immediately.
+    f.client
+        .schedule_payout_change(&id, &owner, &new_payout);
+
+    let pending = f
+        .client
+        .get_pending_payout_change(&id)
+        .expect("pending payout change must exist");
+    assert_eq!(pending.merchant_id, id);
+    assert_eq!(pending.proposed_payout_address, new_payout);
+    assert_eq!(
+        pending.effective_at_ledger,
+        100 + PAYOUT_CHANGE_COOLDOWN_LEDGERS
+    );
+
+    // The merchant's active payout address must remain unchanged while pending.
+    let merchant = f.client.get_merchant(&id);
+    assert_ne!(merchant.payout_address, Some(new_payout.clone()));
+
+    // Attempting to apply before the cooldown elapses must fail.
+    f.env
+        .ledger()
+        .set_sequence_number(100 + PAYOUT_CHANGE_COOLDOWN_LEDGERS - 1);
+    let early = f.client.try_apply_payout_change(&id, &owner);
+    assert_eq!(
+        early.unwrap_err().unwrap(),
+        MarketplaceError::PayoutChangeCooldownActive
+    );
+
+    // After the cooldown, applying succeeds and clears the pending record.
+    f.env
+        .ledger()
+        .set_sequence_number(100 + PAYOUT_CHANGE_COOLDOWN_LEDGERS);
+    f.client.apply_payout_change(&id, &owner);
+    let merchant_after = f.client.get_merchant(&id);
+    assert_eq!(merchant_after.payout_address, Some(new_payout));
+    assert!(f.client.get_pending_payout_change(&id).is_none());
+}
+
+#[test]
+fn test_payout_change_emits_scheduled_event() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+
+    let id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Event Payout Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "logo.png"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 1,
+        },
+    );
+
+    let new_payout = Address::generate(&f.env);
+    f.env.ledger().set_sequence_number(500);
+    f.client.schedule_payout_change(&id, &owner, &new_payout);
+
+    let expected = MerchantPayoutChangeScheduledEvent {
+        merchant_id: id,
+        proposed_payout_address: new_payout.clone(),
+        effective_at_ledger: 500 + PAYOUT_CHANGE_COOLDOWN_LEDGERS,
+    };
+    let emitted = find_event::<MerchantPayoutChangeScheduledEvent>(
+        &f,
+        &symbol_short!("pay_sched"),
+    )
+    .expect("MerchantPayoutChangeScheduledEvent must be emitted");
+    assert_eq!(emitted, expected);
+}
+
+#[test]
+fn test_payout_change_can_be_cancelled_by_owner() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+    let stranger = Address::generate(&f.env);
+
+    let id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Cancel Payout Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "logo.png"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 1,
+        },
+    );
+
+    let new_payout = Address::generate(&f.env);
+    f.env.ledger().set_sequence_number(1_000);
+    f.client.schedule_payout_change(&id, &owner, &new_payout);
+    assert!(f.client.get_pending_payout_change(&id).is_some());
+
+    // Unauthorized caller cannot cancel.
+    let unauth = f.client.try_cancel_payout_change(&id, &stranger);
+    assert_eq!(unauth.unwrap_err().unwrap(), MarketplaceError::Unauthorized);
+    assert!(f.client.get_pending_payout_change(&id).is_some());
+
+    // Owner cancels the pending change.
+    f.client.cancel_payout_change(&id, &owner);
+    assert!(f.client.get_pending_payout_change(&id).is_none());
+
+    // Applying after cancellation must fail because nothing is pending.
+    f.env
+        .ledger()
+        .set_sequence_number(1_000 + PAYOUT_CHANGE_COOLDOWN_LEDGERS);
+    let apply_after_cancel = f.client.try_apply_payout_change(&id, &owner);
+    assert_eq!(
+        apply_after_cancel.unwrap_err().unwrap(),
+        MarketplaceError::NoPendingPayoutChange
+    );
+}
+
+#[test]
+fn test_payout_change_unauthorized_scheduler_rejected() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+    let stranger = Address::generate(&f.env);
+
+    let id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Auth Payout Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "logo.png"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 1,
+        },
+    );
+
+    let new_payout = Address::generate(&f.env);
+    let err = f
+        .client
+        .try_schedule_payout_change(&id, &stranger, &new_payout);
+    assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::Unauthorized);
+    assert!(f.client.get_pending_payout_change(&id).is_none());
+}
+
+#[test]
+fn test_payout_change_second_schedule_overwrites_pending() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+
+    let id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Overwrite Payout Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "logo.png"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 1,
+        },
+    );
+
+    let first = Address::generate(&f.env);
+    let second = Address::generate(&f.env);
+
+    f.env.ledger().set_sequence_number(10);
+    f.client.schedule_payout_change(&id, &owner, &first);
+
+    f.env.ledger().set_sequence_number(20);
+    f.client.schedule_payout_change(&id, &owner, &second);
+
+    let pending = f.client.get_pending_payout_change(&id).unwrap();
+    assert_eq!(pending.proposed_payout_address, second);
+    assert_eq!(
+        pending.effective_at_ledger,
+        20 + PAYOUT_CHANGE_COOLDOWN_LEDGERS
+    );
+}
+
+#[test]
+fn test_payout_change_blocked_when_merchant_frozen() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+
+    let id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Frozen Payout Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "logo.png"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 1,
+        },
+    );
+
+    f.client.suspend_merchant(&f.admin, &id);
+    let new_payout = Address::generate(&f.env);
+    let err = f
+        .client
+        .try_schedule_payout_change(&id, &owner, &new_payout);
+    assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::MerchantFrozen);
 }
 
 #[test]

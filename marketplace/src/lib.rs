@@ -422,13 +422,14 @@ pub enum DataKey {
     CategoryIndex(Symbol),
     MetadataCooldown,
     MetadataCooldownConfig,
-    PendingPayoutChange(u64),
     MerchantVerifier(u64, Address),
     MerchantVerifierList(u64),
     VerificationPolicy(u64),
     LastMetadataUpdate(u64),
     GlobalReputationContract,
     Categories,
+    PendingPayoutChange(u64),
+    PayoutAddress(u64),
 }
 
 /// Mirror of `ReputationScore` from `delego-reputation` for cross-contract deserialization.
@@ -444,6 +445,14 @@ pub struct ExternalReputationScore {
     pub last_updated: u64,
 }
 
+const MAX_COMMISSION_BPS: u32 = 10_000;
+const MAX_REQUIRED_VERIFICATIONS: u32 = 50;
+const DEFAULT_METADATA_COOLDOWN_SECS: u64 = 86_400; // 24 hours
+const MIN_METADATA_COOLDOWN_SECS: u64 = 60;
+const MAX_METADATA_COOLDOWN_SECS: u64 = 30 * 24 * 60 * 60;
+const MAX_PAGE_LIMIT: u32 = 50;
+const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280; // ~1 day of ledgers (5s/ledger)
+const PERSISTENT_BUMP_AMOUNT: u32 = 518_400; // ~30 days of ledgers
 pub const PAYOUT_CHANGE_COOLDOWN_LEDGERS: u32 = 17_280; // ~24 hours
 
 #[contracttype]
@@ -468,22 +477,6 @@ pub struct MerchantPayoutChangeCancelledEvent {
     pub merchant_id: u64,
     pub cancelled_by: Address,
 }
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct MerchantPayoutChangeAppliedEvent {
-    pub merchant_id: u64,
-    pub payout_address: Address,
-}
-
-const MAX_COMMISSION_BPS: u32 = 10_000;
-const MAX_REQUIRED_VERIFICATIONS: u32 = 50;
-const DEFAULT_METADATA_COOLDOWN_SECS: u64 = 86_400; // 24 hours
-const MIN_METADATA_COOLDOWN_SECS: u64 = 60;
-const MAX_METADATA_COOLDOWN_SECS: u64 = 30 * 24 * 60 * 60;
-const MAX_PAGE_LIMIT: u32 = 50;
-const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280; // ~1 day of ledgers (5s/ledger)
-const PERSISTENT_BUMP_AMOUNT: u32 = 518_400; // ~30 days of ledgers
 
 pub(crate) fn normalize_symbol(env: &Env, sym: &Symbol) -> Symbol {
     use soroban_sdk::xdr::ToXdr;
