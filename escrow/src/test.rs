@@ -2892,6 +2892,77 @@ use soroban_sdk::{
     }
 
     #[test]
+    fn test_high_value_release_requires_finance_and_delivery_approval() {
+        use soroban_sdk::xdr::ToXdr;
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let finance_manager = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&buyer, &20_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[319u8; 32]);
+        let amount = crate::DUAL_CONTROL_THRESHOLD + 1;
+        let escrow_id = client.deposit(
+            &buyer,
+            &seller,
+            &token,
+            &amount,
+            &order_id,
+            &1_000u32,
+            &None,
+            &None,
+        );
+        client.set_dual_control_config(&admin, &escrow_id, &finance_manager);
+
+        let oracle_key = SigningKey::from_bytes(&[32u8; 32]);
+        let oracle_pubkey = BytesN::from_array(&env, &oracle_key.verifying_key().to_bytes());
+        client.set_oracle_public_key(&admin, &oracle_pubkey);
+        let delivery_timestamp = env.ledger().timestamp();
+        let tracking_hash = BytesN::from_array(&env, &[93u8; 32]);
+        let payload = SignedDeliveryPayload {
+            escrow_id,
+            carrier_code: symbol_short!("ups"),
+            tracking_hash: tracking_hash.clone(),
+            delivery_timestamp,
+        }
+        .to_xdr(&env);
+        let mut payload_bytes = [0u8; 128];
+        let payload_len = payload.len() as usize;
+        payload.copy_into_slice(&mut payload_bytes[..payload_len]);
+        let signature = oracle_key.sign(&payload_bytes[..payload_len]).to_bytes();
+        let proof = SignedDeliveryProof {
+            escrow_id,
+            carrier_code: symbol_short!("ups"),
+            tracking_hash,
+            delivery_timestamp,
+            oracle_pubkey,
+            signature: BytesN::from_array(&env, &signature),
+        };
+
+        assert_eq!(
+            client.try_release(&escrow_id, &buyer, &seller),
+            Err(Ok(EscrowError::SignedProofRequired))
+        );
+        assert_eq!(
+            client.try_verify_delivery_and_release(&escrow_id, &buyer, &proof),
+            Err(Ok(EscrowError::SecondaryApprovalRequired))
+        );
+
+        assert!(client.approve_release(&escrow_id, &finance_manager));
+        let result = client.verify_delivery_and_release(&escrow_id, &buyer, &proof);
+        assert!(result.fully_released);
+        assert_eq!(client.get_escrow(&escrow_id).status, crate::EscrowStatus::Released);
+    }
+
+    #[test]
     fn test_legacy_boolean_oracle_cannot_release_funds() {
         let env = Env::default();
         env.mock_all_auths();
