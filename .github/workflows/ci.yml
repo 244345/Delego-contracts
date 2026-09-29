@@ -76,6 +76,12 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+      - name: Run cross-contract integration benchmark
+        run: cargo test --workspace --test cross_contract -- --nocapture
+
+      - name: Check Marketplace Version Consistency
+        run: bash scripts/check_version.sh
+
       - name: Check Marketplace Version Consistency
         run: bash scripts/check_version.sh
 
@@ -104,6 +110,43 @@ jobs:
 
       - name: Build contracts
         run: cargo build --target wasm32-unknown-unknown --release
+
+  benchmark:
+    name: Cross-contract benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [test]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain-file: rust-toolchain.toml
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Run cross-contract integration benchmark suite
+        run: |
+          set -euo pipefail
+          cargo test --workspace --test cross_contract -- --nocapture --test-threads=1 \
+            | tee benchmark-output.txt
+
+      - name: Upload benchmark output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-contract-benchmark-output
+          path: benchmark-output.txt
+          if-no-files-found: warn
 
   audit:
     name: Supply-chain audit (cargo-audit)
