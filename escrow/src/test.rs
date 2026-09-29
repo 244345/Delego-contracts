@@ -2,8 +2,8 @@
 #[allow(clippy::module_inception)]
 mod test {
     use crate::{
-        DataKey, EscrowConfig, EscrowContract, EscrowContractClient, EscrowError,
-        EscrowMetadataEvent, SignedDeliveryPayload, SignedDeliveryProof,
+        DataKey, DISPUTE_GRACE_PERIOD_LEDGERS, EscrowConfig, EscrowContract, EscrowContractClient,
+        EscrowError, EscrowMetadataEvent, SignedDeliveryPayload, SignedDeliveryProof,
     };
     use ed25519_dalek::{Signer, SigningKey};
     const MAX_DEPOSIT_CPU_INSTRUCTIONS: u64 = 3_000_000;
@@ -3376,7 +3376,12 @@ use soroban_sdk::{
         let escrow_id2 = client.deposit(
             &buyer, &seller, &token, &1_000i128, &order_id2, &10u32, &None, &None,
         );
-        
+
+        // Advance to escrow2's own timeout_ledger (deposited after the
+        // earlier sequence bump, so it has its own later timeout).
+        let escrow2 = client.get_escrow(&escrow_id2);
+        env.ledger().set_sequence_number(escrow2.timeout_ledger);
+
         // Seller trying to refund without shipment proof should fail
         let result2 = client.try_refund(&escrow_id2, &seller);
         assert_eq!(result2, Err(Ok(EscrowError::TimeoutNotReached)), 
@@ -3391,10 +3396,88 @@ use soroban_sdk::{
             &tracking_hash,
             &env.ledger().timestamp(),
         );
-        
-        // After proof is recorded, seller should be able to refund
+
+        // Even with proof, the seller cannot claim the instant timeout is
+        // reached: the mandatory dispute grace period (issue #284) must
+        // fully elapse first, so the buyer keeps a guaranteed window to
+        // dispute without being front-run.
         let result3 = client.try_refund(&escrow_id2, &seller);
-        assert!(result3.is_ok(), "seller should be able to refund with shipment proof");
+        assert_eq!(
+            result3,
+            Err(Ok(EscrowError::TimeoutNotReached)),
+            "seller with proof must still wait out the dispute grace period"
+        );
+
+        // After the grace period fully elapses, the seller can claim.
+        let escrow2 = client.get_escrow(&escrow_id2);
+        env.ledger().set_sequence_number(
+            escrow2.timeout_ledger + DISPUTE_GRACE_PERIOD_LEDGERS,
+        );
+        let result4 = client.try_refund(&escrow_id2, &seller);
+        assert!(
+            result4.is_ok(),
+            "seller should be able to refund with shipment proof after the grace period"
+        );
+    }
+
+    #[test]
+    fn test_seller_claim_blocked_during_dispute_grace_period() {
+        // Issue #284: a seller (even with shipment proof) must not be able
+        // to front-run a buyer's dispute by claiming the instant
+        // `timeout_ledger` is reached. The buyer must retain a full grace
+        // period to submit a dispute, and a disputed escrow can never be
+        // claimed via the timeout path at all.
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[7u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &10u32, &None, &None,
+        );
+
+        let tracking_hash = BytesN::from_array(&env, &[11u8; 32]);
+        client.record_shipment_proof(
+            &escrow_id,
+            &seller,
+            &symbol_short!("dhl"),
+            &tracking_hash,
+            &env.ledger().timestamp(),
+        );
+
+        let escrow = client.get_escrow(&escrow_id);
+
+        // Right at timeout_ledger: still within the grace period, blocked.
+        env.ledger().set_sequence_number(escrow.timeout_ledger);
+        let at_timeout = client.try_refund(&escrow_id, &seller);
+        assert_eq!(at_timeout, Err(Ok(EscrowError::TimeoutNotReached)));
+
+        // Buyer disputes during the grace period — this must always succeed
+        // while the escrow is still Funded, regardless of how close to
+        // timeout it is.
+        let disputed = client.try_dispute(&escrow_id, &buyer);
+        assert!(disputed.is_ok(), "buyer must be able to dispute during the grace period");
+
+        // Even after the grace period would otherwise have elapsed, a
+        // disputed escrow can never be claimed via the seller timeout path.
+        env.ledger().set_sequence_number(
+            escrow.timeout_ledger + DISPUTE_GRACE_PERIOD_LEDGERS,
+        );
+        let after_grace_but_disputed = client.try_refund(&escrow_id, &seller);
+        assert_eq!(
+            after_grace_but_disputed,
+            Err(Ok(EscrowError::InvalidStatus)),
+            "a disputed escrow is no longer Funded, so the seller timeout path stays closed"
+        );
     }
 
     // ─── Feature: authorized categories ─────────────────────────────────────

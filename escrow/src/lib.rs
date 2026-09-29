@@ -496,6 +496,18 @@ pub struct FeeDistributionSetEvent {
     pub total_bps: u32,
 }
 
+/// Emitted when the admin adds or removes a token from the escrow
+/// allowlist (issue #283), so off-chain indexers can track which tokens are
+/// currently safe to use as escrow collateral without polling `list_tokens`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenAllowlistUpdatedEvent {
+    pub admin: Address,
+    pub token: Address,
+    /// `true` when the token was added to the allowlist, `false` when removed.
+    pub allowed: bool,
+}
+
 /// Optional metadata hash stored on escrow creation for off-chain order verification.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1237,6 +1249,13 @@ pub const UPGRADE_TIMELOCK_SECS: u64 = 172_800;
 /// single compromised key can never replace contract code on its own.
 pub const MIN_UPGRADE_THRESHOLD: u32 = 2;
 
+/// Mandatory window after `timeout_ledger` during which a seller/admin
+/// timeout-based claim (`refund`/`partial_refund` called by the seller with a
+/// recorded shipment proof) is blocked, guaranteeing the buyer a window to
+/// raise a dispute without being front-run the instant the timeout is
+/// reached (issue #284). ~24 hours at a 5s average ledger close time.
+pub const DISPUTE_GRACE_PERIOD_LEDGERS: u32 = 17_280;
+
 fn check_not_terminal(record: &EscrowRecord) -> Result<(), EscrowError> {
     match record.status {
         EscrowStatus::Released => Err(EscrowError::AlreadyReleased),
@@ -1244,6 +1263,16 @@ fn check_not_terminal(record: &EscrowRecord) -> Result<(), EscrowError> {
         EscrowStatus::Cancelled => Err(EscrowError::AlreadyCancelled),
         _ => Ok(()),
     }
+}
+
+/// Returns `true` once a seller/admin timeout-based claim is allowed to
+/// proceed: the escrow must not be under an active dispute, and the mandatory
+/// post-timeout dispute grace period must have fully elapsed. Used to close
+/// the front-running window described in issue #284, where a seller could
+/// otherwise claim the instant `current_ledger == timeout_ledger`, racing a
+/// buyer dispute that has not yet landed.
+pub fn can_seller_claim(current_ledger: u32, timeout_ledger: u32, is_disputed: bool) -> bool {
+    !is_disputed && current_ledger >= timeout_ledger.saturating_add(DISPUTE_GRACE_PERIOD_LEDGERS)
 }
 
 const ZERO_ACCOUNT_STRKEY: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
@@ -2490,6 +2519,17 @@ impl EscrowContract {
             .instance()
             .set(&DataKey::AllowedTokenCount, &(count + 1));
 
+        // Admin token allowlist changes are logged so off-chain indexers can
+        // track which tokens are safe for escrow use (issue #283).
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("tok_add")),
+            TokenAllowlistUpdatedEvent {
+                admin,
+                token: token_address,
+                allowed: true,
+            },
+        );
+
         Ok(true)
     }
 
@@ -2536,13 +2576,25 @@ impl EscrowContract {
                 // Remove the target token from mappings
                 env.storage()
                     .instance()
-                    .remove(&DataKey::AllowedToken(token_address));
+                    .remove(&DataKey::AllowedToken(token_address.clone()));
                 env.storage()
                     .instance()
                     .remove(&DataKey::AllowedTokenAt(last_idx));
                 env.storage()
                     .instance()
                     .set(&DataKey::AllowedTokenCount, &last_idx);
+
+                // Admin token allowlist changes are logged so off-chain
+                // indexers can track which tokens are safe for escrow use
+                // (issue #283).
+                env.events().publish(
+                    (symbol_short!("escrow"), symbol_short!("tok_rem")),
+                    TokenAllowlistUpdatedEvent {
+                        admin,
+                        token: token_address,
+                        allowed: false,
+                    },
+                );
             }
         }
 
@@ -3741,9 +3793,20 @@ impl EscrowContract {
             .has(&DataKey::ShipmentProof(escrow_id));
 
         if caller == record.seller || Self::is_admin(env.clone(), caller.clone()) {
-            // Seller or admin: allowed at any time while funded,
-            // BUT on timeout without proof, seller cannot claim (buyer has exclusive refund rights)
-            if timeout_reached && !has_proof {
+            // Seller or admin: allowed at any time before timeout. Once the
+            // timeout is reached, a mandatory dispute grace period must fully
+            // elapse before a timeout-based claim can proceed, and the escrow
+            // must not be under an active dispute — this guarantees the buyer
+            // a window to raise a dispute without being front-run by a seller
+            // racing to claim the instant `timeout_ledger` is reached (issue
+            // #284). Absence of shipment proof still blocks the seller/admin
+            // from ever claiming on timeout; the buyer retains exclusive
+            // refund rights in that case.
+            let is_disputed = record.status == EscrowStatus::Disputed;
+            if timeout_reached
+                && (!has_proof
+                    || !can_seller_claim(env.ledger().sequence(), record.timeout_ledger, is_disputed))
+            {
                 return Err(EscrowError::TimeoutNotReached);
             }
         } else if caller == record.buyer {
@@ -3963,6 +4026,19 @@ impl EscrowContract {
         record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
+        // Disputed escrows can remain open far longer than a normal
+        // settlement while resolution is pending; bump the persistent TTL so
+        // the record is not archived out from under an active dispute
+        // (issue #282).
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
         env.events().publish(
             (
                 symbol_short!("escrow"),
@@ -3974,6 +4050,41 @@ impl EscrowContract {
                 disputed_by: caller,
             },
         );
+
+        Ok(true)
+    }
+
+    /// Permissionless keeper entrypoint: extend the persistent-storage TTL of
+    /// an active (non-terminal) escrow so it cannot be archived out from
+    /// under its funds while resolution — including a pending dispute — is
+    /// still in progress (issue #282). Unlike `bump_ttl_with_bounty`, this
+    /// does not adjust `timeout_ledger`, pay a bounty, or rate-limit calls,
+    /// and it is available for `Disputed` escrows as well as `Funded` ones;
+    /// it exists purely as an always-available storage-eviction backstop
+    /// that anyone (a keeper bot, the buyer, or the seller) can call for
+    /// free.
+    ///
+    /// # Errors
+    /// Returns [`EscrowError::NotFound`] if the escrow does not exist, or one
+    /// of the "already terminal" errors if it has already reached
+    /// `Released`, `Refunded`, or `Cancelled`.
+    pub fn extend_escrow_ttl(env: Env, escrow_id: u64) -> Result<bool, EscrowError> {
+        let key = DataKey::Escrow(escrow_id);
+        let record: EscrowRecord = match env.storage().persistent().get(&key) {
+            Some(rec) => rec,
+            None => return Err(EscrowError::NotFound),
+        };
+
+        check_not_terminal(&record)?;
+
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
         Ok(true)
     }
