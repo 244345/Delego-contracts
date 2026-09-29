@@ -401,6 +401,21 @@ pub struct MerchantPrunedEvent {
     pub pruned_by: Address,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommissionTier {
+    pub min_settled_volume: i128,
+    pub commission_rate_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantVolumeRecord {
+    pub total_settled_volume: i128,
+    pub active_tier_bps: u32,
+    pub last_updated_ledger: u32,
+}
+
 // --- Storage Keys ---
 
 #[contracttype]
@@ -428,6 +443,8 @@ pub enum DataKey {
     LastMetadataUpdate(u64),
     GlobalReputationContract,
     Categories,
+    CommissionTiers,
+    MerchantVolume(u64),
 }
 
 /// Mirror of `ReputationScore` from `delego-reputation` for cross-contract deserialization.

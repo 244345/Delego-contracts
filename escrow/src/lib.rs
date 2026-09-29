@@ -113,6 +113,40 @@ pub struct EscrowRecord {
 /// Token-unit threshold above which escrow releases require finance approval.
 pub const DUAL_CONTROL_THRESHOLD: i128 = 10_000;
 
+/// A single tier in a merchant's commission schedule.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommissionTier {
+    /// Minimum settled volume (in token units) required for this tier.
+    pub min_settled_volume: i128,
+    /// Commission rate in basis points applied at this tier.
+    pub commission_rate_bps: u32,
+}
+
+/// Accumulated settled volume and active commission tier for a merchant.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantVolumeRecord {
+    /// Total volume settled through escrow releases for this merchant.
+    pub total_settled_volume: i128,
+    /// Commission rate in basis points currently applied to this merchant.
+    pub active_tier_bps: u32,
+    /// Ledger sequence at which the record was last updated.
+    pub last_updated_ledger: u32,
+}
+
+/// Emitted when a merchant's active commission tier changes.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MerchantTierUpdatedEvent {
+    /// Merchant whose tier changed.
+    pub merchant: Address,
+    /// Newly active commission rate in basis points.
+    pub active_tier_bps: u32,
+    /// Total settled volume at the time of the update.
+    pub total_settled_volume: i128,
+}
+
 /// Finance approval state for a high-value escrow.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]

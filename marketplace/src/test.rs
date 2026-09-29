@@ -19,6 +19,7 @@ use crate::{
     MerchantStats, MerchantStatus, RegisterParams, Verifier,
     MerchantStatus, RegisterParams, Verifier, MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN,
     MAX_METADATA_LEN, MAX_NAME_LEN,
+    CommissionTier, MerchantVolumeRecord,
 };
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
@@ -954,6 +955,130 @@ fn test_commission_rate_configuration() {
     // Admin sets commission
     f.client.set_merchant_commission(&id, &f.admin, &250); // 2.50%
     assert_eq!(f.client.get_commission(&id), 250);
+}
+
+#[test]
+fn test_commission_tier_defaults_and_configuration() {
+    let f = TestFixture::setup();
+    let stranger = Address::generate(&f.env);
+
+    // Default tiers are seeded on construction.
+    let tiers = f.client.get_commission_tiers();
+    assert_eq!(tiers.len(), 3);
+    assert_eq!(
+        tiers.get(0).unwrap(),
+        CommissionTier {
+            min_settled_volume: 0,
+            commission_rate_bps: 500,
+        }
+    );
+    assert_eq!(
+        tiers.get(1).unwrap(),
+        CommissionTier {
+            min_settled_volume: 50_000,
+            commission_rate_bps: 300,
+        }
+    );
+    assert_eq!(
+        tiers.get(2).unwrap(),
+        CommissionTier {
+            min_settled_volume: 500_000,
+            commission_rate_bps: 150,
+        }
+    );
+
+    // Non-admin cannot reconfigure tiers.
+    let mut new_tiers = soroban_sdk::Vec::new(&f.env);
+    new_tiers.push_back(CommissionTier {
+        min_settled_volume: 0,
+        commission_rate_bps: 400,
+    });
+    let err = f
+        .client
+        .try_set_commission_tiers(&stranger, &new_tiers);
+    assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::Unauthorized);
+
+    // Admin can reconfigure tiers.
+    f.client.set_commission_tiers(&f.admin, &new_tiers);
+    assert_eq!(f.client.get_commission_tiers().len(), 1);
+    assert_eq!(f.client.get_commission_tiers().get(0).unwrap().commission_rate_bps, 400);
+}
+
+#[test]
+fn test_volume_tier_transitions_and_commission_calculation() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+
+    let id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Volume Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "img.png"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 1,
+        },
+    );
+
+    // Fresh merchant starts at the standard tier.
+    let record = f.client.get_merchant_volume(&id);
+    assert_eq!(record.total_settled_volume, 0);
+    assert_eq!(record.active_tier_bps, 500);
+    assert_eq!(f.client.get_commission(&id), 500);
+
+    // Crossing the 50_000 threshold bumps to the 3% tier.
+    f.client.record_settled_volume(&id, &50_000);
+    let record = f.client.get_merchant_volume(&id);
+    assert_eq!(record.total_settled_volume, 50_000);
+    assert_eq!(record.active_tier_bps, 300);
+    assert_eq!(f.client.get_commission(&id), 300);
+
+    // Crossing the 500_000 threshold bumps to the 1.5% tier.
+    f.client.record_settled_volume(&id, &450_000);
+    let record = f.client.get_merchant_volume(&id);
+    assert_eq!(record.total_settled_volume, 500_000);
+    assert_eq!(record.active_tier_bps, 150);
+    assert_eq!(f.client.get_commission(&id), 150);
+
+    // Additional volume keeps the highest tier.
+    f.client.record_settled_volume(&id, &1_000_000);
+    let record = f.client.get_merchant_volume(&id);
+    assert_eq!(record.total_settled_volume, 1_500_000);
+    assert_eq!(record.active_tier_bps, 150);
+    assert_eq!(f.client.get_commission(&id), 150);
+
+    // Commission calculation matches the active tier schedule.
+    let commission = f.client.calculate_commission(&id, &1_000);
+    assert_eq!(commission, 15); // 1.5% of 1_000
+}
+
+#[test]
+fn test_volume_tier_does_not_downgrade_on_manual_commission() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+
+    let id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Manual Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "img.png"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 1,
+        },
+    );
+
+    f.client.record_settled_volume(&id, &50_000);
+    assert_eq!(f.client.get_commission(&id), 300);
+
+    // A manual override is allowed but the tier record is preserved.
+    f.client.set_merchant_commission(&id, &owner, &450);
+    assert_eq!(f.client.get_commission(&id), 450);
+    assert_eq!(f.client.get_merchant_volume(&id).active_tier_bps, 300);
 }
 
 #[test]

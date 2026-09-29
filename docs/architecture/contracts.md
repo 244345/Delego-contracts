@@ -198,6 +198,17 @@ struct MerchantView {
     reputation_score: Option<u32>,
 }
 
+struct CommissionTier {
+    min_settled_volume: i128,
+    commission_rate_bps: u32,
+}
+
+struct MerchantVolumeRecord {
+    total_settled_volume: i128,
+    active_tier_bps: u32,
+    last_updated_ledger: u32,
+}
+
 struct VerificationPolicy {
     required: u32,      // verifications needed to become Verified
     max_verifications: u32,
@@ -242,6 +253,10 @@ Transitions are enforced by helpers (`check_not_frozen_or_closed`) so that suspe
 - `get_merchant(merchant_id)` / `get_merchant_view(merchant_id)`: Full record vs. discovery view; the view injects a `reputation_score` snapshot by cross-contract calling the paired reputation contract (`get_reputation`)
 - `get_merchants(offset, limit)` / `get_merchants_by_category(category, offset, limit)`: Paginated discovery over `MerchantIds` / `CategoryIndex` (page size capped at 50)
 - `set_merchant_commission(...)` / `get_commission(...)`: Per-merchant commission in basis points (≤ 10_000)
+- `set_commission_tiers(...)` / `get_commission_tiers(...)`: Configure the ordered volume-based commission tier schedule
+- `record_settled_volume(merchant_id, amount)`: Accrue settled volume from escrow release events and re-evaluate the merchant's active tier
+- `get_volume_record(merchant_id)`: Read the merchant's `MerchantVolumeRecord` (total settled volume, active tier bps, last updated ledger)
+- `get_active_commission(merchant_id)`: Return the commission rate matching the merchant's active tier
 - `suspend_merchant(...)` / `unsuspend_merchant(...)` / `close_merchant(...)`: Admin moderation lifecycle
 - `set_merchant_reputation(...)` / `set_reputation_contract(...)`: Pair a merchant (or the whole registry) with a reputation contract for score injection
 - `propose_admin(...)` / `accept_admin(...)`: Two-step admin handover
@@ -252,6 +267,7 @@ Transitions are enforced by helpers (`check_not_frozen_or_closed`) so that suspe
 
 - Instance: `Admin`, `PendingAdmin`, `NextMerchantId`, `Verifiers`, `MetadataCooldown`/`MetadataCooldownConfig`, `GlobalReputationContract`
 - Persistent per merchant: `Merchant(id)`, `MerchantName(name)`, `FreedName(name)`, `ArchivedMerchant(id)`, `VerifiedCount(id)`, `VerificationPolicy(id)`, `MerchantVerifier(id, verifier)`, `MerchantVerifierList(id)`, `LastMetadataUpdate(id)`
+- Persistent per merchant: `MerchantVolume(id)` (`MerchantVolumeRecord`); instance: `CommissionTiers` (`Vec<CommissionTier>`)
 - Persistent indexes: `MerchantIds` (all ids), `CategoryIndex(category)` (ids per category)
 
 #### CategoryIndex & Discovery
@@ -262,12 +278,17 @@ Transitions are enforced by helpers (`check_not_frozen_or_closed`) so that suspe
 
 Metadata updates are rate-limited to prevent squatting/abuse: a non-admin owner may only update `metadata` once per cooldown window (default 24 hours, configurable between 60 seconds and 30 days). Admin updates bypass the cooldown. Exceeding it returns `MetadataLockActive`.
 
+#### Volume-Based Commission Tiers
+
+Merchants accrue `total_settled_volume` as escrow releases settle. The contract evaluates the ordered `CommissionTier` schedule (e.g. 5% standard, 3% above 50,000 XLM, 1.5% above 500,000 XLM) and, when a threshold is crossed, updates `active_tier_bps` and `last_updated_ledger` on the merchant's `MerchantVolumeRecord`. Commission calculation reads the active tier so charged rates always match the merchant's current schedule. Tier transitions are covered by unit tests validating each volume milestone.
+
 #### Use Cases
 
 - Merchant registers with name/category/commission intent → `Registered`
 - Registered verifiers attest identity → threshold reached → `Verified`
 - Storefront/catalog services page through `get_merchants_by_category`
 - Merchant misconduct → `Suspended`; repeat offense → `Closed` (permanently removed from discovery)
+- Merchant crosses a volume milestone → active commission tier drops automatically → discounted rate applied on settlement
 
 ## On-Chain vs Off-Chain
 

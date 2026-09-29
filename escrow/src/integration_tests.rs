@@ -2,8 +2,8 @@
 
 use crate::{
     BatchDepositParams, BatchRefundParams, BatchReleaseParams, EscrowConfig, EscrowContract,
-    EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState, TreasuryShare,
-    MAX_TREASURIES,
+    EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState, MerchantVolumeRecord,
+    TreasuryShare, MAX_TREASURIES,
 };
 use soroban_sdk::{
     symbol_short,
@@ -2507,4 +2507,122 @@ fn test_split_release_multi_treasury() {
     assert_eq!(token_client.balance(&recipient2), 5700);
     assert_eq!(token_client.balance(&treasury1), 200);
     assert_eq!(token_client.balance(&treasury2), 300);
+}
+
+// ── Multi-tier merchant commission schedules ─────────────────────────────
+
+fn setup_commission_tiers(t: &TestEnv) {
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let mut tiers = Vec::new(&t.env);
+    tiers.push_back(crate::CommissionTier {
+        min_settled_volume: 0,
+        commission_rate_bps: 500,
+    });
+    tiers.push_back(crate::CommissionTier {
+        min_settled_volume: 50_000,
+        commission_rate_bps: 300,
+    });
+    tiers.push_back(crate::CommissionTier {
+        min_settled_volume: 500_000,
+        commission_rate_bps: 150,
+    });
+    assert!(escrow_client.set_commission_tiers(&t.admin, &tiers));
+}
+
+#[test]
+fn test_commission_tiers_default_to_standard_rate() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    setup_commission_tiers(&t);
+
+    let record = escrow_client.get_merchant_volume(&t.seller);
+    assert_eq!(record.total_settled_volume, 0);
+    assert_eq!(record.active_tier_bps, 500);
+}
+
+#[test]
+fn test_commission_tier_transitions_on_volume_milestones() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    setup_commission_tiers(&t);
+
+    // Below the first milestone: standard 5% tier.
+    let eid1 = deposit_escrow(&t, 10_000, 100);
+    escrow_client.release(&eid1, &t.buyer, &t.seller);
+    let r1 = escrow_client.get_merchant_volume(&t.seller);
+    assert_eq!(r1.total_settled_volume, 10_000);
+    assert_eq!(r1.active_tier_bps, 500);
+
+    // Cross the 50,000 milestone: 3% tier.
+    let eid2 = deposit_escrow_with_id(&t, 10_000, 100, 2);
+    escrow_client.release(&eid2, &t.buyer, &t.seller);
+    let eid3 = deposit_escrow_with_id(&t, 10_000, 100, 3);
+    escrow_client.release(&eid3, &t.buyer, &t.seller);
+    let eid4 = deposit_escrow_with_id(&t, 10_000, 100, 4);
+    escrow_client.release(&eid4, &t.buyer, &t.seller);
+    let eid5 = deposit_escrow_with_id(&t, 10_000, 100, 5);
+    escrow_client.release(&eid5, &t.buyer, &t.seller);
+    let r2 = escrow_client.get_merchant_volume(&t.seller);
+    assert_eq!(r2.total_settled_volume, 50_000);
+    assert_eq!(r2.active_tier_bps, 300);
+
+    // Cross the 500,000 milestone: 1.5% tier.
+    for seed in 6..=50u8 {
+        let eid = deposit_escrow_with_id(&t, 10_000, 100, seed);
+        escrow_client.release(&eid, &t.buyer, &t.seller);
+    }
+    let r3 = escrow_client.get_merchant_volume(&t.seller);
+    assert_eq!(r3.total_settled_volume, 500_000);
+    assert_eq!(r3.active_tier_bps, 150);
+}
+
+#[test]
+fn test_commission_calculation_matches_active_tier() {
+    let t = TestEnv::setup_with_fee_bps(500);
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+    setup_commission_tiers(&t);
+
+    // Push the merchant into the 3% tier.
+    for seed in 1..=5u8 {
+        let eid = deposit_escrow_with_id(&t, 10_000, 100, seed);
+        escrow_client.release(&eid, &t.buyer, &t.seller);
+    }
+    let record = escrow_client.get_merchant_volume(&t.seller);
+    assert_eq!(record.active_tier_bps, 300);
+
+    // A subsequent release must charge the discounted 3% rate.
+    let eid = deposit_escrow_with_id(&t, 10_000, 100, 6);
+    escrow_client.release(&eid, &t.buyer, &t.seller);
+
+    // 10,000 at 3% = 300 fee, 9,700 net to seller.
+    assert_eq!(token_client.balance(&t.seller), 9_700 + 50_000 - 5 * 500);
+}
+
+#[test]
+fn test_set_commission_tiers_rejects_non_admin() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let mut tiers = Vec::new(&t.env);
+    tiers.push_back(crate::CommissionTier {
+        min_settled_volume: 0,
+        commission_rate_bps: 500,
+    });
+
+    assert_eq!(
+        escrow_client.try_set_commission_tiers(&t.agent, &tiers),
+        Err(Ok(EscrowError::Unauthorized))
+    );
+}
+
+#[test]
+fn test_get_merchant_volume_defaults_for_unknown_merchant() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let unknown = Address::generate(&t.env);
+    let record: MerchantVolumeRecord = escrow_client.get_merchant_volume(&unknown);
+    assert_eq!(record.total_settled_volume, 0);
+    assert_eq!(record.active_tier_bps, 0);
 }
