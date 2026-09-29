@@ -80,6 +80,19 @@ pub struct YieldConfig {
     pub apr_bps: u32,
 }
 
+/// Optional yield split distribution configuration for an escrow (issue #360).
+///
+/// When accrued yield is distributed upon release or refund, this config
+/// defines how the yield is split between the buyer and seller as basis points.
+/// Both parties benefit fairly based on their capital commitment and risk.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct YieldSplitConfig {
+    /// Percentage of accrued yield allocated to the seller in basis points (e.g., 5000 = 50%).
+    /// The remaining yield (10_000 - seller_yield_share_bps) is allocated to the buyer.
+    pub seller_yield_share_bps: u32,
+}
+
 /// Full on-chain record for a single escrow.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -249,6 +262,31 @@ pub struct EscrowYieldAccruedEvent {
     pub escrow_id: u64,
     pub seller: Address,
     pub yield_amount: i128,
+    pub held_seconds: u64,
+}
+
+/// Emitted when a fully-released escrow with yield split distribution completes
+/// and accrued yield is split between buyer and seller (issue #360).
+///
+/// This event replaces `EscrowYieldAccruedEvent` when a `YieldSplitConfig` is
+/// configured, providing transparent reporting of how yield is allocated to
+/// both parties based on their capital commitment and holding period.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EscrowYieldSplitAccruedEvent {
+    /// Unique identifier for the escrow.
+    pub escrow_id: u64,
+    /// Seller's address (receives seller_yield).
+    pub seller: Address,
+    /// Buyer's address (receives buyer_yield).
+    pub buyer: Address,
+    /// Total yield accrued over the holding period.
+    pub total_yield: i128,
+    /// Yield amount allocated to the seller based on configured split.
+    pub seller_yield: i128,
+    /// Yield amount allocated to the buyer based on configured split.
+    pub buyer_yield: i128,
+    /// Seconds the escrow was held, used to calculate yield.
     pub held_seconds: u64,
 }
 
@@ -793,6 +831,9 @@ pub enum DataKey {
     FeeDistribution,
     /// Optional yield configuration for an escrow.
     EscrowYieldConfig(u64),
+    /// Optional yield split configuration for an escrow (issue #360).
+    /// Defines how accrued yield is distributed between buyer and seller.
+    EscrowYieldSplitConfig(u64),
     /// Release condition for an escrow.
     ReleaseCondition(u64),
     /// Ed25519 public key authorized to sign delivery proofs.
@@ -3636,15 +3677,71 @@ impl EscrowContract {
                 .get(&DataKey::EscrowYieldConfig(escrow_id));
             if let Some(cfg) = &yield_config {
                 let (yield_amount, held_seconds) = Self::compute_yield(&record, Some(cfg), env);
-                env.events().publish(
-                    (symbol_short!("escrow"), symbol_short!("yield"), escrow_id),
-                    EscrowYieldAccruedEvent {
-                        escrow_id,
-                        seller: record.seller.clone(),
-                        yield_amount,
-                        held_seconds,
-                    },
-                );
+                
+                // Check if yield split configuration exists (issue #360)
+                let split_config: Option<YieldSplitConfig> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::EscrowYieldSplitConfig(escrow_id));
+                
+                match split_config {
+                    Some(split) => {
+                        // Split yield between buyer and seller according to configured basis points
+                        let seller_yield = (yield_amount * split.seller_yield_share_bps as i128) / 10_000i128;
+                        let buyer_yield = yield_amount - seller_yield;
+                        
+                        // Transfer yields to both parties atomically
+                        if seller_yield > 0 {
+                            token_client.transfer(
+                                &env.current_contract_address(),
+                                &record.seller,
+                                &seller_yield,
+                            );
+                        }
+                        if buyer_yield > 0 {
+                            token_client.transfer(
+                                &env.current_contract_address(),
+                                &record.buyer,
+                                &buyer_yield,
+                            );
+                        }
+                        
+                        // Emit the new split yield event (issue #360)
+                        env.events().publish(
+                            (symbol_short!("escrow"), symbol_short!("yield"), escrow_id),
+                            EscrowYieldSplitAccruedEvent {
+                                escrow_id,
+                                seller: record.seller.clone(),
+                                buyer: record.buyer.clone(),
+                                total_yield: yield_amount,
+                                seller_yield,
+                                buyer_yield,
+                                held_seconds,
+                            },
+                        );
+                    }
+                    None => {
+                        // Backward compatibility: if no split config, seller gets 100% of yield
+                        if yield_amount > 0 {
+                            token_client.transfer(
+                                &env.current_contract_address(),
+                                &record.seller,
+                                &yield_amount,
+                            );
+                        }
+                        
+                        // Emit the legacy yield event for backward compatibility
+                        env.events().publish(
+                            (symbol_short!("escrow"), symbol_short!("yield"), escrow_id),
+                            EscrowYieldAccruedEvent {
+                                escrow_id,
+                                seller: record.seller.clone(),
+                                yield_amount,
+                                held_seconds,
+                            },
+                        );
+                    }
+                }
             }
         }
 
@@ -3795,6 +3892,76 @@ impl EscrowContract {
                 refunded_by: caller,
             },
         );
+
+        // On full refund, distribute accrued yield to buyer if yield config exists (issue #360)
+        if fully_refunded {
+            let yield_config: Option<YieldConfig> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::EscrowYieldConfig(escrow_id));
+            if let Some(cfg) = &yield_config {
+                let (yield_amount, held_seconds) = Self::compute_yield(&record, Some(cfg), &env);
+                
+                // Check if yield split configuration exists (issue #360)
+                let split_config: Option<YieldSplitConfig> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::EscrowYieldSplitConfig(escrow_id));
+                
+                match split_config {
+                    Some(split) => {
+                        // Calculate buyer's share of yield (inverse of seller's share)
+                        let seller_yield = (yield_amount * split.seller_yield_share_bps as i128) / 10_000i128;
+                        let buyer_yield = yield_amount - seller_yield;
+                        
+                        // Transfer buyer's yield share
+                        if buyer_yield > 0 {
+                            token_client.transfer(
+                                &env.current_contract_address(),
+                                &record.buyer,
+                                &buyer_yield,
+                            );
+                        }
+                        
+                        // Emit the split yield event for refund completion (issue #360)
+                        env.events().publish(
+                            (symbol_short!("escrow"), symbol_short!("yield"), escrow_id),
+                            EscrowYieldSplitAccruedEvent {
+                                escrow_id,
+                                seller: record.seller.clone(),
+                                buyer: record.buyer.clone(),
+                                total_yield: yield_amount,
+                                seller_yield,
+                                buyer_yield,
+                                held_seconds,
+                            },
+                        );
+                    }
+                    None => {
+                        // Backward compatibility: on refund without split config,
+                        // buyer gets 100% of yield (fair allocation for refund scenario)
+                        if yield_amount > 0 {
+                            token_client.transfer(
+                                &env.current_contract_address(),
+                                &record.buyer,
+                                &yield_amount,
+                            );
+                        }
+                        
+                        // Emit the legacy yield event
+                        env.events().publish(
+                            (symbol_short!("escrow"), symbol_short!("yield"), escrow_id),
+                            EscrowYieldAccruedEvent {
+                                escrow_id,
+                                seller: record.seller.clone(),
+                                yield_amount,
+                                held_seconds,
+                            },
+                        );
+                    }
+                }
+            }
+        }
 
         Ok(PartialRefundResult {
             refunded: refund_amount,
@@ -4313,6 +4480,62 @@ impl EscrowContract {
             &YieldConfig {
                 lending_contract,
                 apr_bps,
+            },
+        );
+
+        Ok(true)
+    }
+
+    /// Configure yield split distribution between buyer and seller for an escrow (issue #360).
+    ///
+    /// Allows admin to specify how accrued yield is distributed upon full release or refund.
+    /// The seller receives `seller_yield_share_bps` basis points of the total yield, and the
+    /// buyer receives the remaining (`10_000 - seller_yield_share_bps`) basis points.
+    /// Useful for long-term escrows or dispute scenarios where both parties should benefit
+    /// from the accrued interest based on their capital commitment.
+    ///
+    /// The escrow must not be in a terminal state (Released, Refunded, or Cancelled).
+    /// Calling this function is optional — if no `YieldSplitConfig` is set, escrows default
+    /// to awarding 100% of yield to the seller (backward compatible with issue #331).
+    ///
+    /// # Arguments
+    /// - `admin` — Address of the caller (must be primary admin or co-admin).
+    /// - `escrow_id` — Numeric identifier of the escrow to configure.
+    /// - `seller_yield_share_bps` — Percentage of yield for the seller (0-10_000 basis points).
+    ///
+    /// # Errors
+    /// - [`EscrowError::Unauthorized`] if `caller` is neither the primary admin nor a co-admin.
+    /// - [`EscrowError::InvalidYieldConfig`] if `seller_yield_share_bps` exceeds 10_000.
+    /// - [`EscrowError::NotFound`] if the escrow does not exist.
+    /// - [`EscrowError::AlreadyReleased`] if the escrow has already been released.
+    /// - [`EscrowError::AlreadyRefunded`] if the escrow has already been refunded.
+    /// - [`EscrowError::AlreadyCancelled`] if the escrow has already been cancelled.
+    pub fn set_yield_split_config(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        seller_yield_share_bps: u32,
+    ) -> Result<bool, EscrowError> {
+        admin.require_auth();
+        if !Self::is_admin(env.clone(), admin.clone()) {
+            return Err(EscrowError::Unauthorized);
+        }
+        if seller_yield_share_bps > 10_000 {
+            return Err(EscrowError::InvalidYieldConfig);
+        }
+
+        let key = DataKey::Escrow(escrow_id);
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+        check_not_terminal(&record)?;
+
+        env.storage().persistent().set(
+            &DataKey::EscrowYieldSplitConfig(escrow_id),
+            &YieldSplitConfig {
+                seller_yield_share_bps,
             },
         );
 
@@ -5478,6 +5701,24 @@ impl EscrowContract {
         env.storage()
             .persistent()
             .get(&DataKey::EscrowYieldConfig(escrow_id))
+    }
+
+    /// Retrieve the yield split configuration for an escrow (issue #360).
+    ///
+    /// Returns the configured yield distribution between buyer and seller.
+    /// If no `YieldSplitConfig` has been set for the escrow, returns `None`.
+    /// Never mutates storage (read-only getter).
+    ///
+    /// # Arguments
+    /// - `escrow_id` — Numeric identifier of the escrow.
+    ///
+    /// # Returns
+    /// - `Some(config)` if a `YieldSplitConfig` has been configured via `set_yield_split_config`.
+    /// - `None` if no split configuration exists for this escrow (default behavior: seller gets 100%).
+    pub fn get_yield_split_config(env: Env, escrow_id: u64) -> Option<YieldSplitConfig> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EscrowYieldSplitConfig(escrow_id))
     }
 
     // ── Ticket 3: get_co_admins / get_pending_admin ───────────────────────────
