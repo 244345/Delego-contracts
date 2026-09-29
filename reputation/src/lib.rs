@@ -7,7 +7,6 @@
 // enabled during testing so dev-dependencies and test assertions operate normally.
 // This exact conditional form must be consistent across all workspace contract crates.
 #![cfg_attr(not(test), no_std)]
-#![no_std]
 #![warn(missing_docs)]
 // Several entry points mirror escrow/permissions call shapes and exceed
 // clippy's default 7-argument limit; restructuring them would break the
@@ -18,6 +17,9 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String,
     Symbol, Vec,
 };
+
+/// Topic 0 for every event emitted by this contract.
+const EVENT_TOPIC_CONTRACT: Symbol = symbol_short!("reput");
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -549,7 +551,11 @@ impl ReputationContract {
         };
 
         env.events().publish(
-            (symbol_short!("reput"), symbol_short!("tx_rec")),
+            (
+                EVENT_TOPIC_CONTRACT,
+                symbol_short!("tx_rec"),
+                entity.clone(),
+            ),
             TransactionRecordedEvent {
                 escrow_id,
                 entity,
@@ -610,7 +616,11 @@ impl ReputationContract {
         Self::recompute_score(&env, &entity)?;
 
         env.events().publish(
-            (symbol_short!("reput"), symbol_short!("rated")),
+            (
+                EVENT_TOPIC_CONTRACT,
+                symbol_short!("rated"),
+                entity.clone(),
+            ),
             EntityRatedEvent {
                 rater,
                 entity,
@@ -797,7 +807,11 @@ impl ReputationContract {
         let active_count = flags.iter().filter(|f| !f.resolved).count() as u32;
 
         env.events().publish(
-            (symbol_short!("reput"), symbol_short!("flagged")),
+            (
+                EVENT_TOPIC_CONTRACT,
+                symbol_short!("flagged"),
+                entity.clone(),
+            ),
             EntityFlaggedEvent {
                 reporter,
                 entity: entity.clone(),
@@ -813,7 +827,11 @@ impl ReputationContract {
                 .persistent()
                 .set(&DataKey::FrozenStatus(entity.clone()), &true);
             env.events().publish(
-                (symbol_short!("reput"), symbol_short!("frozen")),
+                (
+                    EVENT_TOPIC_CONTRACT,
+                    symbol_short!("frozen"),
+                    entity.clone(),
+                ),
                 EntityFrozenEvent {
                     entity,
                     frozen_by: env.current_contract_address(),
@@ -875,7 +893,11 @@ impl ReputationContract {
             .persistent()
             .set(&DataKey::FrozenStatus(entity.clone()), &true);
         env.events().publish(
-            (symbol_short!("reput"), symbol_short!("frozen")),
+            (
+                EVENT_TOPIC_CONTRACT,
+                symbol_short!("frozen"),
+                entity.clone(),
+            ),
             EntityFrozenEvent {
                 entity,
                 frozen_by: admin,
@@ -896,7 +918,11 @@ impl ReputationContract {
             .persistent()
             .set(&DataKey::FrozenStatus(entity.clone()), &false);
         env.events().publish(
-            (symbol_short!("reput"), symbol_short!("unfrozn")),
+            (
+                EVENT_TOPIC_CONTRACT,
+                symbol_short!("unfrozn"),
+                entity.clone(),
+            ),
             EntityUnfrozenEvent {
                 entity,
                 unfrozen_by: admin,
@@ -952,7 +978,11 @@ impl ReputationContract {
 
         if pruned_count > 0 {
             env.events().publish(
-                (symbol_short!("reput"), symbol_short!("pruned")),
+                (
+                    EVENT_TOPIC_CONTRACT,
+                    symbol_short!("pruned"),
+                    entity.clone(),
+                ),
                 EntityHistoryPrunedEvent {
                     entity,
                     pruned_count,
@@ -990,7 +1020,11 @@ impl ReputationContract {
             .instance()
             .set(&DataKey::PendingAdmin, &new_admin);
         env.events().publish(
-            (symbol_short!("reput"), soroban_sdk::Symbol::new(&env, "admin_prop")),
+            (
+                EVENT_TOPIC_CONTRACT,
+                soroban_sdk::Symbol::new(&env, "admin_prop"),
+                new_admin.clone(),
+            ),
             AdminProposedEvent {
                 current_admin,
                 new_admin,
@@ -1014,7 +1048,11 @@ impl ReputationContract {
         env.storage().instance().set(&DataKey::Admin, &caller);
         env.storage().instance().remove(&DataKey::PendingAdmin);
         env.events().publish(
-            (symbol_short!("reput"), symbol_short!("admin_acc")),
+            (
+                EVENT_TOPIC_CONTRACT,
+                symbol_short!("admin_acc"),
+                caller.clone(),
+            ),
             AdminAcceptedEvent { new_admin: caller },
         );
         Ok(())
@@ -1496,7 +1534,11 @@ impl ReputationContract {
         );
 
         env.events().publish(
-            (symbol_short!("reput"), symbol_short!("score_dec")),
+            (
+                EVENT_TOPIC_CONTRACT,
+                symbol_short!("score_dec"),
+                entity.clone(),
+            ),
             decomposition,
         );
         Ok(rep)

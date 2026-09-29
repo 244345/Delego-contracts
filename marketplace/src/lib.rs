@@ -873,7 +873,11 @@ impl MarketplaceContract {
 
                 // Emit category-changed event.
                 env.events().publish(
-                    (symbol_short!("mkplc"), symbol_short!("cat_chg")),
+                    (
+                        symbol_short!("mkplc"),
+                        symbol_short!("cat_chg"),
+                        merchant_id,
+                    ),
                     MerchantCategoryChangedEvent {
                         merchant_id,
                         from: from_cat,

@@ -1763,6 +1763,41 @@ where
         })
 }
 
+/// Find the most recently published contract event whose topic tuple matches
+/// `(contract, action)` and return its full topic vector plus payload.
+///
+/// This is the canonical helper for asserting the 3-topic Soroban convention
+/// `(contract, action, entity_id)` used across the marketplace, permissions,
+/// and delegation_registry contracts so off-chain indexers can filter by
+/// entity id without parsing the event body.
+fn find_event_with_topics<T>(
+    f: &TestFixture<'_>,
+    contract: &Symbol,
+    action: &Symbol,
+) -> Option<(soroban_sdk::Vec<Val>, T)>
+where
+    T: TryFromVal<Env, Val>,
+{
+    f.env
+        .events()
+        .all()
+        .iter()
+        .rev()
+        .find_map(|(_id, topics, data)| {
+            if topics.len() < 2 {
+                return None;
+            }
+            let t0: Symbol = topics.get(0)?.try_into_val(&f.env).ok()?;
+            let t1: Symbol = topics.get(1)?.try_into_val(&f.env).ok()?;
+            if &t0 == contract && &t1 == action {
+                let payload = T::try_from_val(&f.env, &data).ok()?;
+                Some((topics, payload))
+            } else {
+                None
+            }
+        })
+}
+
 #[test]
 fn test_propose_admin_self_proposal_is_noop() {
     let f = TestFixture::setup();
@@ -1865,6 +1900,164 @@ fn test_propose_admin_overwrite_pending_admin() {
     // Second candidate accepts successfully
     f.client.accept_admin(&new_admin_2);
     assert_eq!(f.client.get_admin(), new_admin_2);
+}
+
+// ---------------------------------------------------------------------------
+// Native contract event topic filtering (issue: off-chain indexer support)
+//
+// All events emitted by the marketplace contract follow the 3-topic Soroban
+// convention:
+//
+//   Topic 0: contract symbol  (e.g. symbol_short!("mkplc"))
+//   Topic 1: action symbol    (e.g. symbol_short!("reg"))
+//   Topic 2: entity id        (u64 merchant id, or Address for admin events)
+//
+// The tests below assert the exact topic tuple and payload type for each
+// event so RPC filter queries can subscribe to entity-level events directly.
+// ---------------------------------------------------------------------------
+
+/// `MerchantRegisteredEvent` must be published with topics
+/// `(mkplc, reg, merchant_id)` and a payload carrying `merchant_id`, `owner`,
+/// and `name`.
+#[test]
+fn test_event_topic_schema_merchant_registered() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+    let id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Topic Schema Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("tech"),
+            image_url: String::from_str(&f.env, "url"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 1,
+        },
+    );
+
+    let (topics, payload) =
+        find_event_with_topics::<MerchantRegisteredEvent>(
+            &f,
+            &symbol_short!("mkplc"),
+            &symbol_short!("reg"),
+        )
+        .expect("reg event must be published");
+
+    assert_eq!(topics.len(), 3, "reg event must use the 3-topic convention");
+    let t0: Symbol = topics.get(0).unwrap().try_into_val(&f.env).unwrap();
+    let t1: Symbol = topics.get(1).unwrap().try_into_val(&f.env).unwrap();
+    let t2: u64 = topics.get(2).unwrap().try_into_val(&f.env).unwrap();
+    assert_eq!(t0, symbol_short!("mkplc"));
+    assert_eq!(t1, symbol_short!("reg"));
+    assert_eq!(t2, id, "topic 2 must carry the merchant id");
+    assert_eq!(payload.merchant_id, id);
+    assert_eq!(payload.owner, owner);
+}
+
+/// `AdminProposedEvent` must be published with topics
+/// `(mkplc, adm_prop, new_admin)` so indexers can subscribe to a specific
+/// pending admin address.
+#[test]
+fn test_event_topic_schema_admin_proposed() {
+    let f = TestFixture::setup();
+    let new_admin = Address::generate(&f.env);
+
+    f.client.propose_admin(&f.admin, &new_admin);
+
+    let (topics, payload) = find_event_with_topics::<AdminProposedEvent>(
+        &f,
+        &symbol_short!("mkplc"),
+        &symbol_short!("adm_prop"),
+    )
+    .expect("adm_prop event must be published");
+
+    assert_eq!(topics.len(), 3, "adm_prop event must use the 3-topic convention");
+    let t0: Symbol = topics.get(0).unwrap().try_into_val(&f.env).unwrap();
+    let t1: Symbol = topics.get(1).unwrap().try_into_val(&f.env).unwrap();
+    let t2: Address = topics.get(2).unwrap().try_into_val(&f.env).unwrap();
+    assert_eq!(t0, symbol_short!("mkplc"));
+    assert_eq!(t1, symbol_short!("adm_prop"));
+    assert_eq!(t2, new_admin, "topic 2 must carry the proposed admin address");
+    assert_eq!(payload.current_admin, f.admin);
+    assert_eq!(payload.new_admin, new_admin);
+}
+
+/// `AdminAcceptedEvent` must be published with topics
+/// `(mkplc, adm_acc, new_admin)` so indexers can subscribe to a specific
+/// accepted admin address.
+#[test]
+fn test_event_topic_schema_admin_accepted() {
+    let f = TestFixture::setup();
+    let new_admin = Address::generate(&f.env);
+
+    f.client.propose_admin(&f.admin, &new_admin);
+    f.client.accept_admin(&new_admin);
+
+    let (topics, payload) = find_event_with_topics::<AdminAcceptedEvent>(
+        &f,
+        &symbol_short!("mkplc"),
+        &symbol_short!("adm_acc"),
+    )
+    .expect("adm_acc event must be published");
+
+    assert_eq!(topics.len(), 3, "adm_acc event must use the 3-topic convention");
+    let t0: Symbol = topics.get(0).unwrap().try_into_val(&f.env).unwrap();
+    let t1: Symbol = topics.get(1).unwrap().try_into_val(&f.env).unwrap();
+    let t2: Address = topics.get(2).unwrap().try_into_val(&f.env).unwrap();
+    assert_eq!(t0, symbol_short!("mkplc"));
+    assert_eq!(t1, symbol_short!("adm_acc"));
+    assert_eq!(t2, new_admin, "topic 2 must carry the accepted admin address");
+    assert_eq!(payload.previous_admin, f.admin);
+    assert_eq!(payload.new_admin, new_admin);
+}
+
+/// `MerchantCategoryChangedEvent` must be published with topics
+/// `(mkplc, cat_chg, merchant_id)` so indexers can subscribe to category
+/// changes for a specific merchant.
+#[test]
+fn test_event_topic_schema_merchant_category_changed() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+    let id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Category Topic Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("tech"),
+            image_url: String::from_str(&f.env, "url"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 1,
+        },
+    );
+
+    f.client.update_merchant_profile(
+        &id,
+        &owner,
+        &String::from_str(&f.env, "Category Topic Store"),
+        &String::from_str(&f.env, "Desc"),
+        &String::from_str(&f.env, "url"),
+        &Some(symbol_short!("books")),
+    );
+
+    let (topics, payload) = find_event_with_topics::<MerchantCategoryChangedEvent>(
+        &f,
+        &symbol_short!("mkplc"),
+        &symbol_short!("cat_chg"),
+    )
+    .expect("cat_chg event must be published");
+
+    assert_eq!(topics.len(), 3, "cat_chg event must use the 3-topic convention");
+    let t0: Symbol = topics.get(0).unwrap().try_into_val(&f.env).unwrap();
+    let t1: Symbol = topics.get(1).unwrap().try_into_val(&f.env).unwrap();
+    let t2: u64 = topics.get(2).unwrap().try_into_val(&f.env).unwrap();
+    assert_eq!(t0, symbol_short!("mkplc"));
+    assert_eq!(t1, symbol_short!("cat_chg"));
+    assert_eq!(t2, id, "topic 2 must carry the merchant id");
+    assert_eq!(payload.merchant_id, id);
+    assert_eq!(payload.from, symbol_short!("tech"));
+    assert_eq!(payload.to, symbol_short!("books"));
 }
 
 #[test]

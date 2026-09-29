@@ -356,6 +356,23 @@ pub enum DelegationError {
     InvalidBatchSize = 316,
 }
 
+/// Canonical topic symbols for delegation registry events.
+///
+/// Every event published by this contract follows the 3-topic Soroban
+/// convention `(contract, action, entity_id)` so off-chain indexers can
+/// subscribe to entity-level events directly via RPC topic filters without
+/// parsing the event body.
+///
+/// - Topic 0: `symbol_short!("deleg")` — contract namespace.
+/// - Topic 1: action symbol (e.g. `symbol_short!("created")`).
+/// - Topic 2: entity id (`u64` delegation id, or `Address` for admin events).
+pub mod topics {
+    use soroban_sdk::symbol_short;
+
+    /// Topic 0: contract namespace used by every delegation event.
+    pub const CONTRACT: soroban_sdk::Symbol = symbol_short!("deleg");
+}
+
 /// The delegation registry contract.
 #[contract]
 pub struct DelegationRegistry;
@@ -410,7 +427,11 @@ impl DelegationRegistry {
             .set(&DataKey::ProposedAdmin, &new_admin);
 
         env.events().publish(
-            (symbol_short!("deleg"), symbol_short!("adm_prop")),
+            (
+                symbol_short!("deleg"),
+                symbol_short!("adm_prop"),
+                new_admin.clone(),
+            ),
             AdminProposedEvent {
                 current_admin,
                 proposed_admin: new_admin,
@@ -447,7 +468,11 @@ impl DelegationRegistry {
         env.storage().instance().remove(&DataKey::ProposedAdmin);
 
         env.events().publish(
-            (symbol_short!("deleg"), symbol_short!("adm_xfer")),
+            (
+                symbol_short!("deleg"),
+                symbol_short!("adm_xfer"),
+                proposed_admin.clone(),
+            ),
             AdminTransferredEvent {
                 previous_admin,
                 new_admin: proposed_admin.clone(),
@@ -624,7 +649,11 @@ impl DelegationRegistry {
             .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
         env.events().publish(
-            (symbol_short!("deleg"), symbol_short!("created")),
+            (
+                symbol_short!("deleg"),
+                symbol_short!("created"),
+                id,
+            ),
             DelegationCreatedEvent {
                 delegation_id: id,
                 owner,
@@ -661,7 +690,11 @@ impl DelegationRegistry {
         Self::store_snapshot(&env, delegation_id, &record);
 
         env.events().publish(
-            (symbol_short!("deleg"), symbol_short!("paused")),
+            (
+                symbol_short!("deleg"),
+                symbol_short!("paused"),
+                delegation_id,
+            ),
             DelegationPausedEvent {
                 delegation_id,
                 owner: record.owner.clone(),
@@ -708,7 +741,11 @@ impl DelegationRegistry {
         Self::store_snapshot(&env, delegation_id, &record);
 
         env.events().publish(
-            (symbol_short!("deleg"), symbol_short!("resumed")),
+            (
+                symbol_short!("deleg"),
+                symbol_short!("resumed"),
+                delegation_id,
+            ),
             DelegationResumedEvent {
                 delegation_id,
                 owner: record.owner.clone(),
@@ -749,7 +786,11 @@ impl DelegationRegistry {
         Self::store_snapshot(&env, delegation_id, &record);
 
         env.events().publish(
-            (symbol_short!("deleg"), symbol_short!("revoked")),
+            (
+                symbol_short!("deleg"),
+                symbol_short!("revoked"),
+                delegation_id,
+            ),
             DelegationRevokedEvent {
                 delegation_id,
                 owner: record.owner.clone(),
@@ -804,7 +845,11 @@ impl DelegationRegistry {
         Self::store_snapshot(&env, delegation_id, &record);
 
         env.events().publish(
-            (symbol_short!("deleg"), symbol_short!("revoked")),
+            (
+                symbol_short!("deleg"),
+                symbol_short!("revoked"),
+                delegation_id,
+            ),
             DelegationRevokedEvent {
                 delegation_id,
                 owner: record.owner.clone(),
@@ -1023,7 +1068,11 @@ impl DelegationRegistry {
 
         if expired_on_restore {
             env.events().publish(
-                (symbol_short!("deleg"), symbol_short!("expired")),
+                (
+                    symbol_short!("deleg"),
+                    symbol_short!("expired"),
+                    delegation_id,
+                ),
                 DelegationExpiredEvent {
                     delegation_id,
                     owner: record.owner.clone(),
@@ -1340,7 +1389,11 @@ impl DelegationRegistry {
         Self::store_snapshot(env, delegation_id, &record);
 
         env.events().publish(
-            (symbol_short!("deleg"), symbol_short!("perm_chg")),
+            (
+                symbol_short!("deleg"),
+                symbol_short!("perm_chg"),
+                delegation_id,
+            ),
             PermissionFlagsChangedEvent {
                 delegation_id,
                 owner: record.owner.clone(),
@@ -1388,7 +1441,11 @@ impl DelegationRegistry {
                     Self::store_snapshot(&env, id, &record);
 
                     env.events().publish(
-                        (symbol_short!("deleg"), symbol_short!("expired")),
+                        (
+                            symbol_short!("deleg"),
+                            symbol_short!("expired"),
+                            id,
+                        ),
                         DelegationExpiredEvent {
                             delegation_id: id,
                             owner: record.owner.clone(),

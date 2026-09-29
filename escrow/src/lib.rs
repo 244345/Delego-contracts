@@ -13,6 +13,28 @@
 //! order id. Contract-wide events that have no single escrow to route by
 //! (`upgraded`, `paused`, `feedist`, `pl_fund`, `pl_wdrw`, and the `admin`
 //! transfer events) keep the two-topic `(escrow|admin, <action>)` form.
+//!
+//! # Event topic schema
+//!
+//! All escrow lifecycle events follow the 3-topic Soroban convention
+//! `(contract, action, entity_id)`:
+//!
+//! | Action       | Topic 0  | Topic 1    | Topic 2 (entity id) |
+//! |--------------|----------|------------|---------------------|
+//! | `created`    | `escrow` | `created`  | `u64` escrow_id     |
+//! | `metadata`   | `escrow` | `metadata` | `BytesN<32>` order  |
+//! | `cancelled`  | `escrow` | `cancelled`| `BytesN<32>` order  |
+//! | `released`   | `escrow` | `released` | `u64` escrow_id     |
+//! | `refunded`   | `escrow` | `refunded` | `u64` escrow_id     |
+//! | `disputed`   | `escrow` | `disputed` | `u64` escrow_id     |
+//! | `resolved`   | `escrow` | `resolved` | `u64` escrow_id     |
+//! | `yield`      | `escrow` | `yield`    | `u64` escrow_id     |
+//! | `split`      | `escrow` | `split`    | `u64` escrow_id     |
+//! | `cond_set`   | `escrow` | `cond_set` | `u64` escrow_id     |
+//! | `vote`       | `escrow` | `vote`     | `u64` escrow_id     |
+//!
+//! The entity id is duplicated in the event body so consumers that already
+//! have the body do not need to re-read topics.
 
 // Contract crates compile as no_std for release and wasm builds, but keep std
 // enabled during testing so dev-dependencies and test assertions operate normally.
