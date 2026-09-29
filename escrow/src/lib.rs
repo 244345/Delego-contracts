@@ -1054,6 +1054,12 @@ pub enum EscrowError {
     BatchLimitExceeded = 409,
     /// Dispute award amounts are negative or do not sum to the escrow balance.
     InvalidDisputeAward = 410,
+    /// Net tokens received after transfer are less than the requested deposit
+    /// amount. Occurs with fee-on-transfer or deflationary tokens where the
+    /// balance delta is smaller than the nominal amount passed to transfer().
+    DepositUnderfunded = 411,
+    /// Arithmetic overflow when computing the deposit balance delta.
+    MathOverflow = 412,
 }
 
 /// Compact receipt returned to buyers after escrow creation via `get_receipt`.
@@ -1253,6 +1259,31 @@ fn is_zero_address(env: &Env, address: &Address) -> bool {
     let zero_account = Address::from_str(env, ZERO_ACCOUNT_STRKEY);
     let zero_contract = Address::from_str(env, ZERO_CONTRACT_STRKEY);
     address == &zero_account || address == &zero_contract
+}
+
+/// Verify the actual net token delta received by the contract after a deposit
+/// transfer.
+///
+/// Fee-on-transfer and deflationary tokens deduct a fee during `transfer()`,
+/// so the balance increase can be less than the nominal `expected_amount`.
+/// This function reads the post-transfer balance, computes the delta relative
+/// to `balance_before`, and returns the real amount received — or aborts with
+/// a typed error when the deposit is underfunded.
+fn verify_received_deposit_delta(
+    env: &Env,
+    token_client: &soroban_sdk::token::Client,
+    contract_address: &Address,
+    balance_before: i128,
+    expected_amount: i128,
+) -> Result<i128, EscrowError> {
+    let balance_after = token_client.balance(contract_address);
+    let net_received = balance_after
+        .checked_sub(balance_before)
+        .ok_or(EscrowError::MathOverflow)?;
+    if net_received < expected_amount {
+        return Err(EscrowError::DepositUnderfunded);
+    }
+    Ok(net_received)
 }
 
 #[contract]
@@ -3167,8 +3198,17 @@ impl EscrowContract {
         }
 
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
+        let balance_before = token_client.balance(&env.current_contract_address());
         token_client.transfer(&buyer, &env.current_contract_address(), &record.amount);
+        let net_received = verify_received_deposit_delta(
+            &env,
+            &token_client,
+            &env.current_contract_address(),
+            balance_before,
+            record.amount,
+        )?;
 
+        record.amount = net_received;
         record.status = EscrowStatus::Funded;
         record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
@@ -3304,8 +3344,17 @@ impl EscrowContract {
             .ok_or(EscrowError::NotFound)?;
 
         let token_client = soroban_sdk::token::Client::new(&env, &token);
+        let balance_before = token_client.balance(&env.current_contract_address());
         token_client.transfer(&buyer, &env.current_contract_address(), &amount);
+        let net_received = verify_received_deposit_delta(
+            &env,
+            &token_client,
+            &env.current_contract_address(),
+            balance_before,
+            amount,
+        )?;
 
+        record.amount = net_received;
         record.status = EscrowStatus::Funded;
         record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
