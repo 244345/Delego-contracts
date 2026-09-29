@@ -110,6 +110,21 @@ pub struct EscrowRecord {
     pub timeout_ledger: u32,
 }
 
+/// Token-unit threshold above which escrow releases require finance approval.
+pub const DUAL_CONTROL_THRESHOLD: i128 = 10_000;
+
+/// Finance approval state for a high-value escrow.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DualControlConfig {
+    /// Address authorized to provide the secondary approval.
+    pub secondary_approver: Address,
+    /// Whether the secondary approver has authorized release.
+    pub is_secondary_approved: bool,
+    /// Ledger timestamp of the secondary approval, or zero before approval.
+    pub secondary_approved_at: u64,
+}
+
 /// Outcome of a partial release.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -710,6 +725,8 @@ pub struct DisputeVotesPrunedEvent {
 pub enum DataKey {
     Admin,
     Escrow(u64),
+    /// Per-escrow finance approval configuration.
+    DualControlConfig(u64),
     LastEscrowId,
     PendingAdmin,
     AdminList,
@@ -951,6 +968,10 @@ pub enum EscrowError {
     InvalidSignedDeliveryProof = 46,
     /// Delivery oracle public key has not been configured by admin
     OraclePublicKeyNotSet = 47,
+    /// Dual-control approval has not been configured for this escrow.
+    DualControlNotConfigured = 48,
+    /// Finance approval is required before a high-value release.
+    SecondaryApprovalRequired = 49,
     /// Maximum treasuries exceeded
     MaxTreasuriesExceeded = 42,
     /// Escrow exists but no metadata was stored at creation
@@ -1382,6 +1403,71 @@ impl EscrowContract {
             .instance()
             .get(&DataKey::AmountLimits)
             .ok_or(EscrowError::AmountLimitsNotSet)
+    }
+
+    /// Configure the finance approver for a high-value escrow. Admin-only.
+    pub fn set_dual_control_config(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        secondary_approver: Address,
+    ) -> Result<(), EscrowError> {
+        admin.require_auth();
+        if !Self::is_admin(env.clone(), admin) {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        let key = DataKey::Escrow(escrow_id);
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+        if record.amount <= DUAL_CONTROL_THRESHOLD {
+            return Err(EscrowError::InvalidAmount);
+        }
+
+        env.storage().persistent().set(
+            &DataKey::DualControlConfig(escrow_id),
+            &DualControlConfig {
+                secondary_approver,
+                is_secondary_approved: false,
+                secondary_approved_at: 0,
+            },
+        );
+        Ok(())
+    }
+
+    /// Record explicit finance authorization for a configured high-value escrow.
+    pub fn approve_release(
+        env: Env,
+        escrow_id: u64,
+        secondary_approver: Address,
+    ) -> Result<bool, EscrowError> {
+        let config_key = DataKey::DualControlConfig(escrow_id);
+        let mut config: DualControlConfig = env
+            .storage()
+            .persistent()
+            .get(&config_key)
+            .ok_or(EscrowError::DualControlNotConfigured)?;
+        if config.secondary_approver != secondary_approver {
+            return Err(EscrowError::Unauthorized);
+        }
+        secondary_approver.require_auth();
+
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+        if record.amount <= DUAL_CONTROL_THRESHOLD || record.status != EscrowStatus::Funded {
+            return Err(EscrowError::InvalidStatus);
+        }
+
+        config.is_secondary_approved = true;
+        config.secondary_approved_at = env.ledger().timestamp();
+        env.storage().persistent().set(&config_key, &config);
+        Ok(true)
     }
 
     /// Set the quorum configuration for dispute resolution. Admin-only.
@@ -3230,6 +3316,10 @@ impl EscrowContract {
         }
         Self::validate_release_status(&record)?;
 
+        if record.amount > DUAL_CONTROL_THRESHOLD {
+            return Err(EscrowError::SignedProofRequired);
+        }
+
         // When the admin has required it, buyer-originated releases must pass
         // the release-eligibility gate (issue #48). Admins are not gated.
         if caller == record.buyer
@@ -3577,6 +3667,17 @@ impl EscrowContract {
         check_not_terminal(&record)?;
         if record.status != EscrowStatus::Funded {
             return Err(EscrowError::InvalidStatus);
+        }
+
+        if record.amount > DUAL_CONTROL_THRESHOLD {
+            let config: DualControlConfig = env
+                .storage()
+                .persistent()
+                .get(&DataKey::DualControlConfig(escrow_id))
+                .ok_or(EscrowError::DualControlNotConfigured)?;
+            if !config.is_secondary_approved {
+                return Err(EscrowError::SecondaryApprovalRequired);
+            }
         }
 
         let configured_key: BytesN<32> = env
