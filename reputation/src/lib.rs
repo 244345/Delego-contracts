@@ -51,6 +51,26 @@ pub struct ScoreDecomposition {
     pub final_score: u32,
 }
 
+/// Composite reputation score blending transaction-count and dollar-volume
+/// signals so that micro-transaction spam cannot inflate a merchant's
+/// standing while high-value transactions carry appropriate significance.
+///
+/// All fields are in basis points (0-10000).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositeScore {
+    /// Count-weighted score in basis points (0-10000).
+    pub count_score_bps: u32,
+    /// Volume-weighted score in basis points (0-10000), computed with
+    /// logarithmic dampening so a single whale transaction cannot dominate.
+    pub volume_score_bps: u32,
+    /// Canonical blended score: 40% count score + 60% volume score.
+    pub blended_score_bps: u32,
+    /// Confidence rating in basis points (0-10000) reflecting how much
+    /// transaction volume backs the blended score.
+    pub confidence_rating: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransactionRecord {
@@ -58,8 +78,8 @@ pub struct TransactionRecord {
     pub entity: Address,
     pub counterparty: Address,
     /// Transaction amount in the smallest denomination of the token.
-    /// This field is persisted for historical record-keeping but does not
-    /// influence reputation scoring calculations.
+    /// This field feeds the volume-weighted component of the composite
+    /// reputation score (see [`CompositeScore`]) with logarithmic dampening.
     pub amount: i128,
     pub outcome: TransactionOutcome,
     /// 0-10000, set once by `rate_entity`.
@@ -296,6 +316,9 @@ pub enum DataKey {
     Transacted(Address, Address),
     /// Incremental weighted sums used by `record_transaction`'s hot path.
     ScoreAccumulator(Address),
+    /// Cached composite score for an entity, recomputed on each
+    /// `record_transaction`/`rate_entity`.
+    CompositeScore(Address),
 }
 
 /// Maximum basis points value (100.00%), used both for ratings/scores and
@@ -324,6 +347,19 @@ const SCORE_WINDOW: u32 = 200;
 /// for roughly 30 days, matching the repository's persistent-storage policy.
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280;
 const PERSISTENT_BUMP_AMOUNT: u32 = 518_400;
+
+/// Weight (in basis points) applied to the count component of the
+/// composite score. Count and volume weights must sum to `BPS_SCALE`.
+const COUNT_WEIGHT_BPS: i128 = 4_000;
+
+/// Weight (in basis points) applied to the volume component of the
+/// composite score. Count and volume weights must sum to `BPS_SCALE`.
+const VOLUME_WEIGHT_BPS: i128 = 6_000;
+
+/// Reference volume (in smallest token units) used as the logarithmic
+/// dampening unit for the volume-weighted score. Each multiple of this
+/// amount contributes a diminishing marginal increment to the volume score.
+const VOLUME_UNIT: i128 = 1_000;
 
 /// Maps a transaction outcome to its contribution toward `score`, in basis
 /// points, per the reputation score formula.
