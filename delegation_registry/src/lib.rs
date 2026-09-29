@@ -816,6 +816,124 @@ impl DelegationRegistry {
         Ok(true)
     }
 
+    /// Admin force-pauses a delegation regardless of owner action (issue
+    /// #285). Emergency counterpart to `pause_delegation`, mirroring
+    /// `admin_revoke`'s authorization pattern: `caller` must require auth
+    /// and must equal the configured admin, independent of `record.owner`.
+    ///
+    /// Returns `Ok(true)` if the delegation transitioned to `Paused`.
+    /// Returns `Err(DelegationError::NotActive)` if it was not `Active`
+    /// (mirrors `pause_delegation`'s own precondition).
+    pub fn admin_pause_delegation(
+        env: Env,
+        caller: Address,
+        delegation_id: u64,
+    ) -> Result<bool, DelegationError> {
+        caller.require_auth();
+
+        let admin = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .expect("Admin not set");
+
+        if caller != admin {
+            return Err(DelegationError::NotAuthorized);
+        }
+
+        let mut record: DelegationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(delegation_id))
+            .ok_or(DelegationError::NotFound)?;
+
+        if record.status != DelegationStatus::Active {
+            return Err(DelegationError::NotActive);
+        }
+
+        record.status = DelegationStatus::Paused;
+        record.version = Self::increment_version(&env, delegation_id);
+        record.updated_at = env.ledger().timestamp();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Delegation(delegation_id), &record);
+
+        Self::store_snapshot(&env, delegation_id, &record);
+
+        env.events().publish(
+            (symbol_short!("deleg"), symbol_short!("paused")),
+            DelegationPausedEvent {
+                delegation_id,
+                owner: record.owner.clone(),
+                agent: record.agent_id.clone(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(true)
+    }
+
+    /// Admin resumes a delegation it (or `pause_delegation`'s owner path)
+    /// previously paused (issue #285). Emergency counterpart to
+    /// `resume_delegation`, so an admin-initiated pause is not
+    /// unrecoverable when the owner is unavailable. Same expiry precondition
+    /// as `resume_delegation`: the stored record is left untouched (still
+    /// `Paused`) if the delegation's expiry has already passed.
+    pub fn admin_resume_delegation(
+        env: Env,
+        caller: Address,
+        delegation_id: u64,
+    ) -> Result<bool, DelegationError> {
+        caller.require_auth();
+
+        let admin = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .expect("Admin not set");
+
+        if caller != admin {
+            return Err(DelegationError::NotAuthorized);
+        }
+
+        let mut record: DelegationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(delegation_id))
+            .ok_or(DelegationError::NotFound)?;
+
+        if record.status != DelegationStatus::Paused {
+            return Err(DelegationError::NotPaused);
+        }
+
+        if env.ledger().sequence() >= record.expires_at_ledger {
+            return Err(DelegationError::Expired);
+        }
+
+        record.status = DelegationStatus::Active;
+        record.version = Self::increment_version(&env, delegation_id);
+        record.updated_at = env.ledger().timestamp();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Delegation(delegation_id), &record);
+
+        Self::store_snapshot(&env, delegation_id, &record);
+
+        env.events().publish(
+            (symbol_short!("deleg"), symbol_short!("resumed")),
+            DelegationResumedEvent {
+                delegation_id,
+                owner: record.owner.clone(),
+                agent: record.agent_id.clone(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(true)
+    }
+
     const MAX_PAGE_LIMIT: u32 = 100;
 
     /// Returns a page of the delegations owned by `owner`.
