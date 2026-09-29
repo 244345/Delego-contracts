@@ -820,6 +820,10 @@ pub enum DataKey {
     UpgradeProposal,
     /// M-of-N admin approvals required to execute an upgrade (issue #292).
     UpgradeThreshold,
+    /// Instance-storage re-entrancy lock held while an entry point is executing
+    /// an external call. A re-entrant invocation observes `true` and is
+    /// rejected with [`EscrowError::ReentrancyDetected`] (issue #334).
+    ReentrancyGuard,
 }
 
 #[contracterror]
@@ -1054,6 +1058,44 @@ pub enum EscrowError {
     BatchLimitExceeded = 409,
     /// Dispute award amounts are negative or do not sum to the escrow balance.
     InvalidDisputeAward = 410,
+    /// A re-entrant invocation was attempted while an external call was in
+    /// flight (issue #334).
+    ReentrancyDetected = 411,
+}
+
+/// Runs `f` under a re-entrancy lock and returns its result unchanged.
+///
+/// Soroban discards every storage write made during an invocation once the
+/// top-level entry point returns `Err`, so an external call that fails only
+/// leaves escrow storage pristine if the error is propagated rather than
+/// swallowed. This helper enforces both halves of that guarantee (issue #334):
+///
+/// * it takes an instance-storage re-entrancy lock before calling `f`, so a
+///   downstream contract invoked from inside `f` cannot call back into the
+///   escrow and act on state that has only been half-applied;
+/// * it returns `f`'s `Result` unchanged, so a failure propagates out of the
+///   entry point and the host rolls the partial writes back.
+///
+/// The lock is always released before returning. A nested call while the lock
+/// is held fails fast with [`EscrowError::ReentrancyDetected`].
+pub fn execute_atomic_operation<F, T>(env: &Env, f: F) -> Result<T, EscrowError>
+where
+    F: FnOnce() -> Result<T, EscrowError>,
+{
+    let storage = env.storage().instance();
+    let locked: bool = storage.get(&DataKey::ReentrancyGuard).unwrap_or(false);
+    if locked {
+        return Err(EscrowError::ReentrancyDetected);
+    }
+    storage.set(&DataKey::ReentrancyGuard, &true);
+
+    let result = f();
+
+    // Release the lock. When `result` is `Err`, this write is rolled back along
+    // with the rest of the invocation; when it is `Ok`, the contract is left
+    // re-usable by the next call.
+    storage.remove(&DataKey::ReentrancyGuard);
+    result
 }
 
 /// Compact receipt returned to buyers after escrow creation via `get_receipt`.
@@ -3579,6 +3621,25 @@ impl EscrowContract {
     /// `released_amount` tracks the full escrow-amount released, not the net
     /// seller payout.
     fn execute_release(
+        env: &Env,
+        escrow_id: u64,
+        key: &DataKey,
+        record: EscrowRecord,
+        caller: Address,
+        release_amount: i128,
+    ) -> Result<PartialReleaseResult, EscrowError> {
+        // The token transfers below are external calls: run the whole release
+        // under the re-entrancy lock so a malicious token cannot call back into
+        // the escrow before the record write is committed, and so a failed
+        // transfer propagates and leaves storage pristine (issue #334).
+        execute_atomic_operation(env, || {
+            Self::execute_release_inner(env, escrow_id, key, record, caller, release_amount)
+        })
+    }
+
+    /// Unguarded release body. Callers must go through [`Self::execute_release`]
+    /// so the re-entrancy lock is held across the token transfers (issue #334).
+    fn execute_release_inner(
         env: &Env,
         escrow_id: u64,
         key: &DataKey,
@@ -6167,6 +6228,112 @@ mod quorum_cleanup_tests {
         assert!(!env.as_contract(&contract_id, || {
             env.storage().persistent().has(&votes_key)
         }));
+    }
+}
+
+#[cfg(test)]
+mod reentrancy_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn register_escrow(env: &Env) -> Address {
+        let config = EscrowConfig {
+            admin: Address::generate(env),
+            fee_bps: 0u32,
+            treasury: Address::generate(env),
+            min_amount: 1i128,
+            max_amount: 1_000_000i128,
+        };
+        env.register(EscrowContract, (config,))
+    }
+
+    #[test]
+    fn atomic_operation_returns_value_and_releases_guard() {
+        let env = Env::default();
+        let contract_id = register_escrow(&env);
+
+        let outcome = env.as_contract(&contract_id, || {
+            assert_eq!(
+                execute_atomic_operation(&env, || Ok::<u32, EscrowError>(42)),
+                Ok(42)
+            );
+            // The lock must have been released, otherwise this second call
+            // would fail with ReentrancyDetected.
+            execute_atomic_operation(&env, || Ok::<u32, EscrowError>(7))
+        });
+
+        assert_eq!(outcome, Ok(7));
+    }
+
+    #[test]
+    fn atomic_operation_propagates_error_and_releases_guard() {
+        let env = Env::default();
+        let contract_id = register_escrow(&env);
+
+        let outcome = env.as_contract(&contract_id, || {
+            let failed = execute_atomic_operation(&env, || {
+                Err::<u32, EscrowError>(EscrowError::ZeroAmount)
+            });
+            assert_eq!(failed, Err(EscrowError::ZeroAmount));
+            // A failed operation must not leave the lock held.
+            execute_atomic_operation(&env, || Ok::<u32, EscrowError>(1))
+        });
+
+        assert_eq!(outcome, Ok(1));
+    }
+
+    #[test]
+    fn reentrant_atomic_operation_is_rejected() {
+        let env = Env::default();
+        let contract_id = register_escrow(&env);
+
+        let outcome = env.as_contract(&contract_id, || {
+            execute_atomic_operation(&env, || {
+                // Simulates a downstream contract calling back into escrow while
+                // an external call is in flight.
+                execute_atomic_operation(&env, || Ok::<u32, EscrowError>(1))
+            })
+        });
+
+        assert_eq!(outcome, Err(EscrowError::ReentrancyDetected));
+    }
+
+    #[test]
+    fn release_path_is_reentrancy_guarded() {
+        // `execute_release` runs its token transfers through
+        // `execute_atomic_operation`. A release attempted while an external
+        // call already holds the lock must fail fast (and therefore never
+        // reach the transfers), leaving the escrow record untouched.
+        let env = Env::default();
+        let contract_id = register_escrow(&env);
+
+        let outcome = env.as_contract(&contract_id, || {
+            execute_atomic_operation(&env, || {
+                EscrowContract::execute_release(
+                    &env,
+                    1u64,
+                    &DataKey::Escrow(1u64),
+                    EscrowRecord {
+                        escrow_id: 1u64,
+                        buyer: Address::generate(&env),
+                        seller: Address::generate(&env),
+                        token: Address::generate(&env),
+                        amount: 100i128,
+                        released_amount: 0i128,
+                        refunded_amount: 0i128,
+                        status: EscrowStatus::Funded,
+                        order_id: BytesN::from_array(&env, &[0u8; 32]),
+                        created_at: 0u64,
+                        updated_at: 0u64,
+                        timeout_ledger: 0u32,
+                    },
+                    Address::generate(&env),
+                    10i128,
+                )
+            })
+        });
+
+        assert_eq!(outcome, Err(EscrowError::ReentrancyDetected));
     }
 }
 
