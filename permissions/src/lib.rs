@@ -1898,11 +1898,8 @@ impl PermissionsContract {
         // execute_spend and execute_spend_via_relayer (issue #55).
         while let Some((p_owner, p_delegate)) = next_parent {
             let parent_key = DataKey::Permission(p_owner, p_delegate);
-            let mut parent_record: PermissionRecord = env
-                .storage()
-                .persistent()
-                .get(&parent_key)
-                .unwrap();
+            let mut parent_record: PermissionRecord =
+                env.storage().persistent().get(&parent_key).unwrap();
 
             let parent_spent = parent_record
                 .spent
@@ -1976,9 +1973,14 @@ impl PermissionsContract {
         if min_interval_secs > 0 {
             // Pairs whose last spend predates timestamp tracking have no
             // recorded timestamp; they are governed by the ledger check alone.
-            if let Some(last_ts) = env.storage().persistent().get::<DataKey, u64>(
-                &DataKey::LastSpendTimestamp(owner.clone(), delegate.clone()),
-            ) {
+            if let Some(last_ts) =
+                env.storage()
+                    .persistent()
+                    .get::<DataKey, u64>(&DataKey::LastSpendTimestamp(
+                        owner.clone(),
+                        delegate.clone(),
+                    ))
+            {
                 let next_allowed = last_ts.saturating_add(min_interval_secs);
                 if env.ledger().timestamp() < next_allowed {
                     return Err(PermissionError::VelocityLimitExceeded);
@@ -2511,16 +2513,29 @@ impl PermissionsContract {
         records
     }
 
-    pub fn get_permission(env: Env, owner: Address, delegate: Address) -> Result<PermissionRecord, PermissionError> {
+    pub fn get_permission(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+    ) -> Result<PermissionRecord, PermissionError> {
         let key = DataKey::Permission(owner, delegate);
-        env.storage().persistent().get(&key).ok_or(PermissionError::PermissionNotFound)
+        env.storage()
+            .persistent()
+            .get(&key)
+            .ok_or(PermissionError::PermissionNotFound)
     }
 
-
-
-    pub fn get_remaining_allowance(env: Env, owner: Address, delegate: Address) -> Result<i128, PermissionError> {
+    pub fn get_remaining_allowance(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+    ) -> Result<i128, PermissionError> {
         let key = DataKey::Permission(owner, delegate);
-        let record: PermissionRecord = env.storage().persistent().get(&key).ok_or(PermissionError::PermissionNotFound)?;
+        let record: PermissionRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(PermissionError::PermissionNotFound)?;
         Ok(record.limit_total - record.spent)
     }
 
@@ -2622,7 +2637,8 @@ impl PermissionsContract {
         }
 
         let execution_time = env.ledger().timestamp() + 86400;
-        let execution_time = env.ledger().timestamp() + Self::get_decrease_timelock_secs(env.clone());
+        let execution_time =
+            env.ledger().timestamp() + Self::get_decrease_timelock_secs(env.clone());
 
         let pending = PendingAllowanceDecrement {
             amount,
@@ -3226,10 +3242,7 @@ impl PermissionsContract {
             return Err(PermissionError::InvalidParam);
         }
 
-        let previous: Option<u64> = env
-            .storage()
-            .instance()
-            .get(&DataKey::MinSpendIntervalSecs);
+        let previous: Option<u64> = env.storage().instance().get(&DataKey::MinSpendIntervalSecs);
 
         env.storage()
             .instance()
@@ -3735,9 +3748,7 @@ impl PermissionsContract {
 
         if let Some(total_entries) = storage.get::<_, u32>(&count_key) {
             let first = start.min(total_entries);
-            let end = first
-                .saturating_add(MAX_AUDIT_PAGE_SIZE)
-                .min(total_entries);
+            let end = first.saturating_add(MAX_AUDIT_PAGE_SIZE).min(total_entries);
             let oldest_slot: u32 = storage
                 .get(&DataKey::AuditLogStart(owner.clone(), delegate.clone()))
                 .unwrap_or(0);
@@ -3765,9 +3776,7 @@ impl PermissionsContract {
             .unwrap_or_else(|| Vec::new(&env));
         let total_entries = legacy.len();
         let first = start.min(total_entries);
-        let end = first
-            .saturating_add(MAX_AUDIT_PAGE_SIZE)
-            .min(total_entries);
+        let end = first.saturating_add(MAX_AUDIT_PAGE_SIZE).min(total_entries);
         for i in first..end {
             if let Some(entry) = legacy.get(i) {
                 entries.push_back(entry);
@@ -3883,8 +3892,6 @@ mod absent_key_tests {
         let delegate = Address::generate(&env);
         (env, owner, delegate)
     }
-
-
 }
 
 #[cfg(test)]
@@ -3968,6 +3975,9 @@ mod audit_log_page_tests {
         let page = client.get_audit_log_page(&owner, &delegate, &None);
         assert_eq!(page.total_entries, 3);
         assert_eq!(page.entries.len(), 3);
-        assert_eq!(page.entries.get(2).unwrap().timestamp, env.ledger().timestamp());
+        assert_eq!(
+            page.entries.get(2).unwrap().timestamp,
+            env.ledger().timestamp()
+        );
     }
 }

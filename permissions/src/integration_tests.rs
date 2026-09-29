@@ -406,9 +406,7 @@ fn test_set_decrease_allowance_timelock_custom_value() {
         Err(Ok(PermissionError::TimeLockActive))
     );
 
-    t.env
-        .ledger()
-        .set_timestamp(t.env.ledger().timestamp() + 1);
+    t.env.ledger().set_timestamp(t.env.ledger().timestamp() + 1);
     client.execute_decrease_allowance(&t.buyer, &t.agent);
     assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 800);
 }
@@ -1340,7 +1338,10 @@ fn test_validate_chain_prevents_mutation_on_exceeds_parent_limit() {
     );
 
     // Child state should not be mutated (spent is 0, remaining is 100)
-    assert_eq!(client.get_remaining_allowance(&t.agent, &child_delegate), 100);
+    assert_eq!(
+        client.get_remaining_allowance(&t.agent, &child_delegate),
+        100
+    );
     // Parent state should not be further mutated (spent is 50, remaining is 50)
     assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 50);
 }

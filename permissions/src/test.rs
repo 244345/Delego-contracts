@@ -2852,7 +2852,6 @@ mod test {
         assert!(!found_old);
     }
 
-
     // --- Batch sweep tests ---
 
     #[test]
@@ -3040,7 +3039,7 @@ mod test {
         let delegate = Address::generate(&env);
         let contract_id = env.register(PermissionsContract, ());
         let client = PermissionsContractClient::new(&env, &contract_id);
-        
+
         let result = client.try_decrease_allowance(&owner, &delegate, &-100);
         assert!(result.is_err());
     }
