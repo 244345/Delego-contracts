@@ -600,6 +600,26 @@ pub struct BatchEscrowItem {
     pub timeout_ledger: u32,
 }
 
+/// One escrow's deposit request for `batch_deposit` (issue #317).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchDepositItem {
+    /// Escrow to fund.
+    pub escrow_id: u64,
+    /// Amount to deposit into the escrow.
+    pub amount: i128,
+}
+
+/// Aggregate result of a successful `batch_deposit` (issue #317).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchDepositResult {
+    /// Number of escrows funded by this batch.
+    pub funded_count: u32,
+    /// Sum of all amounts deposited across the batch.
+    pub total_deposited: i128,
+}
+
 /// One escrow's release request for `batch_release` (issue #317).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -615,6 +635,9 @@ pub struct BatchRefundParams {
     pub escrow_id: u64,
     pub refund_amount: i128,
 }
+
+/// Maximum number of items accepted by `batch_deposit`.
+pub const MAX_BATCH_DEPOSIT_ITEMS: u32 = 50;
 
 /// Shared liquidity reserve for a single token, used to instantly settle
 /// funded escrows without waiting on the ordinary buyer/admin release flow
