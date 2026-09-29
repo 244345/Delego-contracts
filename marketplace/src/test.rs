@@ -2,6 +2,7 @@ use crate::{
     AdminAcceptedEvent, AdminProposedEvent, MarketplaceContract, MarketplaceContractClient,
     MarketplaceError, MerchantRegisteredEvent, MerchantStatus, RegisterParams, Verifier,
     DataKey, MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantStatus,
+    DataKey, MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantStatus,
     RegisterParams, Verifier,
     MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantCursor,
     MerchantRegisteredEvent, MerchantStatus, RegisterParams, Verifier,
@@ -19,6 +20,7 @@ use crate::{
     MerchantStats, MerchantStatus, RegisterParams, Verifier,
     MerchantStatus, RegisterParams, Verifier, MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN,
     MAX_METADATA_LEN, MAX_NAME_LEN,
+    ReputationCursor, RankedMerchantPage,
 };
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
@@ -27,6 +29,7 @@ use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Events as _, Ledger as _},
     Address, Env, IntoVal, String, Symbol, TryFromVal, Val,
+    Address, Env, String, Symbol, TryIntoVal,
     Address, Env, String, Symbol, TryIntoVal,
 };
 
@@ -2969,3 +2972,146 @@ fn test_register_merchant_event_carries_merchant_id_topic() {
     assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::InvalidParam);
     let unchanged = f.client.get_merchant(&id);
     assert_eq!(unchanged.name, String::from_str(&f.env, "Store A Updated"));
+
+#[test]
+fn test_ranked_discovery_orders_by_reputation_desc() {
+    let f = TestFixture::setup();
+    let reputation_admin = Address::generate(&f.env);
+    let rep_id = f.env.register(
+        ReputationContract,
+        (
+            reputation_admin.clone(),
+            ReputationConfig {
+                decay_window_seconds: 90 * 24 * 60 * 60,
+                min_transactions_threshold: 1,
+                dispute_penalty_bps: 500,
+                freeze_threshold_flags: 3,
+            },
+        ),
+    );
+    let rep_client = ReputationContractClient::new(&f.env, &rep_id);
+
+    let mut ids = soroban_sdk::Vec::<u64>::new(&f.env);
+    for i in 1..=5u32 {
+        let owner = Address::generate(&f.env);
+        let id = f.client.register_merchant(
+            &owner,
+            &RegisterParams {
+                name: store_name(&f.env, i),
+                description: String::from_str(&f.env, "Desc"),
+                category: symbol_short!("tech"),
+                image_url: String::from_str(&f.env, "url"),
+                metadata: None,
+                metadata_uri: None,
+                required_verifications: 1,
+            },
+        );
+        ids.push_back(id);
+        rep_client.record_transaction(
+            &reputation_admin,
+            &(i as u64),
+            &owner,
+            &Address::generate(&f.env),
+            &(100i128 * i as i128),
+            &TransactionOutcome::Released,
+        );
+        f.client
+            .set_merchant_reputation(&f.admin, &id, &Some(rep_id.clone()));
+    }
+
+    let page: RankedMerchantPage = f.client.get_ranked_merchants(&None, &10);
+    assert_eq!(page.total_count, 5);
+    assert_eq!(page.merchants.len(), 5);
+    let mut prev: Option<u32> = None;
+    for m in page.merchants.iter() {
+        let score = m.reputation_score.unwrap_or(0);
+        if let Some(p) = prev {
+            assert!(score <= p, "scores must be non-increasing");
+        }
+        prev = Some(score);
+    }
+    assert_eq!(page.next_cursor, None);
+}
+
+#[test]
+fn test_ranked_discovery_stable_pagination_with_ties() {
+    let f = TestFixture::setup();
+    let reputation_admin = Address::generate(&f.env);
+    let rep_id = f.env.register(
+        ReputationContract,
+        (
+            reputation_admin.clone(),
+            ReputationConfig {
+                decay_window_seconds: 90 * 24 * 60 * 60,
+                min_transactions_threshold: 1,
+                dispute_penalty_bps: 500,
+                freeze_threshold_flags: 3,
+            },
+        ),
+    );
+    let rep_client = ReputationContractClient::new(&f.env, &rep_id);
+
+    // All merchants receive identical reputation scores to force ties.
+    for i in 1..=7u32 {
+        let owner = Address::generate(&f.env);
+        let id = f.client.register_merchant(
+            &owner,
+            &RegisterParams {
+                name: store_name(&f.env, i),
+                description: String::from_str(&f.env, "Desc"),
+                category: symbol_short!("tech"),
+                image_url: String::from_str(&f.env, "url"),
+                metadata: None,
+                metadata_uri: None,
+                required_verifications: 1,
+            },
+        );
+        rep_client.record_transaction(
+            &reputation_admin,
+            &(i as u64),
+            &owner,
+            &Address::generate(&f.env),
+            &500i128,
+            &TransactionOutcome::Released,
+        );
+        f.client
+            .set_merchant_reputation(&f.admin, &id, &Some(rep_id.clone()));
+    }
+
+    let mut seen = soroban_sdk::Vec::<u64>::new(&f.env);
+    let mut cursor: Option<ReputationCursor> = None;
+    loop {
+        let page = f.client.get_ranked_merchants(&cursor, &3);
+        for m in page.merchants.iter() {
+            for prev in seen.iter() {
+                assert_ne!(prev, m.id, "no duplicate merchant across pages");
+            }
+            seen.push_back(m.id);
+        }
+        match page.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    assert_eq!(seen.len(), 7);
+}
+
+#[test]
+fn test_ranked_discovery_cost_stays_within_thresholds() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+    f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Ranked Cost Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("tech"),
+            image_url: String::from_str(&f.env, "url"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 1,
+        },
+    );
+    let _ = f.client.get_ranked_merchants(&None, &20);
+    assert_discovery_cost_within_thresholds(&f.env);
+}
