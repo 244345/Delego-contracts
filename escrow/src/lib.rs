@@ -13,8 +13,21 @@
 //! order id. Contract-wide events that have no single escrow to route by
 //! (`upgraded`, `paused`, `feedist`, `pl_fund`, `pl_wdrw`, and the `admin`
 //! transfer events) keep the two-topic `(escrow|admin, <action>)` form.
-//! The quorum timeout extension uses `tmo_qext` to distinguish it from the
-//! keeper bounty timeout extension (`tmo_ext`).
+//!
+//! # Topic index
+//!
+//! | Topic 1 | Topic 2 | Topic 3 | Event payload |
+//! |---------|---------|---------|---------------|
+//! | `escrow` | `upg_prop` | — | `ContractUpgradeProposedEvent` |
+//! | `escrow` | `upg_appr` | — | `ContractUpgradeApprovedEvent` |
+//! | `escrow` | `upg_cncl` | — | `ContractUpgradeCancelledEvent` |
+//! | `escrow` | `upgraded` | — | `ContractUpgradedEvent` |
+//! | `escrow` | `vote` | `u64` escrow_id | `DisputeVotedEvent` |
+//! | `escrow` | `resolved` | `u64` escrow_id | `EscrowResolvedEvent` |
+//! | `escrow` | `tmo_ext` | `u64` escrow_id | `TimeoutExtendedEvent` / `EscrowTimeoutExtendedEvent` |
+//! | `escrow` | `bounty` | `u64` escrow_id | `KeeperBountyPaidEvent` |
+//! | `escrow` | `fee_sched` | — | `ConfigChangeScheduledEvent` |
+//! | `escrow` | `dispsplit` | `u64` escrow_id | `DisputeResolvedEvent` |
 
 // Contract crates compile as no_std for release and wasm builds, but keep std
 // enabled during testing so dev-dependencies and test assertions operate normally.

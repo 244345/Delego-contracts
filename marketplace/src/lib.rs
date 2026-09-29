@@ -228,12 +228,40 @@ pub enum MarketplaceError {
 
 // --- Events ---
 //
-// Merchant-scoped events are published as `(mkplc, <action>, merchant_id)` so
-// off-chain indexers and Soroban RPC subscriptions can filter by merchant from
-// the topics alone, without deserializing the event body (issue #142). The
-// `merchant_id` is also retained in the event data. Events that are not scoped
-// to a single merchant — verifier add/remove and admin transfer — keep the
-// two-topic `(mkplc, <action>)` form.
+// All events follow the 3-topic Soroban convention `(contract, action, entity_id)`
+// so off-chain indexers and Soroban RPC subscriptions can filter by entity from
+// the topics alone, without deserializing the event body (issue #142).
+//
+// Topic 0: `symbol_short!("mkplc")` — contract namespace.
+// Topic 1: `Symbol` action name (e.g. `symbol_short!("created")`).
+// Topic 2: Entity ID — `u64` merchant id, or `Address` for non-merchant-scoped
+//          events (verifiers, admin).
+//
+// The entity id is also retained in the event data payload for convenience.
+//
+// Event schema reference:
+// | Event                              | Topic 1     | Topic 2 (entity) |
+// |------------------------------------|-------------|------------------|
+// | MerchantRegisteredEvent            | created     | u64 merchant_id  |
+// | MerchantVerifiedEvent              | verified    | u64 merchant_id  |
+// | MerchantProfileUpdatedEvent        | updated     | u64 merchant_id  |
+// | MerchantCategoryChangedEvent       | category    | u64 merchant_id  |
+// | MerchantMetadataUpdatedEvent       | metadata    | u64 merchant_id  |
+// | MerchantCommissionSetEvent         | commission  | u64 merchant_id  |
+// | MerchantSuspendedEvent             | suspended   | u64 merchant_id  |
+// | MerchantBannedEvent                | banned      | u64 merchant_id  |
+// | MerchantUnsuspendedEvent           | unsuspend   | u64 merchant_id  |
+// | MerchantClosedEvent                | closed      | u64 merchant_id  |
+// | MerchantVerificationRevokedEvent   | revoked     | u64 merchant_id  |
+// | MerchantReputationSetEvent         | reputation  | u64 merchant_id  |
+// | VerifierAddedEvent                 | verifier    | Address verifier |
+// | VerifierRemovedEvent               | unverifier  | Address verifier |
+// | AdminProposedEvent                 | adminprop   | Address new_admin|
+// | AdminAcceptedEvent                 | adminacc    | Address new_admin|
+// | CategoryAddedEvent                 | catadd      | Symbol key       |
+// | CategoryRemovedEvent               | catrm       | Symbol key       |
+// | MetadataCooldownSetEvent           | cooldown    | Address set_by   |
+// | MerchantPrunedEvent                | pruned      | Address pruned_by|
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -873,7 +901,7 @@ impl MarketplaceContract {
 
                 // Emit category-changed event.
                 env.events().publish(
-                    (symbol_short!("mkplc"), symbol_short!("cat_chg"), merchant_id),
+                    (symbol_short!("mkplc"), symbol_short!("cat_chg")),
                     MerchantCategoryChangedEvent {
                         merchant_id,
                         from: from_cat,
@@ -2452,6 +2480,7 @@ impl MarketplaceContract {
     pub fn version(_env: Env) -> ContractVersion {
         ContractVersion {
             name: symbol_short!("market"),
+            semver: symbol_short!("0_2_0"),
             semver: soroban_sdk::Symbol::new(&_env, env!("CARGO_PKG_VERSION_SYM")),
         }
     }

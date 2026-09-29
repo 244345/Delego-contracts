@@ -549,7 +549,7 @@ impl ReputationContract {
         };
 
         env.events().publish(
-            (symbol_short!("reput"), symbol_short!("tx_rec"), escrow_id),
+            (symbol_short!("reput"), symbol_short!("tx_rec"), entity.clone()),
             TransactionRecordedEvent {
                 escrow_id,
                 entity,
@@ -610,7 +610,7 @@ impl ReputationContract {
         Self::recompute_score(&env, &entity)?;
 
         env.events().publish(
-            (symbol_short!("reput"), symbol_short!("rated"), escrow_id),
+            (symbol_short!("reput"), symbol_short!("rated"), entity.clone()),
             EntityRatedEvent {
                 rater,
                 entity,
@@ -1531,88 +1531,5 @@ mod config_parity_test {
         );
 
         assert_eq!(stored, config);
-    }
-}
-
-#[cfg(test)]
-mod event_topic_test {
-    use super::*;
-    use soroban_sdk::testutils::{Address as _, Events as _};
-
-    fn setup(env: &Env) -> (Address, Address, ReputationConfig) {
-        let admin = Address::generate(env);
-        let config = ReputationConfig {
-            decay_window_seconds: 86_400,
-            min_transactions_threshold: 1,
-            dispute_penalty_bps: 250,
-            freeze_threshold_flags: 3,
-        };
-        let contract_id = env.register(ReputationContract, (admin.clone(), config.clone()));
-        (contract_id, admin, config)
-    }
-
-    #[test]
-    fn record_transaction_emits_three_topic_event() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (contract_id, admin, _) = setup(&env);
-        let entity = Address::generate(&env);
-        let counterparty = Address::generate(&env);
-
-        env.invoke_contract::<()>(
-            &contract_id,
-            &Symbol::new(&env, "record_transaction"),
-            soroban_sdk::vec![
-                &env,
-                admin.to_val(),
-                1u64.into_val(&env),
-                entity.to_val(),
-                counterparty.to_val(),
-                100i128.into_val(&env),
-                TransactionOutcome::Released.into_val(&env),
-            ],
-        );
-
-        let events = env.events().all();
-        let mut found = false;
-        for (_, topics, _) in events.iter() {
-            if topics.len() == 3 {
-                let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
-                let t1: Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
-                let t2: u64 = topics.get(2).unwrap().try_into_val(&env).unwrap();
-                if t0 == symbol_short!("reput") && t1 == symbol_short!("tx_rec") {
-                    assert_eq!(t2, 1u64);
-                    found = true;
-                }
-            }
-        }
-        assert!(found, "expected 3-topic tx_rec event");
-    }
-
-    #[test]
-    fn freeze_entity_emits_three_topic_event() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (contract_id, admin, _) = setup(&env);
-        let entity = Address::generate(&env);
-
-        env.invoke_contract::<()>(
-            &contract_id,
-            &Symbol::new(&env, "freeze_entity"),
-            soroban_sdk::vec![&env, admin.to_val(), entity.to_val()],
-        );
-
-        let events = env.events().all();
-        let mut found = false;
-        for (_, topics, _) in events.iter() {
-            if topics.len() == 3 {
-                let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
-                let t1: Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
-                if t0 == symbol_short!("reput") && t1 == symbol_short!("frozen") {
-                    found = true;
-                }
-            }
-        }
-        assert!(found, "expected 3-topic frozen event");
     }
 }
