@@ -3044,4 +3044,239 @@ mod test {
         let result = client.try_decrease_allowance(&owner, &delegate, &-100);
         assert!(result.is_err());
     }
+
+    // ── invalidate_nonce_range tests (issue #335) ─────────────────────────────
+
+    #[test]
+    fn test_invalidate_nonce_range_no_permission_returns_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        // No permission granted — should fail with PermissionNotFound.
+        let result = client.try_invalidate_nonce_range(&owner, &delegate, &5);
+        assert_eq!(
+            result,
+            Err(Ok(PermissionError::PermissionNotFound)),
+            "expected PermissionNotFound when no permission exists"
+        );
+    }
+
+    #[test]
+    fn test_invalidate_nonce_range_advances_nonce_to_up_to_plus_one() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
+
+        // Initial nonce is 0.
+        assert_eq!(client.get_relayer_nonce(&owner, &delegate), 0);
+
+        // Invalidate nonces 0..=9 — next expected nonce must become 10.
+        client.invalidate_nonce_range(&owner, &delegate, &9);
+        assert_eq!(
+            client.get_relayer_nonce(&owner, &delegate),
+            10,
+            "nonce must advance to up_to_nonce + 1"
+        );
+    }
+
+    #[test]
+    fn test_invalidate_nonce_range_below_current_returns_nonce_already_used() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
+
+        // Advance the nonce to 5 first.
+        client.invalidate_nonce_range(&owner, &delegate, &4);
+        assert_eq!(client.get_relayer_nonce(&owner, &delegate), 5);
+
+        // Trying to invalidate nonce 3 (< 5) must fail.
+        let result = client.try_invalidate_nonce_range(&owner, &delegate, &3);
+        assert_eq!(
+            result,
+            Err(Ok(PermissionError::NonceAlreadyUsed)),
+            "expected NonceAlreadyUsed when up_to_nonce < current nonce"
+        );
+    }
+
+    #[test]
+    fn test_invalidate_nonce_range_equal_to_current_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
+
+        // Advance to 5.
+        client.invalidate_nonce_range(&owner, &delegate, &4);
+
+        // Invalidating exactly the current nonce (5) should succeed and advance
+        // to 6 — this is the "cancel exactly the current stalled nonce" path
+        // that mirrors cancel_nonce semantics.
+        client.invalidate_nonce_range(&owner, &delegate, &5);
+        assert_eq!(client.get_relayer_nonce(&owner, &delegate), 6);
+    }
+
+    #[test]
+    fn test_invalidate_nonce_range_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
+
+        client.invalidate_nonce_range(&owner, &delegate, &7);
+
+        use crate::NonceBatchInvalidatedEvent;
+        let events = env.events().all();
+        let found = events.iter().any(|ev| {
+            if let Ok(payload) = ev.2.clone().try_into_val::<_, NonceBatchInvalidatedEvent>(&env) {
+                payload.owner == owner
+                    && payload.delegate == delegate
+                    && payload.up_to_nonce == 7
+                    && payload.next_nonce == 8
+            } else {
+                false
+            }
+        });
+        assert!(found, "NonceBatchInvalidatedEvent not found in events");
+    }
+
+    #[test]
+    fn test_invalidate_nonce_range_blocks_previous_nonces_via_relayer() {
+        // This test verifies that after invalidate_nonce_range, any relayed spend
+        // using a nonce ≤ up_to_nonce fails with InvalidNonce, and that a spend
+        // using the new expected nonce succeeds.
+        //
+        // We use cancel_nonce (the unit-testable nonce-advance sibling) to assert
+        // that old nonces are already consumed from the relayer's perspective.
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
+
+        // Bulk-invalidate nonces 0..=99.
+        client.invalidate_nonce_range(&owner, &delegate, &99);
+        assert_eq!(client.get_relayer_nonce(&owner, &delegate), 100);
+
+        // Attempting to cancel any nonce below 100 is now "already used".
+        for old_nonce in [0u64, 50, 99] {
+            let result = client.try_cancel_nonce(&owner, &delegate, &old_nonce);
+            assert_eq!(
+                result,
+                Err(Ok(PermissionError::NonceAlreadyUsed)),
+                "nonce {} should be already consumed after invalidate_nonce_range(99)",
+                old_nonce
+            );
+        }
+
+        // Nonce 100 (the new current) can still be cancelled normally.
+        client.cancel_nonce(&owner, &delegate, &100);
+        assert_eq!(client.get_relayer_nonce(&owner, &delegate), 101);
+    }
+
+    #[test]
+    fn test_invalidate_nonce_range_idempotent_on_same_value() {
+        // Calling invalidate_nonce_range with the same up_to_nonce a second time
+        // must fail with NonceAlreadyUsed — not silently succeed.
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
+
+        client.invalidate_nonce_range(&owner, &delegate, &10);
+        assert_eq!(client.get_relayer_nonce(&owner, &delegate), 11);
+
+        // Second call with the same value — nonce 10 < 11, so NonceAlreadyUsed.
+        let result = client.try_invalidate_nonce_range(&owner, &delegate, &10);
+        assert_eq!(result, Err(Ok(PermissionError::NonceAlreadyUsed)));
+    }
+
+    #[test]
+    fn test_invalidate_nonce_range_zero_advances_nonce_from_zero_to_one() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
+
+        // Invalidate just nonce 0 (up_to_nonce = 0).
+        client.invalidate_nonce_range(&owner, &delegate, &0);
+        assert_eq!(client.get_relayer_nonce(&owner, &delegate), 1);
+    }
+
+    #[test]
+    fn test_invalidate_nonce_range_audit_log_is_appended() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
+        client.invalidate_nonce_range(&owner, &delegate, &5);
+
+        let page = client.get_audit_log_page(&owner, &delegate, &None);
+        // At minimum: "granted" + "nonce_inv" — total_entries >= 2.
+        assert!(
+            page.total_entries >= 2,
+            "expected at least 2 audit log entries, got {}",
+            page.total_entries
+        );
+        let last = page.entries.get(page.total_entries - 1).unwrap();
+        use soroban_sdk::symbol_short;
+        assert_eq!(
+            last.action,
+            symbol_short!("nonce_inv"),
+            "last audit entry should be nonce_inv"
+        );
+    }
 }

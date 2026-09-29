@@ -45,6 +45,8 @@ will reject the change.
 
 ### Unreleased
 
+- Add `invalidate_nonce_range` entrypoint to bulk-invalidate all relayer nonces up to and including a given nonce for a compromised agent key recovery flow (issue #335). Owner-authorized; emits `NonceBatchInvalidatedEvent` and writes an audit log entry.
+
 ### 0.1.0 - 2026-08-29
 
 - Initial tracked release for this contract. On-chain `version()` returns `0.1.0`
