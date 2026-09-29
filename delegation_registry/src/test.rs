@@ -213,7 +213,9 @@ fn test_rollback_rejects_stale_permissions_pointer() {
     record.permissions_contract = rotated_permissions.clone();
 
     env.as_contract(&client.address, || {
-        env.storage().persistent().set(&DataKey::Delegation(id), &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Delegation(id), &record);
     });
 
     let result = client.try_rollback_delegation(&id, &1u32);
@@ -1051,8 +1053,7 @@ fn test_get_active_delegations_excludes_unswept_ledger_expiry() {
     let label = Symbol::new(&env, "Active_Stale");
     // Expires at ledger 150 but is never swept, so its stored status stays Active.
     client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &50);
-    let live_id =
-        client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    let live_id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
 
     env.ledger().set_sequence_number(200);
 
@@ -1112,7 +1113,10 @@ fn test_resume_expired_emits_no_expired_event() {
             && Symbol::try_from_val(&env, &t.get(0).unwrap()).ok() == Some(symbol_short!("deleg"))
             && Symbol::try_from_val(&env, &t.get(1).unwrap()).ok() == Some(symbol_short!("expired"))
     });
-    assert!(!emitted_expired, "failed resume must not emit a deleg/expired event");
+    assert!(
+        !emitted_expired,
+        "failed resume must not emit a deleg/expired event"
+    );
 }
 
 #[test]
@@ -1222,11 +1226,17 @@ fn test_admin_transfer_emits_propose_and_transfer_events() {
     let (env, client, _, _, _, _) = setup();
     env.mock_all_auths();
 
-    let has_topic = |events: &soroban_sdk::Vec<(Address, soroban_sdk::Vec<soroban_sdk::Val>, soroban_sdk::Val)>, wanted: Symbol| {
+    let has_topic = |events: &soroban_sdk::Vec<(
+        Address,
+        soroban_sdk::Vec<soroban_sdk::Val>,
+        soroban_sdk::Val,
+    )>,
+                     wanted: Symbol| {
         events.iter().any(|(_, topics, _)| {
             let t: soroban_sdk::Vec<soroban_sdk::Val> = topics;
             t.len() >= 2
-                && Symbol::try_from_val(&env, &t.get(0).unwrap()).ok() == Some(symbol_short!("deleg"))
+                && Symbol::try_from_val(&env, &t.get(0).unwrap()).ok()
+                    == Some(symbol_short!("deleg"))
                 && Symbol::try_from_val(&env, &t.get(1).unwrap()).ok() == Some(wanted.clone())
         })
     };
@@ -1356,4 +1366,617 @@ fn test_admin_revoke_nonexistent_delegation() {
 
     // Should fail with NotFound error
     assert_eq!(result, Err(Ok(DelegationError::NotFound)));
+}
+
+// ── Issue #322: capabilities packed into a single u32 bitmask ────────────────
+
+/// CPU ceiling for a single scoped authorization check. Deliberately generous:
+/// the point of the benchmark below is the *relative* cost, and this guards
+/// against a future change accidentally making the check read extra entries.
+const MAX_SCOPED_CHECK_CPU_INSTRUCTIONS: u64 = 150_000;
+
+/// Packed capabilities must never cost more than this share of the CPU that
+/// four separate boolean slots cost, for a read-modify-write of the same four
+/// capabilities. Packing removes three storage round-trips per delegation.
+const MAX_PACKED_SHARE_OF_UNPACKED_CPU: u64 = 40;
+
+/// The pre-bitmask layout, kept only so the benchmark can state the saving in
+/// bytes. `DelegationRecord` itself is identical apart from the four
+/// booleans the packed mask replaced.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UnpackedScopedRecord {
+    id: u64,
+    owner: Address,
+    agent_id: BytesN<32>,
+    permissions_contract: Address,
+    status: DelegationStatus,
+    label: Symbol,
+    created_at: u64,
+    updated_at: u64,
+    expires_at_ledger: u32,
+    version: u32,
+    can_spend: bool,
+    can_refund: bool,
+    can_dispute: bool,
+    can_delegate: bool,
+}
+
+/// Turns a `DelegationRecord` into the equivalent unpacked record so the two
+/// can be serialized and compared byte for byte.
+fn unpacked_equivalent(record: &DelegationRecord) -> UnpackedScopedRecord {
+    let p = record.permissions;
+    UnpackedScopedRecord {
+        id: record.id,
+        owner: record.owner.clone(),
+        agent_id: record.agent_id.clone(),
+        permissions_contract: record.permissions_contract.clone(),
+        status: record.status.clone(),
+        label: record.label.clone(),
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+        expires_at_ledger: record.expires_at_ledger,
+        version: record.version,
+        can_spend: p.has_flag(PERM_FLAG_SPEND),
+        can_refund: p.has_flag(PERM_FLAG_REFUND),
+        can_dispute: p.has_flag(PERM_FLAG_DISPUTE),
+        can_delegate: p.has_flag(PERM_FLAG_DELEGATE),
+    }
+}
+
+#[test]
+fn test_permission_bitmask_helpers() {
+    assert_eq!(PermissionBitmask::all().bits(), 0b1111);
+    assert_eq!(PermissionBitmask::none().bits(), 0);
+    assert!(PermissionBitmask::none().is_empty());
+    assert!(!PermissionBitmask::all().is_empty());
+
+    // The four documented capability bits occupy the documented positions.
+    assert_eq!(PERM_FLAG_SPEND, 1);
+    assert_eq!(PERM_FLAG_REFUND, 2);
+    assert_eq!(PERM_FLAG_DISPUTE, 4);
+    assert_eq!(PERM_FLAG_DELEGATE, 8);
+    assert_eq!(PERM_ALL_FLAGS, 15);
+
+    // set_flag accumulates, has_flag tests membership, clear_flag subtracts.
+    let mut mask = PermissionBitmask::none();
+    assert!(!mask.has_flag(PERM_FLAG_SPEND));
+
+    mask = mask.set_flag(PERM_FLAG_SPEND);
+    assert!(mask.has_flag(PERM_FLAG_SPEND));
+    assert!(!mask.has_flag(PERM_FLAG_REFUND));
+    assert_eq!(mask.bits(), PERM_FLAG_SPEND);
+
+    mask = mask.set_flag(PERM_FLAG_REFUND | PERM_FLAG_DISPUTE);
+    assert_eq!(mask.bits(), 0b0111);
+    assert!(mask.has_flag(PERM_FLAG_REFUND | PERM_FLAG_DISPUTE));
+
+    // Setting a bit that is already set is a no-op, not an error.
+    assert_eq!(mask.set_flag(PERM_FLAG_SPEND), mask);
+
+    mask = mask.clear_flag(PERM_FLAG_REFUND);
+    assert!(!mask.has_flag(PERM_FLAG_REFUND));
+    assert_eq!(mask.bits(), 0b0101);
+
+    // Clearing a bit that is already clear is a no-op.
+    assert_eq!(mask.clear_flag(PERM_FLAG_REFUND), mask);
+
+    // Clearing an unset bit never disturbs the others.
+    assert_eq!(mask.clear_flag(PERM_FLAG_DELEGATE), mask);
+
+    // A combined mask requires *every* bit to be present.
+    assert!(PermissionBitmask::all().has_flag(PERM_ALL_FLAGS));
+    assert!(!PermissionBitmask::none().has_flag(PERM_ALL_FLAGS));
+    assert!(!PermissionBitmask::none()
+        .set_flag(PERM_FLAG_SPEND)
+        .has_flag(PERM_ALL_FLAGS));
+}
+
+#[test]
+fn test_permission_bitmask_rejects_reserved_flags() {
+    // Zero is rejected: setting it would be a paid no-op.
+    assert!(!PermissionBitmask::is_valid_flag(0));
+    // Each real capability bit is accepted.
+    for flag in [
+        PERM_FLAG_SPEND,
+        PERM_FLAG_REFUND,
+        PERM_FLAG_DISPUTE,
+        PERM_FLAG_DELEGATE,
+    ] {
+        assert!(PermissionBitmask::is_valid_flag(flag));
+    }
+    // Combining real bits is fine.
+    assert!(PermissionBitmask::is_valid_flag(PERM_ALL_FLAGS));
+    // Undefined bits are not.
+    assert!(!PermissionBitmask::is_valid_flag(1 << 4));
+    assert!(!PermissionBitmask::is_valid_flag(u32::MAX));
+    assert!(!PermissionBitmask::is_valid_flag(u32::MAX << 1));
+}
+
+#[test]
+fn test_create_delegation_grants_all_capabilities() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "All_Flags");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    // Backwards compatibility: the pre-existing entry point keeps granting the
+    // delegate everything, so no existing integration silently loses authority.
+    let permissions = client.get_permissions(&id);
+    assert_eq!(permissions, PermissionBitmask::all());
+
+    for flag in [
+        PERM_FLAG_SPEND,
+        PERM_FLAG_REFUND,
+        PERM_FLAG_DISPUTE,
+        PERM_FLAG_DELEGATE,
+    ] {
+        assert!(client.is_authorized_for(&id, &agent_id, &flag));
+    }
+}
+
+#[test]
+fn test_create_scoped_delegation_stores_only_requested_capabilities() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Spend_Only");
+    let scope = PermissionBitmask::none().set_flag(PERM_FLAG_SPEND);
+    let id = client.create_scoped_delegation(
+        &owner,
+        &agent_id,
+        &permissions_contract,
+        &label,
+        &1000,
+        &scope,
+    );
+
+    // One u32 on the record, not four booleans.
+    assert_eq!(client.get_permissions(&id), scope);
+    assert_eq!(client.get_delegation(&id).permissions, scope);
+
+    assert!(client.is_authorized_for(&id, &agent_id, &PERM_FLAG_SPEND));
+    for flag in [PERM_FLAG_REFUND, PERM_FLAG_DISPUTE, PERM_FLAG_DELEGATE] {
+        assert!(!client.is_authorized_for(&id, &agent_id, &flag));
+        assert!(!client.has_permission(&id, &flag));
+    }
+
+    // A delegation with no capabilities at all is representable and grants none.
+    let empty = client.create_scoped_delegation(
+        &owner,
+        &agent_id,
+        &permissions_contract,
+        &label,
+        &1000,
+        &PermissionBitmask::none(),
+    );
+    assert!(client.get_permissions(&empty).is_empty());
+    assert!(!client.is_authorized_for(&empty, &agent_id, &PERM_FLAG_SPEND));
+}
+
+#[test]
+fn test_create_scoped_delegation_rejects_reserved_bits() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Bad_Flags");
+    let bogus = PermissionBitmask(PERM_FLAG_SPEND | (1 << 9));
+
+    let result = client.try_create_scoped_delegation(
+        &owner,
+        &agent_id,
+        &permissions_contract,
+        &label,
+        &1000,
+        &bogus,
+    );
+    assert_eq!(result, Err(Ok(DelegationError::InvalidPermissionFlag)));
+
+    // Nothing was persisted for the refused grant.
+    assert_eq!(client.get_delegations_by_owner(&owner).len(), 0);
+}
+
+#[test]
+fn test_is_authorized_for_fails_closed() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(100);
+
+    let label = Symbol::new(&env, "Fail_Closed");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+
+    // Unknown delegation.
+    assert!(!client.is_authorized_for(&9999, &agent_id, &PERM_FLAG_SPEND));
+    // Unknown agent.
+    let stranger = BytesN::from_array(&env, &[9; 32]);
+    assert!(!client.is_authorized_for(&id, &stranger, &PERM_FLAG_SPEND));
+    // Reserved / empty flag is refused rather than treated as "allowed".
+    assert!(!client.is_authorized_for(&id, &agent_id, &0u32));
+    assert!(!client.is_authorized_for(&id, &agent_id, &(1u32 << 20)));
+    // Paused.
+    client.pause_delegation(&id);
+    assert!(!client.is_authorized_for(&id, &agent_id, &PERM_FLAG_SPEND));
+    client.resume_delegation(&id);
+    // Expired.
+    env.ledger().set_sequence_number(200);
+    assert!(!client.is_authorized_for(&id, &agent_id, &PERM_FLAG_SPEND));
+}
+
+#[test]
+fn test_set_and_clear_permission_flag() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Scope_Edit");
+    let id = client.create_scoped_delegation(
+        &owner,
+        &agent_id,
+        &permissions_contract,
+        &label,
+        &1000,
+        &PermissionBitmask::none().set_flag(PERM_FLAG_SPEND),
+    );
+
+    assert!(!client.is_authorized_for(&id, &agent_id, &PERM_FLAG_DELEGATE));
+
+    assert!(client.set_permission_flag(&id, &PERM_FLAG_DELEGATE));
+    assert_eq!(
+        client.get_permissions(&id),
+        PermissionBitmask::none()
+            .set_flag(PERM_FLAG_SPEND)
+            .set_flag(PERM_FLAG_DELEGATE)
+    );
+    // Widening one flag leaves the others untouched.
+    assert!(client.is_authorized_for(&id, &agent_id, &PERM_FLAG_SPEND));
+    assert!(client.is_authorized_for(&id, &agent_id, &PERM_FLAG_DELEGATE));
+    assert!(!client.is_authorized_for(&id, &agent_id, &PERM_FLAG_REFUND));
+
+    // A scope change is an auditable mutation: version and history advance.
+    assert_eq!(client.get_delegation_version(&id), 2);
+    let history = client.get_delegation_history(&id);
+    assert_eq!(history.len(), 2);
+    assert!(!history
+        .get(0)
+        .unwrap()
+        .record
+        .permissions
+        .has_flag(PERM_FLAG_DELEGATE));
+    assert!(history
+        .get(1)
+        .unwrap()
+        .record
+        .permissions
+        .has_flag(PERM_FLAG_DELEGATE));
+
+    assert!(client.clear_permission_flag(&id, &PERM_FLAG_DELEGATE));
+    assert!(!client.is_authorized_for(&id, &agent_id, &PERM_FLAG_DELEGATE));
+    // Narrowing one flag leaves the others untouched.
+    assert!(client.is_authorized_for(&id, &agent_id, &PERM_FLAG_SPEND));
+    assert_eq!(client.get_delegation_version(&id), 3);
+}
+
+#[test]
+fn test_permission_flag_changes_are_idempotent() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Idempotent_Scope");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    // Already set by create_delegation: no write, no version bump.
+    assert!(!client.set_permission_flag(&id, &PERM_FLAG_SPEND));
+    assert_eq!(client.get_delegation_version(&id), 1);
+    assert_eq!(client.get_delegation_history(&id).len(), 1);
+
+    assert!(client.clear_permission_flag(&id, &PERM_FLAG_SPEND));
+    assert_eq!(client.get_delegation_version(&id), 2);
+    // Already clear: again a no-op.
+    assert!(!client.clear_permission_flag(&id, &PERM_FLAG_SPEND));
+    assert_eq!(client.get_delegation_version(&id), 2);
+    assert_eq!(client.get_delegation_history(&id).len(), 2);
+}
+
+#[test]
+fn test_permission_flag_changes_require_owner_auth() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "No_Auth");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    // Drop the recorded authorizations: a scope change is an owner decision, so
+    // without the owner's signature neither widening nor narrowing may proceed.
+    env.set_auths(&[]);
+
+    assert!(client
+        .try_set_permission_flag(&id, &PERM_FLAG_REFUND)
+        .is_err());
+    assert!(client
+        .try_clear_permission_flag(&id, &PERM_FLAG_REFUND)
+        .is_err());
+    assert_eq!(client.get_permissions(&id), PermissionBitmask::all());
+    assert_eq!(client.get_delegation_version(&id), 1);
+}
+
+#[test]
+fn test_permission_flag_mutation_rejects_invalid_flag() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Bad_Flag_Mutation");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    for bad in [0u32, 1 << 4, u32::MAX] {
+        assert_eq!(
+            client.try_set_permission_flag(&id, &bad),
+            Err(Ok(DelegationError::InvalidPermissionFlag))
+        );
+        assert_eq!(
+            client.try_clear_permission_flag(&id, &bad),
+            Err(Ok(DelegationError::InvalidPermissionFlag))
+        );
+        assert_eq!(
+            client.try_has_permission(&id, &bad),
+            Err(Ok(DelegationError::InvalidPermissionFlag))
+        );
+    }
+
+    // Rejected writes leave both the mask and the version untouched.
+    assert_eq!(client.get_permissions(&id), PermissionBitmask::all());
+    assert_eq!(client.get_delegation_version(&id), 1);
+}
+
+#[test]
+fn test_permission_flag_mutation_on_missing_delegation() {
+    let (env, client, _, _, _, _) = setup();
+    env.mock_all_auths();
+
+    assert_eq!(
+        client.try_set_permission_flag(&9999, &PERM_FLAG_SPEND),
+        Err(Ok(DelegationError::NotFound))
+    );
+    assert_eq!(
+        client.try_clear_permission_flag(&9999, &PERM_FLAG_SPEND),
+        Err(Ok(DelegationError::NotFound))
+    );
+    assert_eq!(
+        client.try_get_permissions(&9999),
+        Err(Ok(DelegationError::NotFound))
+    );
+    assert_eq!(
+        client.try_has_permission(&9999, &PERM_FLAG_SPEND),
+        Err(Ok(DelegationError::NotFound))
+    );
+}
+
+#[test]
+fn test_has_permission_reports_scope_regardless_of_status() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Scope_Only");
+    let id = client.create_scoped_delegation(
+        &owner,
+        &agent_id,
+        &permissions_contract,
+        &label,
+        &1000,
+        &PermissionBitmask::none().set_flag(PERM_FLAG_DISPUTE),
+    );
+
+    assert!(client.has_permission(&id, &PERM_FLAG_DISPUTE));
+
+    // Revoking the delegation stops authorization but does not erase history:
+    // scope inspection still reports what the grant covered.
+    client.revoke_delegation(&id);
+    assert!(!client.is_authorized_for(&id, &agent_id, &PERM_FLAG_DISPUTE));
+    assert!(client.has_permission(&id, &PERM_FLAG_DISPUTE));
+    assert!(!client.has_permission(&id, &PERM_FLAG_SPEND));
+}
+
+#[test]
+fn test_rollback_restores_previous_capabilities() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Scope_Rollback");
+    let id = client.create_scoped_delegation(
+        &owner,
+        &agent_id,
+        &permissions_contract,
+        &label,
+        &1000,
+        &PermissionBitmask::none().set_flag(PERM_FLAG_SPEND),
+    );
+
+    client.set_permission_flag(&id, &PERM_FLAG_REFUND);
+    assert!(client.is_authorized_for(&id, &agent_id, &PERM_FLAG_REFUND));
+
+    // Rolling back to version 1 must also roll back the capability grant, so a
+    // scope change cannot be used to escape the history it is recorded in.
+    client.rollback_delegation(&id, &1);
+    assert_eq!(
+        client.get_permissions(&id),
+        PermissionBitmask::none().set_flag(PERM_FLAG_SPEND)
+    );
+    assert!(!client.is_authorized_for(&id, &agent_id, &PERM_FLAG_REFUND));
+    assert!(client.is_authorized_for(&id, &agent_id, &PERM_FLAG_SPEND));
+}
+
+#[test]
+fn test_permission_flags_changed_event_emitted() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Scope_Evt");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    client.clear_permission_flag(&id, &PERM_FLAG_DISPUTE);
+
+    let events = env.events().all();
+    let found = events.iter().any(|(_, topics, _)| {
+        let t: soroban_sdk::Vec<soroban_sdk::Val> = topics;
+        t.len() >= 2
+            && Symbol::try_from_val(&env, &t.get(0).unwrap()).ok() == Some(symbol_short!("deleg"))
+            && Symbol::try_from_val(&env, &t.get(1).unwrap()).ok()
+                == Some(symbol_short!("perm_chg"))
+    });
+    assert!(found, "PermissionFlagsChanged event not emitted");
+}
+
+#[test]
+fn test_capability_mask_survives_lifecycle_transitions() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Scope_Lifecycle");
+    let scope = PermissionBitmask::none()
+        .set_flag(PERM_FLAG_SPEND)
+        .set_flag(PERM_FLAG_REFUND);
+    let id = client.create_scoped_delegation(
+        &owner,
+        &agent_id,
+        &permissions_contract,
+        &label,
+        &1000,
+        &scope,
+    );
+
+    // Pause / resume only flip status; they must not silently widen or narrow
+    // the capability set.
+    client.pause_delegation(&id);
+    assert_eq!(client.get_permissions(&id), scope);
+    client.resume_delegation(&id);
+    assert_eq!(client.get_permissions(&id), scope);
+
+    // Neither must expiry sweeping.
+    env.ledger().set_sequence_number(1_000);
+    let mut ids = Vec::new(&env);
+    ids.push_back(id);
+    client.sweep_expired(&ids);
+    assert_eq!(client.get_permissions(&id), scope);
+    assert_eq!(client.get_delegation(&id).status, DelegationStatus::Expired);
+    assert!(!client.is_authorized_for(&id, &agent_id, &PERM_FLAG_SPEND));
+}
+
+// ── Issue #322 benchmarks ───────────────────────────────────────────────────
+
+#[test]
+fn test_benchmark_delegation_entry_is_smaller_with_packed_flags() {
+    use soroban_sdk::xdr::ToXdr;
+
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Bench_Size");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    let record = client.get_delegation(&id);
+
+    let packed_bytes = record.clone().to_xdr(&env).len();
+    let unpacked_bytes = unpacked_equivalent(&record).to_xdr(&env).len();
+
+    assert!(
+        packed_bytes < unpacked_bytes,
+        "packed record ({packed_bytes}B) must beat unpacked ({unpacked_bytes}B)"
+    );
+
+    // The flag block is the only difference between the two encodings, so the
+    // saving is bounded above by the four booleans it replaced and is worth
+    // double digits on the entry as a whole.
+    let saving = unpacked_bytes - packed_bytes;
+    println!(
+        "[#322] delegation entry: {packed_bytes}B packed vs {unpacked_bytes}B unpacked \
+         ({saving}B saved, {:.1}%)",
+        saving as f64 / unpacked_bytes as f64 * 100.0
+    );
+    assert!(
+        saving >= 48,
+        "packing saved only {saving}B of a {unpacked_bytes}B entry, less than the \
+         48B the four encoded booleans cannot compress below"
+    );
+    assert!(
+        saving * 100 >= unpacked_bytes * 10,
+        "packing saved {saving}B of a {unpacked_bytes}B entry, under the 10% target"
+    );
+}
+
+#[test]
+fn test_benchmark_packed_flags_beat_separate_slots() {
+    let (env, client, _, _, _, _) = setup();
+    env.mock_all_auths();
+    let contract_id = &client.address;
+
+    // Baseline: the pre-bitmask layout, one boolean per storage slot, written
+    // then read back — the exact access pattern `set`/`clear` of four
+    // capabilities would have had.
+    env.as_contract(contract_id, || {
+        for index in 0..4u32 {
+            let key = DataKey::Delegation(u64::from(index));
+            env.storage().persistent().set(&key, &true);
+        }
+        for index in 0..4u32 {
+            let key = DataKey::Delegation(u64::from(index));
+            let _: bool = env.storage().persistent().get(&key).unwrap();
+        }
+    });
+    let unpacked_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+
+    // Packed: one word, one slot, one round-trip.
+    env.as_contract(contract_id, || {
+        let key = DataKey::Delegation(4);
+        env.storage()
+            .persistent()
+            .set(&key, &PermissionBitmask::all());
+        let mask: PermissionBitmask = env.storage().persistent().get(&key).unwrap();
+        assert!(mask.has_flag(PERM_FLAG_SPEND));
+    });
+    let packed_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+
+    println!(
+        "[#322] flag read+write: {unpacked_cpu} CPU insns in four slots vs \
+         {packed_cpu} packed ({:.1}% saved)",
+        (1.0 - packed_cpu as f64 / unpacked_cpu as f64) * 100.0
+    );
+    assert!(
+        packed_cpu * 100 <= unpacked_cpu * MAX_PACKED_SHARE_OF_UNPACKED_CPU,
+        "packing four capabilities into one u32 used {packed_cpu} CPU instructions \
+         vs {unpacked_cpu} for four separate slots, which is more than the \
+         {MAX_PACKED_SHARE_OF_UNPACKED_CPU}% budget"
+    );
+}
+
+#[test]
+fn test_benchmark_scoped_check_stays_within_cpu_budget() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Bench_Check");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    // Measure the identity check on its own first, so the scoped check can be
+    // compared against it rather than against a hard-coded number.
+    assert!(client.is_authorized(&id, &agent_id));
+    let identity_check_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+
+    assert!(client.is_authorized_for(&id, &agent_id, &PERM_FLAG_SPEND));
+    let scoped_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+
+    assert!(
+        scoped_cpu <= MAX_SCOPED_CHECK_CPU_INSTRUCTIONS,
+        "scoped authorization check used {scoped_cpu} CPU instructions, over the \
+         {MAX_SCOPED_CHECK_CPU_INSTRUCTIONS} budget"
+    );
+
+    // The added scope test is one bitwise `and` on an already-loaded record: it
+    // must not cost anything close to another storage read.
+    let scope_overhead = scoped_cpu.saturating_sub(identity_check_cpu);
+    println!(
+        "[#322] permission check: {identity_check_cpu} CPU insns for `is_authorized`, \
+         {scoped_cpu} for `is_authorized_for` (+{scope_overhead} for the scope test)"
+    );
+    assert!(
+        scope_overhead * 10 <= identity_check_cpu,
+        "scope test cost {scope_overhead} CPU instructions on top of a \
+         {identity_check_cpu}-instruction check, which is more than the 10% budget"
+    );
 }

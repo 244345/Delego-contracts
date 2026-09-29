@@ -36,6 +36,87 @@ pub enum DelegationStatus {
     Expired,
 }
 
+/// Capability bit: the delegate may move funds through the permissions contract.
+pub const PERM_FLAG_SPEND: u32 = 1 << 0;
+/// Capability bit: the delegate may claim refunds.
+pub const PERM_FLAG_REFUND: u32 = 1 << 1;
+/// Capability bit: the delegate may open/participate in disputes.
+pub const PERM_FLAG_DISPUTE: u32 = 1 << 2;
+/// Capability bit: the delegate may re-delegate its authority onwards.
+pub const PERM_FLAG_DELEGATE: u32 = 1 << 3;
+
+/// Every capability bit this contract defines. Bits outside this mask are
+/// reserved and rejected by the mutating entry points.
+pub const PERM_ALL_FLAGS: u32 =
+    PERM_FLAG_SPEND | PERM_FLAG_REFUND | PERM_FLAG_DISPUTE | PERM_FLAG_DELEGATE;
+
+/// A delegation's capability set packed into a single `u32` bitmask (issue #322).
+///
+/// The four capabilities a delegation can carry — spend, refund, dispute and
+/// delegate — used to be modelled as four independent booleans. Each boolean
+/// carries its own type discriminant and length prefix in the XDR encoding of
+/// a [`DelegationRecord`], so a delegation paid for four times the flag
+/// overhead it needed. Packing them into one `u32` replaces four encoded
+/// fields with a single one and turns a permission check into one load plus a
+/// bitwise test instead of four loads and four branches.
+///
+/// Bits are additive: setting a bit never clears another, and unknown bits
+/// (outside [`PERM_ALL_FLAGS`]) are rejected so future capabilities can be
+/// added without silently widening an existing delegation's scope.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub struct PermissionBitmask(pub u32);
+
+impl PermissionBitmask {
+    /// A bitmask with every currently defined capability enabled.
+    pub const fn all() -> Self {
+        Self(PERM_ALL_FLAGS)
+    }
+
+    /// A bitmask with no capability enabled.
+    pub const fn none() -> Self {
+        Self(0)
+    }
+
+    /// Returns the raw bit pattern.
+    pub const fn bits(&self) -> u32 {
+        self.0
+    }
+
+    /// Returns `true` when every capability in `flags` is set.
+    ///
+    /// `flags` may combine several bits; all of them must be present.
+    pub const fn has_flag(&self, flags: u32) -> bool {
+        self.0 & flags == flags
+    }
+
+    /// Returns `self` with every capability in `flags` set.
+    pub const fn set_flag(&self, flags: u32) -> Self {
+        Self(self.0 | flags)
+    }
+
+    /// Returns `self` with every capability in `flags` cleared.
+    pub const fn clear_flag(&self, flags: u32) -> Self {
+        Self(self.0 & !flags)
+    }
+
+    /// Returns `true` when no capability is set.
+    pub const fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+
+    /// Returns `true` when `flag` is a non-zero combination of known
+    /// capability bits.
+    ///
+    /// Guards the mutating entry points against a zero mask (a no-op write that
+    /// still costs a storage bump) and against reserved bits that this contract
+    /// does not define.
+    pub const fn is_valid_flag(flag: u32) -> bool {
+        flag != 0 && flag & PERM_ALL_FLAGS == flag
+    }
+}
+
 /// A record representing a single delegation.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,11 +135,14 @@ pub struct DelegationRecord {
     pub label: Symbol,
     /// Ledger timestamp when the delegation was created.
     pub created_at: u64,
+    /// Ledger timestamp of the last mutation to this delegation.
     pub updated_at: u64,
     /// Ledger sequence at which the delegation expires.
     pub expires_at_ledger: u32,
     /// Version number used for history/rollback.
     pub version: u32,
+    /// Capabilities granted to the delegate, packed into one word (issue #322).
+    pub permissions: PermissionBitmask,
 }
 
 /// A point-in-time snapshot of a delegation.
@@ -157,6 +241,23 @@ pub struct DelegationExpiredEvent {
     pub timestamp: u64,
 }
 
+/// Emitted when a delegation's capability bitmask changes (issue #322).
+#[contracttype]
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct PermissionFlagsChangedEvent {
+    /// Unique delegation identifier.
+    pub delegation_id: u64,
+    /// Address of the delegation owner.
+    pub owner: Address,
+    /// Identifier of the associated agent.
+    pub agent: BytesN<32>,
+    /// The delegation's full capability set after the change.
+    pub permissions: PermissionBitmask,
+    /// Ledger timestamp of the event.
+    pub timestamp: u64,
+}
+
 /// Emitted when the current admin proposes a successor.
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -214,7 +315,7 @@ pub enum DataKey {
 /// | `ReputationError` | 201..=300 |
 /// | `DelegationError` | 301..=400 |
 /// | `MarketplaceError` | 401..=500 |
-/// `DelegationError` currently occupies codes 301..=312.
+/// `DelegationError` currently occupies codes 301..=315.
 /// New variants must use the next unused code within 301..=400.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -248,6 +349,8 @@ pub enum DelegationError {
     InvalidTtl = 313,
     /// The caller is not authorized to perform admin operations.
     NotAuthorized = 314,
+    /// The supplied permission flag is not a single known capability bit.
+    InvalidPermissionFlag = 315,
 }
 
 /// The delegation registry contract.
@@ -353,6 +456,11 @@ impl DelegationRegistry {
     }
 
     /// Creates a new delegation and returns its id.
+    ///
+    /// The delegation is created with every capability in
+    /// [`PermissionBitmask::all()`] enabled. Use
+    /// [`create_scoped_delegation`](Self::create_scoped_delegation)
+    /// to grant a narrower set.
     pub fn create_delegation(
         env: Env,
         owner: Address,
@@ -360,6 +468,61 @@ impl DelegationRegistry {
         permissions_contract: Address,
         label: Symbol,
         ttl_ledgers: u32,
+    ) -> Result<u64, DelegationError> {
+        Self::create_delegation_inner(
+            env,
+            owner,
+            agent_id,
+            permissions_contract,
+            label,
+            ttl_ledgers,
+            PermissionBitmask::all(),
+        )
+    }
+
+    /// Creates a new delegation whose delegate only holds `permissions`.
+    ///
+    /// Identical to [`create_delegation`](Self::create_delegation) except that
+    /// the capability bitmask is supplied by the caller, so an owner can grant
+    /// a single action (e.g. spend-only) instead of every capability. The mask
+    /// is stored as one `u32` inside the delegation record rather than as
+    /// separate boolean fields (issue #322).
+    ///
+    /// Returns [`DelegationError::InvalidPermissionFlag`] when the mask
+    /// contains a reserved bit, since accepting one would let a delegation
+    /// carry capabilities this contract cannot interpret.
+    pub fn create_scoped_delegation(
+        env: Env,
+        owner: Address,
+        agent_id: BytesN<32>,
+        permissions_contract: Address,
+        label: Symbol,
+        ttl_ledgers: u32,
+        permissions: PermissionBitmask,
+    ) -> Result<u64, DelegationError> {
+        if permissions.0 & !PERM_ALL_FLAGS != 0 {
+            return Err(DelegationError::InvalidPermissionFlag);
+        }
+
+        Self::create_delegation_inner(
+            env,
+            owner,
+            agent_id,
+            permissions_contract,
+            label,
+            ttl_ledgers,
+            permissions,
+        )
+    }
+
+    fn create_delegation_inner(
+        env: Env,
+        owner: Address,
+        agent_id: BytesN<32>,
+        permissions_contract: Address,
+        label: Symbol,
+        ttl_ledgers: u32,
+        permissions: PermissionBitmask,
     ) -> Result<u64, DelegationError> {
         owner.require_auth();
 
@@ -396,6 +559,7 @@ impl DelegationRegistry {
             updated_at: now,
             expires_at_ledger,
             version: 1,
+            permissions,
         };
 
         env.storage()
@@ -989,6 +1153,180 @@ impl DelegationRegistry {
         true
     }
 
+    /// Returns whether the agent is authorized for `flag` on a delegation.
+    ///
+    /// Same liveness and identity checks as [`is_authorized`](Self::is_authorized)
+    /// — the delegation must be `Active`, unexpired, and registered to
+    /// `agent_id` — plus a single bitwise test against the delegation's packed
+    /// [`PermissionBitmask`]. Because the four capabilities share one word,
+    /// answering this costs one comparison instead of the four boolean loads
+    /// and branches an unpacked layout would need (issue #322).
+    ///
+    /// Returns `false` (never panics) when the delegation does not exist or
+    /// `flag` is not a known capability bit, so callers can fail closed.
+    pub fn is_authorized_for(
+        env: Env,
+        delegation_id: u64,
+        agent_id: BytesN<32>,
+        flag: u32,
+    ) -> bool {
+        if !PermissionBitmask::is_valid_flag(flag) {
+            return false;
+        }
+
+        let record: DelegationRecord = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(delegation_id))
+        {
+            Some(r) => r,
+            None => return false,
+        };
+
+        if record.status != DelegationStatus::Active {
+            return false;
+        }
+
+        if env.ledger().sequence() >= record.expires_at_ledger {
+            return false;
+        }
+
+        if record.agent_id != agent_id {
+            return false;
+        }
+
+        if !record.permissions.has_flag(flag) {
+            return false;
+        }
+
+        // Bump TTL on both the delegation record and its owner index so
+        // active delegations stay alive while they're being queried.
+        Self::bump_delegation(&env, delegation_id, &record.owner);
+
+        true
+    }
+
+    /// Returns a delegation's capability bitmask (issue #322).
+    pub fn get_permissions(
+        env: Env,
+        delegation_id: u64,
+    ) -> Result<PermissionBitmask, DelegationError> {
+        let record: DelegationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(delegation_id))
+            .ok_or(DelegationError::NotFound)?;
+
+        Ok(record.permissions)
+    }
+
+    /// Returns whether a delegation grants `flag` to its delegate.
+    ///
+    /// Unlike [`is_authorized_for`](Self::is_authorized_for) this ignores
+    /// lifecycle state and expiry: it answers purely "does this delegation
+    /// carry this capability", which is what scope-inspection UIs need.
+    pub fn has_permission(
+        env: Env,
+        delegation_id: u64,
+        flag: u32,
+    ) -> Result<bool, DelegationError> {
+        if !PermissionBitmask::is_valid_flag(flag) {
+            return Err(DelegationError::InvalidPermissionFlag);
+        }
+
+        let record: DelegationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(delegation_id))
+            .ok_or(DelegationError::NotFound)?;
+
+        Ok(record.permissions.has_flag(flag))
+    }
+
+    /// Sets `flag` on a delegation, requiring the owner to authorize.
+    ///
+    /// Other capabilities are left untouched. The delegation's version, history
+    /// snapshot and `updated_at` are advanced so a scope change is visible in
+    /// the audit trail and is reachable by `rollback_delegation`.
+    ///
+    /// Returns `Ok(true)` when the flag was newly set, `Ok(false)` when it was
+    /// already set (no write, no version bump).
+    pub fn set_permission_flag(
+        env: Env,
+        delegation_id: u64,
+        flag: u32,
+    ) -> Result<bool, DelegationError> {
+        if !PermissionBitmask::is_valid_flag(flag) {
+            return Err(DelegationError::InvalidPermissionFlag);
+        }
+
+        Self::update_permissions(&env, delegation_id, |mask| mask.set_flag(flag))
+    }
+
+    /// Clears `flag` on a delegation, requiring the owner to authorize.
+    ///
+    /// Mirrors [`set_permission_flag`](Self::set_permission_flag): the
+    /// delegation's version, history snapshot and `updated_at` advance only
+    /// when the flag actually changed.
+    ///
+    /// Returns `Ok(true)` when the flag was cleared, `Ok(false)` when it was
+    /// already clear.
+    pub fn clear_permission_flag(
+        env: Env,
+        delegation_id: u64,
+        flag: u32,
+    ) -> Result<bool, DelegationError> {
+        if !PermissionBitmask::is_valid_flag(flag) {
+            return Err(DelegationError::InvalidPermissionFlag);
+        }
+
+        Self::update_permissions(&env, delegation_id, |mask| mask.clear_flag(flag))
+    }
+
+    /// Applies `mutate` to a delegation's capability bitmask on behalf of its
+    /// owner, skipping the write (and the version bump) when nothing changes.
+    fn update_permissions(
+        env: &Env,
+        delegation_id: u64,
+        mutate: impl FnOnce(PermissionBitmask) -> PermissionBitmask,
+    ) -> Result<bool, DelegationError> {
+        let mut record: DelegationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(delegation_id))
+            .ok_or(DelegationError::NotFound)?;
+
+        record.owner.require_auth();
+
+        let updated = mutate(record.permissions);
+        if updated == record.permissions {
+            return Ok(false);
+        }
+
+        record.permissions = updated;
+        record.version = Self::increment_version(env, delegation_id);
+        record.updated_at = env.ledger().timestamp();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Delegation(delegation_id), &record);
+
+        Self::store_snapshot(env, delegation_id, &record);
+
+        env.events().publish(
+            (symbol_short!("deleg"), symbol_short!("perm_chg")),
+            PermissionFlagsChangedEvent {
+                delegation_id,
+                owner: record.owner.clone(),
+                agent: record.agent_id.clone(),
+                permissions: record.permissions,
+                timestamp: record.updated_at,
+            },
+        );
+
+        Ok(true)
+    }
+
     /// Sweeps a caller-supplied batch of delegation ids, transitioning any
     /// that have passed their `expires_at_ledger` into `Expired` status.
     ///
@@ -1145,6 +1483,7 @@ mod error_code_uniqueness_tests {
             (DelegationError::NotInitialized, 312u32),
             (DelegationError::InvalidTtl, 313u32),
             (DelegationError::NotAuthorized, 314u32),
+            (DelegationError::InvalidPermissionFlag, 315u32),
         ];
 
         for (variant, expected) in codes {
@@ -1166,6 +1505,7 @@ mod error_code_uniqueness_tests {
             DelegationError::NotInitialized as u32,
             DelegationError::InvalidTtl as u32,
             DelegationError::NotAuthorized as u32,
+            DelegationError::InvalidPermissionFlag as u32,
         ];
         seen.sort_unstable();
         for pair in seen.windows(2) {
