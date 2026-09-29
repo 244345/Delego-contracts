@@ -2852,6 +2852,137 @@ mod test {
         assert!(!found_old);
     }
 
+    #[test]
+    fn test_get_permissions_by_delegate_multiple_owners_and_revoke() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+        let merchants = Vec::<Address>::new(&env);
+
+        client.grant(&owner_a, &delegate, &1000, &100, &merchants, &10000);
+        client.grant(&owner_b, &delegate, &2000, &200, &merchants, &10000);
+
+        let records = client.get_permissions_by_delegate(&delegate);
+        assert_eq!(records.len(), 2);
+        let first = records.get(0).unwrap();
+        let second = records.get(1).unwrap();
+        assert_ne!(first.owner, second.owner);
+        assert!(first.owner == owner_a || first.owner == owner_b);
+        assert!(second.owner == owner_a || second.owner == owner_b);
+
+        client.revoke(&owner_a, &delegate);
+        let remaining = client.get_permissions_by_delegate(&delegate);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining.get(0).unwrap().owner, owner_b);
+    }
+
+    #[test]
+    fn test_get_permissions_by_delegate_empty_and_expired() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let unknown_delegate = Address::generate(&env);
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        assert_eq!(
+            client.get_permissions_by_delegate(&unknown_delegate).len(),
+            0
+        );
+
+        env.mock_all_auths();
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &5);
+        let expires_at = client.get_permission(&owner, &delegate).expires_at_ledger;
+        env.ledger().set_sequence_number(expires_at + 1);
+
+        let records = client.get_permissions_by_delegate(&delegate);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records.get(0).unwrap().owner, owner);
+    }
+
+    #[test]
+    fn test_get_permissions_by_delegate_transfer_moves_index() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let old_delegate = Address::generate(&env);
+        let new_delegate = Address::generate(&env);
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+        let merchants = Vec::<Address>::new(&env);
+
+        client.grant(&owner, &old_delegate, &1000, &100, &merchants, &10000);
+        client.transfer_permission(&owner, &old_delegate, &new_delegate);
+
+        assert_eq!(client.get_permissions_by_delegate(&old_delegate).len(), 0);
+        let records = client.get_permissions_by_delegate(&new_delegate);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records.get(0).unwrap().owner, owner);
+        assert_eq!(records.get(0).unwrap().delegate, new_delegate);
+    }
+
+    #[test]
+    fn test_get_permissions_by_delegate_regrant_does_not_duplicate_owner() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+        let merchants = Vec::<Address>::new(&env);
+
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
+        client.re_grant(&owner, &delegate, &2000, &200, &merchants, &10000);
+
+        let records = client.get_permissions_by_delegate(&delegate);
+        assert_eq!(records.len(), 1);
+        let record = records.get(0).unwrap();
+        assert_eq!(record.owner, owner);
+        assert_eq!(record.limit_total, 2000);
+        assert_eq!(record.limit_per_tx, 200);
+    }
+
+    #[test]
+    fn test_get_permissions_by_delegate_includes_child_until_cascade_revoke() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let parent_owner = Address::generate(&env);
+        let parent_delegate = Address::generate(&env);
+        let child_delegate = Address::generate(&env);
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+        let merchants = Vec::<Address>::new(&env);
+
+        client.grant(
+            &parent_owner,
+            &parent_delegate,
+            &1000,
+            &100,
+            &merchants,
+            &10000,
+        );
+        client.grant_child(
+            &parent_owner,
+            &parent_delegate,
+            &child_delegate,
+            &500,
+            &50,
+            &merchants,
+            &10000,
+        );
+
+        let child_records = client.get_permissions_by_delegate(&child_delegate);
+        assert_eq!(child_records.len(), 1);
+        assert_eq!(child_records.get(0).unwrap().owner, parent_delegate);
+
+        client.revoke(&parent_owner, &parent_delegate);
+        assert_eq!(client.get_permissions_by_delegate(&child_delegate).len(), 0);
+    }
 
     // --- Batch sweep tests ---
 
@@ -2884,6 +3015,9 @@ mod test {
 
         let perm1 = client.get_permission(&owner, &delegate1);
         assert_eq!(perm1.status, PermissionStatus::Expired);
+        let expired_records = client.get_permissions_by_delegate(&delegate1);
+        assert_eq!(expired_records.len(), 1);
+        assert_eq!(expired_records.get(0).unwrap().owner, owner);
 
         let perm2 = client.get_permission(&owner, &delegate2);
         assert_eq!(perm2.status, PermissionStatus::Active);
@@ -2948,6 +3082,11 @@ mod test {
 
         let perm2 = client.get_permission(&owner, &delegate2);
         assert_eq!(perm2.status, PermissionStatus::Active);
+
+        assert_eq!(client.get_permissions_by_delegate(&delegate1).len(), 0);
+        let active_records = client.get_permissions_by_delegate(&delegate2);
+        assert_eq!(active_records.len(), 1);
+        assert_eq!(active_records.get(0).unwrap().owner, owner);
     }
 
     #[test]
