@@ -12,11 +12,16 @@ Soroban smart contract for holding purchase funds until fulfillment.
 | `fund` | buyer | Fund an existing `Created` escrow |
 | `cancel` | seller (merchant) | Cancel an unfunded `Created` escrow |
 | `deposit` | buyer | Lock buyer funds for an order (convenience `create` + `fund`) |
+| `batch_create_escrows` | buyer | Atomically create and fund up to 50 orders with aggregated token allowances |
 | `release` | buyer / admin | Transfer full remaining balance to seller |
+| `publish_merkle_root` | admin / co-admin | Anchor an immutable daily delivery Merkle root |
+| `release_with_merkle_proof` | buyer | Release funds after proving delivery inclusion |
+| `verify_merkle_proof` | — | Verify a SHA-256 Merkle path |
 | `partial_release` | buyer / admin | Transfer a partial amount to seller |
 | `refund` | seller / admin / buyer (after timeout) | Return funds to buyer |
 | `dispute` | buyer / seller | Mark escrow as disputed |
 | `resolve_dispute` | admin | Resolve dispute, release to seller or refund buyer |
+| `resolve_dispute_split` | admin | Resolve a dispute with buyer, seller, and mediator payouts |
 | `resolve_dispute_quorum` | any (after quorum) | Resolve via multi-arbiter quorum vote |
 | `vote_dispute` | arbiter | Cast a quorum vote on a disputed escrow |
 | `get_escrow` | — | Full `EscrowRecord` for an escrow id |
@@ -158,10 +163,42 @@ pub struct EscrowCancelledEvent {
 | `("escrow", "refunded")` | `EscrowRefundedEvent` | `refund` |
 | `("escrow", "disputed")` | `EscrowDisputedEvent` | `dispute` |
 | `("escrow", "resolved")` | `EscrowResolvedEvent` | `resolve_dispute` / `resolve_dispute_quorum` |
+| `("escrow", "dispsplit")` | `DisputeResolvedEvent` | `resolve_dispute_split` |
+| `("escrow", "merkroot", date)` | `BytesN<32>` | `publish_merkle_root` |
 | `("escrow", "paused")` | `EscrowPauseChangedEvent` | `set_create_paused` |
 | `("admin", "proposed")` | `AdminProposedEvent` | `propose_admin` |
 | `("admin", "accepted")` | `AdminAcceptedEvent` | `accept_admin` |
 | `("admin", "cancelled")` | `AdminTransferCancelledEvent` | `cancel_admin_transfer` |
+
+## Merkle delivery proofs
+
+Oracles publish one root per UTC epoch day with
+`publish_merkle_root(caller, date, root)`. The primary admin and co-admins are
+the authorized publishers, and an existing root cannot be overwritten while
+stored. Reading or using a root refreshes its persistent-storage TTL. Leaves
+are `SHA-256(order_id)`; internal nodes are
+SHA-256 of the concatenated left and right 32-byte child hashes. `index` is the
+leaf's zero-based position, and `proof` lists siblings from leaf level to root.
+A buyer can release a funded escrow with
+`release_with_merkle_proof(escrow_id, buyer, date, proof)` only when the proof
+matches both the published root and that escrow's order ID.
+
+## Batch escrow creation
+
+`batch_create_escrows(buyer, items)` accepts `BatchEscrowItem` values with an
+absolute `timeout_ledger`. The buyer must approve the escrow contract for the
+sum of each token's amounts; the contract makes one `transfer_from` call per
+distinct token. Batches are limited to 50 entries, and any validation or
+allowance failure reverts all created records and transfers.
+
+## Split dispute resolution
+
+`resolve_dispute_split(escrow_id, caller, award)` is admin-only and accepts
+`DisputeResolutionAward` amounts for the buyer, seller, and mediator. All
+amounts must be non-negative and sum exactly to the escrow balance. The
+mediator fee is explicit and no additional platform release fee is charged.
+The call transfers each nonzero award, records the buyer amount as refunded
+and seller-plus-mediator amounts as released, and emits `DisputeResolvedEvent`.
 
 ## Development
 

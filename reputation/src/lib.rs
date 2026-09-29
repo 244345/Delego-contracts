@@ -345,23 +345,51 @@ fn outcome_value_bps(outcome: &TransactionOutcome) -> i128 {
 /// remainder — a deterministic fixed-point approximation of `e^(-lambda *
 /// t)` accurate to a few percent, which is sufficient for reputation
 /// weighting.
+///
+/// The public score helper uses the same fixed-point curve with a zero
+/// baseline, so historical values converge to zero after sustained inactivity.
+/// A zero half-life disables decay and returns the historical score unchanged.
+pub fn calculate_decayed_score(
+    historical_score: u32,
+    ledgers_elapsed: u32,
+    half_life_ledgers: u32,
+) -> u32 {
+    fixed_point_decay(
+        historical_score as u64,
+        ledgers_elapsed as u64,
+        half_life_ledgers as u64,
+        u32::BITS as u64,
+    ) as u32
+}
+
+fn fixed_point_decay(
+    historical_score: u64,
+    elapsed: u64,
+    half_life: u64,
+    max_halvings: u64,
+) -> u64 {
+    if half_life == 0 {
+        return historical_score;
+    }
+
+    let full_halvings = elapsed / half_life;
+    if full_halvings >= max_halvings {
+        return 0;
+    }
+
+    let base = historical_score >> full_halvings;
+    let remainder = elapsed % half_life;
+    let decrement = (u128::from(base) * u128::from(remainder) / (2 * u128::from(half_life))) as u64;
+    base.saturating_sub(decrement)
+}
+
 fn recency_weight_bps(elapsed_secs: u64, decay_window_secs: u64) -> i128 {
-    if decay_window_secs == 0 {
-        return BPS_SCALE;
-    }
-    let full_halvings = elapsed_secs / decay_window_secs;
-    if full_halvings >= MAX_HALVINGS {
-        return 0;
-    }
-    let remainder_secs = elapsed_secs % decay_window_secs;
-    let base = BPS_SCALE >> full_halvings;
-    if base == 0 {
-        return 0;
-    }
-    let numerator = base * (remainder_secs as i128);
-    let denominator = 2 * (decay_window_secs as i128);
-    let decrement = numerator / denominator;
-    (base - decrement).max(0)
+    fixed_point_decay(
+        BPS_SCALE as u64,
+        elapsed_secs,
+        decay_window_secs,
+        MAX_HALVINGS,
+    ) as i128
 }
 
 #[contract]

@@ -2,7 +2,8 @@
 #[allow(clippy::module_inception)]
 mod test {
     use crate::{
-        PermissionError, PermissionStatus, PermissionsContract, PermissionsContractClient,
+        DataKey, PermissionError, PermissionRecord, PermissionStatus, PermissionsContract,
+        PermissionsContractClient,
     };
     use soroban_sdk::{
         testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
@@ -210,6 +211,32 @@ mod test {
 
         client.execute_spend(&owner, &delegate, &30, &merchant);
         assert_eq!(client.get_remaining_allowance(&owner, &delegate), 970);
+    }
+
+    #[test]
+    fn test_competing_spends_cannot_exceed_remaining_allowance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let merchant = Address::generate(&env);
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &100, &100, &merchants, &10_000);
+
+        client.execute_spend(&owner, &delegate, &60, &merchant);
+        assert_eq!(
+            client.try_execute_spend(&owner, &delegate, &60, &merchant),
+            Err(Ok(PermissionError::ExceedsTotalLimit))
+        );
+
+        let permission = client.get_permission(&owner, &delegate);
+        assert_eq!(permission.spent, 60);
+        assert_eq!(client.get_remaining_allowance(&owner, &delegate), 40);
+        let stats = client.get_usage_stats(&owner, &delegate);
+        assert_eq!(stats.total_spends, 1);
+        assert_eq!(stats.total_spent, 60);
     }
 
     #[test]
@@ -2955,6 +2982,54 @@ mod test {
 
         let res_over_cap = client.try_sweep_inactive_batch(&over_cap, &caller);
         assert_eq!(res_over_cap, Err(Ok(PermissionError::InvalidParam)));
+
+        let empty = Vec::<(Address, Address)>::new(&env);
+        let res_empty = client.try_sweep_inactive_batch(&empty, &caller);
+        assert_eq!(res_empty, Err(Ok(PermissionError::InvalidParam)));
+    }
+
+    #[test]
+    fn test_sweep_inactive_full_batch_of_50_stays_within_budget() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let caller = Address::generate(&env);
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+        client.set_admin(&admin);
+        client.set_inactivity_threshold(&admin, &1u64);
+
+        let merchants = Vec::<Address>::new(&env);
+        let mut pairs = Vec::<(Address, Address)>::new(&env);
+        env.as_contract(&contract_id, || {
+            for _ in 0..50 {
+                let owner = Address::generate(&env);
+                let delegate = Address::generate(&env);
+                env.storage().persistent().set(
+                    &DataKey::Permission(owner.clone(), delegate.clone()),
+                    &PermissionRecord {
+                        owner: owner.clone(),
+                        delegate: delegate.clone(),
+                        limit_total: 100,
+                        spent: 0,
+                        limit_per_tx: 10,
+                        allowed_merchants: merchants.clone(),
+                        status: PermissionStatus::Active,
+                        expires_at_ledger: 10_000,
+                        created_at: 0,
+                        parent_owner: None,
+                        parent_delegate: None,
+                    },
+                );
+                pairs.push_back((owner, delegate));
+            }
+        });
+        env.ledger().set_timestamp(2);
+
+        assert_eq!(client.sweep_inactive_batch(&pairs, &caller), 50);
+        let budget = env.cost_estimate().budget();
+        assert!(budget.cpu_instruction_cost() < 50_000_000);
+        assert!(budget.memory_bytes_cost() < 30_000_000);
     }
 
     #[test]

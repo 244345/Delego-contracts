@@ -62,7 +62,8 @@ pub const MAX_VELOCITY_INTERVAL_SECS: u64 = 31_536_000;
 pub const DEFAULT_DECREASE_TIMELOCK_SECS: u64 = 86_400;
 /// Maximum configurable allowance-decrease timelock (30 days).
 pub const MAX_DECREASE_TIMELOCK_SECS: u64 = 2_592_000;
-pub const MAX_SWEEP_BATCH: u32 = 50;
+pub const MAX_SWEEP_BATCH_SIZE: u32 = 50;
+pub const MAX_SWEEP_BATCH: u32 = MAX_SWEEP_BATCH_SIZE;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -175,12 +176,15 @@ mod error_code_tests {
         PermissionError::TimeLockActive as u32,
         PermissionError::LimitBelowSpent as u32,
         PermissionError::ExceedsAllowance as u32,
+        PermissionError::InvalidExpiry as u32,
         PermissionError::NotInitialized as u32,
         PermissionError::NonceAlreadyUsed as u32,
     ];
 
     #[test]
     fn permission_error_codes_are_unique_and_in_reserved_range() {
+        assert_eq!(PERMISSION_ERROR_CODES.len(), 29);
+
         let permission_range = ERROR_CODE_RANGES
             .iter()
             .find(|entry| entry.0 == "PermissionError")
@@ -741,6 +745,13 @@ pub struct UsageStatsView {
 pub struct PermissionUsage {
     pub spent: i128,
     pub last_spend_ledger: Option<u32>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpendExecutionResult {
+    pub remaining_allowance: i128,
+    pub new_spend_ledger: u32,
 }
 
 /// Read-only view of the merchant restriction configured under a delegation
@@ -1813,7 +1824,7 @@ impl PermissionsContract {
         // since the last recorded spend ledger for this (owner, delegate) pair.
         Self::check_velocity(&env, &owner, &delegate)?;
 
-        let remaining = Self::apply_spend(&env, &owner, &delegate, amount)?;
+        let result = Self::apply_spend(&env, &owner, &delegate, amount)?;
 
         // Emit after successful spend only (issue #99).
         env.events().publish(
@@ -1823,7 +1834,7 @@ impl PermissionsContract {
                 delegate,
                 merchant,
                 amount,
-                remaining,
+                remaining: result.remaining_allowance,
             },
         );
 
@@ -1834,22 +1845,32 @@ impl PermissionsContract {
     /// record and then walks the parent chain, decrementing each ancestor's
     /// allowance by the same `amount` (issue #55 / #332).
     ///
-    /// Callers **must** have already run all validation (`can_spend`,
-    /// velocity checks, nonce checks, …) before calling this function.
-    /// `apply_spend` only mutates storage — it does **not** re-validate.
+    /// Callers must run all policy checks first. This helper independently
+    /// rechecks the current allowance before mutating storage.
     ///
-    /// Returns the remaining allowance on the child permission after the spend.
+    /// Rechecks and persists the spend atomically against the latest stored record.
     fn apply_spend(
         env: &Env,
         owner: &Address,
         delegate: &Address,
         amount: i128,
-    ) -> Result<i128, PermissionError> {
+    ) -> Result<SpendExecutionResult, PermissionError> {
         let key = DataKey::Permission(owner.clone(), delegate.clone());
         let mut record: PermissionRecord = env.storage().persistent().get(&key).unwrap();
 
-        record.spent += amount;
+        if amount <= 0 {
+            return Err(PermissionError::InvalidParam);
+        }
+        let new_spent = record
+            .spent
+            .checked_add(amount)
+            .ok_or(PermissionError::ExceedsTotalLimit)?;
+        if new_spent > record.limit_total {
+            return Err(PermissionError::ExceedsTotalLimit);
+        }
+        record.spent = new_spent;
         let remaining = record.limit_total - record.spent;
+        let new_spend_ledger = env.ledger().sequence();
 
         // Capture the parent link before writing the updated record so we can
         // walk the chain without holding an immutable borrow.
@@ -1864,7 +1885,7 @@ impl PermissionsContract {
         // Record the current ledger sequence and timestamp for velocity tracking.
         env.storage().persistent().set(
             &DataKey::LastSpendLedger(owner.clone(), delegate.clone()),
-            &env.ledger().sequence(),
+            &new_spend_ledger,
         );
         env.storage().persistent().set(
             &DataKey::LastSpendTimestamp(owner.clone(), delegate.clone()),
@@ -1883,7 +1904,14 @@ impl PermissionsContract {
                 .get(&parent_key)
                 .unwrap();
 
-            parent_record.spent += amount;
+            let parent_spent = parent_record
+                .spent
+                .checked_add(amount)
+                .ok_or(PermissionError::ExceedsTotalLimit)?;
+            if parent_spent > parent_record.limit_total {
+                return Err(PermissionError::ExceedsTotalLimit);
+            }
+            parent_record.spent = parent_spent;
             next_parent = match (
                 parent_record.parent_owner.clone(),
                 parent_record.parent_delegate.clone(),
@@ -1894,7 +1922,10 @@ impl PermissionsContract {
             env.storage().persistent().set(&parent_key, &parent_record);
         }
 
-        Ok(remaining)
+        Ok(SpendExecutionResult {
+            remaining_allowance: remaining,
+            new_spend_ledger,
+        })
     }
 
     /// Rejects a spend when the configured velocity limit has not yet elapsed
@@ -2156,7 +2187,7 @@ impl PermissionsContract {
         // apply_spend increments the child record, walks the full parent chain,
         // updates usage stats, and records the last spend ledger — identical to
         // the direct execute_spend path (issue #55).
-        let remaining = Self::apply_spend(&env, &owner, &delegate, amount)?;
+        let result = Self::apply_spend(&env, &owner, &delegate, amount)?;
 
         env.events().publish(
             (symbol_short!("perm"), symbol_short!("relayed")),
@@ -2165,7 +2196,7 @@ impl PermissionsContract {
                 delegate,
                 merchant,
                 amount,
-                remaining,
+                remaining: result.remaining_allowance,
             },
         );
 
@@ -3018,7 +3049,7 @@ impl PermissionsContract {
     ) -> Result<u32, PermissionError> {
         caller.require_auth();
 
-        if pairs.len() > MAX_SWEEP_BATCH {
+        if pairs.is_empty() || pairs.len() > MAX_SWEEP_BATCH_SIZE {
             return Err(PermissionError::InvalidParam);
         }
 
@@ -3058,7 +3089,7 @@ impl PermissionsContract {
     ) -> Result<u32, PermissionError> {
         caller.require_auth();
 
-        if pairs.len() > MAX_SWEEP_BATCH {
+        if pairs.is_empty() || pairs.len() > MAX_SWEEP_BATCH_SIZE {
             return Err(PermissionError::InvalidParam);
         }
 
