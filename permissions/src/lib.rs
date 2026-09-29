@@ -134,6 +134,9 @@ pub enum PermissionError {
     /// Nonce cancellation targets a nonce that was already consumed or
     /// would overflow the nonce counter (issue #297)
     NonceAlreadyUsed = 2413,
+    /// Spend attempted outside the delegation's configured business-hour /
+    /// day-of-week `TimeWindowRestriction` (issue #315)
+    OutsideAuthorizedWindow = 2414,
 }
 
 #[cfg(test)]
@@ -179,11 +182,12 @@ mod error_code_tests {
         PermissionError::InvalidExpiry as u32,
         PermissionError::NotInitialized as u32,
         PermissionError::NonceAlreadyUsed as u32,
+        PermissionError::OutsideAuthorizedWindow as u32,
     ];
 
     #[test]
     fn permission_error_codes_are_unique_and_in_reserved_range() {
-        assert_eq!(PERMISSION_ERROR_CODES.len(), 29);
+        assert_eq!(PERMISSION_ERROR_CODES.len(), 30);
 
         let permission_range = ERROR_CODE_RANGES
             .iter()
@@ -569,6 +573,42 @@ pub struct VelocityLimit {
     pub last_spend_timestamp: u64,
 }
 
+/// Business-hour / day-of-week spend restriction for a single (owner,
+/// delegate) delegation (issue #315).
+///
+/// `start_hour_utc`/`end_hour_utc` are hours-of-day in `[0, 24)`. A spend's
+/// hour (derived from `env.ledger().timestamp()`) must fall in
+/// `[start_hour_utc, end_hour_utc)` when `start_hour_utc < end_hour_utc`, or
+/// in `[start_hour_utc, 24) ∪ [0, end_hour_utc)` when `start_hour_utc >
+/// end_hour_utc` (an overnight window, e.g. 22 -> 6). Equal start/end hours
+/// disable the hour-of-day check (any hour is allowed) so the restriction
+/// can be day-of-week-only.
+///
+/// `allowed_days_bitmap` is a 7-bit mask, bit 0 = Monday through bit 6 =
+/// Sunday (bits 7-31 must be zero). A day whose bit is unset is fully
+/// blocked regardless of hour.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub struct TimeWindowRestriction {
+    pub start_hour_utc: u32,
+    pub end_hour_utc: u32,
+    pub allowed_days_bitmap: u32,
+}
+
+/// Emitted when a delegation's business-hour restriction is set or cleared
+/// (issue #315).
+#[contracttype]
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct TimeWindowRestrictionSetEvent {
+    pub owner: Address,
+    pub delegate: Address,
+    pub start_hour_utc: u32,
+    pub end_hour_utc: u32,
+    pub allowed_days_bitmap: u32,
+}
+
 /// Emitted when the expiry of a permission is updated via `update_expiry` (issue #102).
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -830,6 +870,9 @@ pub enum DataKey {
     UserPermissions(Address),
     /// Seller-specific allowlist for a sensitive (owner, delegate) delegation.
     MerchantAllowlist(Address, Address),
+    /// Business-hour / day-of-week spend restriction for a (owner, delegate)
+    /// delegation (issue #315).
+    TimeWindowRestriction(Address, Address),
 }
 
 #[contract]
@@ -1706,6 +1749,10 @@ impl PermissionsContract {
 
         Self::check_merchant_allowlist(&env, &owner, &delegate, &merchant)?;
 
+        // Issue #315: reject spends outside the configured business-hour /
+        // day-of-week window, if one is set for this delegation.
+        Self::check_time_window(&env, &owner, &delegate)?;
+
         Ok(())
     }
 
@@ -1799,6 +1846,139 @@ impl PermissionsContract {
         env.storage()
             .persistent()
             .get(&DataKey::MerchantAllowlist(owner, delegate))
+    }
+
+    /// Configures (or replaces) the business-hour / day-of-week restriction
+    /// for a `(owner, delegate)` delegation (issue #315). Owner-authorized;
+    /// a permission must already exist for the pair.
+    ///
+    /// `start_hour_utc` and `end_hour_utc` must each be `< 24`.
+    /// `allowed_days_bitmap` must only use bits 0-6 (Mon-Sun); any of bits
+    /// 7-31 set is rejected as [`PermissionError::InvalidParam`].
+    pub fn set_time_window_restriction(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        start_hour_utc: u32,
+        end_hour_utc: u32,
+        allowed_days_bitmap: u32,
+    ) -> Result<(), PermissionError> {
+        owner.require_auth();
+
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Permission(owner.clone(), delegate.clone()))
+        {
+            return Err(PermissionError::PermissionNotFound);
+        }
+
+        if start_hour_utc >= 24 || end_hour_utc >= 24 || (allowed_days_bitmap & !0x7F) != 0 {
+            return Err(PermissionError::InvalidParam);
+        }
+
+        env.storage().persistent().set(
+            &DataKey::TimeWindowRestriction(owner.clone(), delegate.clone()),
+            &TimeWindowRestriction {
+                start_hour_utc,
+                end_hour_utc,
+                allowed_days_bitmap,
+            },
+        );
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("timewin")),
+            TimeWindowRestrictionSetEvent {
+                owner: owner.clone(),
+                delegate: delegate.clone(),
+                start_hour_utc,
+                end_hour_utc,
+                allowed_days_bitmap,
+            },
+        );
+
+        Self::append_audit_log(
+            &env,
+            &owner,
+            &delegate,
+            owner.clone(),
+            symbol_short!("timewin"),
+        );
+
+        Ok(())
+    }
+
+    /// Removes any business-hour restriction configured for `(owner,
+    /// delegate)` (issue #315). A no-op (not an error) when none was set.
+    pub fn clear_time_window_restriction(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+    ) -> Result<(), PermissionError> {
+        owner.require_auth();
+        env.storage()
+            .persistent()
+            .remove(&DataKey::TimeWindowRestriction(owner, delegate));
+        Ok(())
+    }
+
+    /// Returns the business-hour restriction configured for `(owner,
+    /// delegate)`, if any (issue #315).
+    pub fn get_time_window_restriction(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+    ) -> Option<TimeWindowRestriction> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TimeWindowRestriction(owner, delegate))
+    }
+
+    /// Rejects a spend made outside the delegation's configured business-hour
+    /// window (issue #315). No-op when no restriction is configured.
+    ///
+    /// The current UTC hour-of-day and Mon-Sun weekday are derived directly
+    /// from `env.ledger().timestamp()` (seconds since the Unix epoch, which
+    /// was a Thursday): `weekday = (days_since_epoch + 3) % 7` maps
+    /// Monday -> 0 ... Sunday -> 6, and `hour = (timestamp % 86400) / 3600`.
+    fn check_time_window(
+        env: &Env,
+        owner: &Address,
+        delegate: &Address,
+    ) -> Result<(), PermissionError> {
+        let restriction: TimeWindowRestriction = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::TimeWindowRestriction(owner.clone(), delegate.clone()))
+        {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+
+        let timestamp = env.ledger().timestamp();
+        let days_since_epoch = timestamp / 86_400;
+        let seconds_of_day = timestamp % 86_400;
+        let weekday = ((days_since_epoch + 3) % 7) as u32;
+        let hour = (seconds_of_day / 3_600) as u32;
+
+        let day_bit = 1u32 << weekday;
+        if restriction.allowed_days_bitmap & day_bit == 0 {
+            return Err(PermissionError::OutsideAuthorizedWindow);
+        }
+
+        if restriction.start_hour_utc != restriction.end_hour_utc {
+            let in_window = if restriction.start_hour_utc < restriction.end_hour_utc {
+                hour >= restriction.start_hour_utc && hour < restriction.end_hour_utc
+            } else {
+                // Overnight window wrapping past midnight (e.g. 22 -> 6).
+                hour >= restriction.start_hour_utc || hour < restriction.end_hour_utc
+            };
+            if !in_window {
+                return Err(PermissionError::OutsideAuthorizedWindow);
+            }
+        }
+
+        Ok(())
     }
 
     pub fn execute_spend(
@@ -2478,6 +2658,9 @@ impl PermissionsContract {
                     PermissionError::ExceedsPerTxLimit => Symbol::new(&env, "per_tx_limit"),
                     PermissionError::ExceedsTotalLimit => Symbol::new(&env, "total_limit"),
                     PermissionError::MerchantNotAllowed => Symbol::new(&env, "bad_merchant"),
+                    PermissionError::OutsideAuthorizedWindow => {
+                        Symbol::new(&env, "outside_win")
+                    }
                     // Remaining variants cannot be returned by can_spend but
                     // exhaustively handled to satisfy the compiler.
                     _ => Symbol::new(&env, "unauthorized"),
@@ -3871,6 +4054,8 @@ impl PermissionsContract {
 mod integration_tests;
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod fuzz_tests;
 
 #[cfg(test)]
 mod absent_key_tests {
