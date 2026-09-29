@@ -19,7 +19,6 @@
 // This exact conditional form must be consistent across all workspace contract crates.
 #![cfg_attr(not(test), no_std)]
 #![warn(missing_docs)]
-#![no_std]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
     InvokeError, Map, Symbol, Vec,
@@ -1254,9 +1253,9 @@ impl EscrowContract {
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::LastEscrowId, &0u64);
-        env.storage().instance().set(
-            &DataKey::FeeConfig,
-            &FeeConfig { fee_bps, treasury });
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeConfig, &FeeConfig { fee_bps, treasury });
         env.storage().instance().set(
             &DataKey::AmountLimits,
             &EscrowAmountLimits {
@@ -2434,10 +2433,7 @@ impl EscrowContract {
     /// Returns [`EscrowError::PoolNotFound`] when no pool has ever been funded
     /// for the given token, so callers can distinguish an unfunded pool from a
     /// funded one that is currently empty.
-    pub fn get_liquidity_pool(
-        env: Env,
-        token: Address,
-    ) -> Result<LiquidityPool, EscrowError> {
+    pub fn get_liquidity_pool(env: Env, token: Address) -> Result<LiquidityPool, EscrowError> {
         env.storage()
             .instance()
             .get(&DataKey::LiquidityPool(token))
@@ -2801,7 +2797,7 @@ impl EscrowContract {
             PERSISTENT_BUMP_AMOUNT,
         );
         storage.extend_ttl(
-            &buyer_ids_key,
+            &buyer_count_key,
             PERSISTENT_BUMP_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
@@ -5457,7 +5453,7 @@ mod escrow_feature_tests {
 #[cfg(test)]
 mod fee_distribution_tests {
     use super::*;
-    use soroban_sdk::testutils::{Address as _};
+    use soroban_sdk::testutils::Address as _;
 
     fn setup(env: &Env) -> (EscrowContractClient<'_>, Address, Address) {
         let admin = Address::generate(env);
@@ -5627,14 +5623,7 @@ mod metadata_tests {
         let no_hash: Option<BytesN<32>> = None;
         let no_schema: Option<Symbol> = None;
         let escrow_id = client.create(
-            &buyer,
-            &seller,
-            &token,
-            &100i128,
-            &order_id,
-            &1000u32,
-            &no_hash,
-            &no_schema,
+            &buyer, &seller, &token, &100i128, &order_id, &1000u32, &no_hash, &no_schema,
         );
         let result = client.try_get_escrow_metadata(&escrow_id);
         assert_eq!(result, Err(Ok(EscrowError::MetadataNotSet)));
@@ -5673,8 +5662,7 @@ mod metadata_tests {
         let (client, admin, _contract_id, token) = setup_with_token(&env);
         let buyer = Address::generate(&env);
         let seller = Address::generate(&env);
-        let token_admin_client =
-            soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
         token_admin_client.mint(&buyer, &1_000_000i128);
 
         let order_hash = BytesN::from_array(&env, &[38u8; 32]);
@@ -5743,7 +5731,6 @@ mod metadata_tests {
     }
 }
 
-
 #[cfg(all(test, feature = "full_suite"))]
 mod integration_tests;
 #[cfg(all(test, feature = "full_suite"))]
@@ -5778,7 +5765,6 @@ mod quorum_cleanup_tests {
         };
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(&env, &contract_id);
-
         client.add_token(&admin, &token);
 
         let arbiters = soroban_sdk::vec![&env, arbiter1.clone(), arbiter2.clone()];
