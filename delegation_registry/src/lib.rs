@@ -937,6 +937,33 @@ impl DelegationRegistry {
         records
     }
 
+    /// Returns all delegations associated with the given agent identifier.
+    ///
+    /// Iterates through all issued delegations and collects records matching
+    /// `agent_id`.
+    pub fn get_delegations_by_agent(env: Env, agent_id: BytesN<32>) -> Vec<DelegationRecord> {
+        let next_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextId)
+            .unwrap_or(1u64);
+
+        let mut records = Vec::new(&env);
+        for id in 1..next_id {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, DelegationRecord>(&DataKey::Delegation(id))
+            {
+                if record.agent_id == agent_id {
+                    Self::bump_delegation(&env, id, &record.owner);
+                    records.push_back(record);
+                }
+            }
+        }
+        records
+    }
+
     /// Returns every delegation owned by `owner` whose stored status is
     /// `Active` and whose `expires_at_ledger` has not yet been reached.
     ///
