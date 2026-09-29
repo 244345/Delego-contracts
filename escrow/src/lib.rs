@@ -949,6 +949,21 @@ pub enum EscrowError {
     OraclePublicKeyNotSet = 47,
     /// Maximum treasuries exceeded
     MaxTreasuriesExceeded = 42,
+    /// Escrow exists but no metadata was stored at creation
+    MetadataNotSet = 400,
+    /// Only one of order_hash/schema was supplied; metadata must be provided
+    /// fully (both halves) or not at all (issue #38).
+    InvalidMetadata = 401,
+    /// Keeper bump rate limit exceeded (minimum time between bumps not elapsed)
+    BumpRateLimitExceeded = 402,
+    /// Escrow TTL not within threshold for bounty payout
+    BumpThresholdNotMet = 403,
+    /// No shipment proof recorded for this escrow
+    ShipmentProofNotFound = 404,
+    /// Scheduled fee update is not yet effective
+    FeeUpdateNotEffective = 405,
+    /// Minimum notice window for fee change not met
+    FeeNoticeWindowNotMet = 406,
     /// An unexecuted upgrade proposal is already pending
     UpgradeProposalExists = 407,
     /// No pending upgrade proposal exists
@@ -1972,7 +1987,7 @@ impl EscrowContract {
     /// * `false` if TTL was extended but escrow was not within bounty threshold
     ///
     /// # Errors
-    /// Returns [`EscrowError::NotFound`] if called too soon after last bump.
+    /// Returns [`EscrowError::BumpRateLimitExceeded`] if called too soon after last bump.
     /// Returns [`EscrowError::NotFound`] if escrow does not exist.
     /// Returns [`EscrowError::InvalidStatus`] if escrow is in a terminal state.
     pub fn bump_ttl_with_bounty(
@@ -1990,7 +2005,7 @@ impl EscrowContract {
             .get(&DataKey::LastBumpLedger(escrow_id))
             .unwrap_or(0);
         if current_ledger.saturating_sub(last_bump) < BUMP_RATE_LIMIT_LEDGERS {
-            return Err(EscrowError::NotFound);
+            return Err(EscrowError::BumpRateLimitExceeded);
         }
 
         // Get and validate escrow
@@ -2127,7 +2142,7 @@ impl EscrowContract {
         env.storage()
             .persistent()
             .get(&DataKey::ShipmentProof(escrow_id))
-            .ok_or(EscrowError::NotFound)
+            .ok_or(EscrowError::ShipmentProofNotFound)
     }
 
     /// Check if an escrow has a valid shipment proof.
@@ -2720,7 +2735,7 @@ impl EscrowContract {
         // used by `create`, `deposit`, and every `batch_deposit` entry, so all
         // three behave identically.
         if order_hash.is_some() != schema.is_some() {
-            return Err(EscrowError::NotFound);
+            return Err(EscrowError::InvalidMetadata);
         }
 
         let mut last_id: u64 = env
@@ -4326,7 +4341,7 @@ impl EscrowContract {
     ///
     /// Returns the metadata if it was provided during escrow creation.
     /// Returns [`EscrowError::NotFound`] when no escrow exists for
-    /// `escrow_id`, or [`EscrowError::NotFound`] when the escrow
+    /// `escrow_id`, or [`EscrowError::MetadataNotSet`] when the escrow
     /// exists but no metadata was stored.
     pub fn get_escrow_metadata(env: Env, escrow_id: u64) -> Result<EscrowMetadata, EscrowError> {
         let order_hash: BytesN<32> = env
@@ -5180,7 +5195,7 @@ mod metadata_tests {
             &no_schema,
         );
         let result = client.try_get_escrow_metadata(&escrow_id);
-        assert_eq!(result, Err(Ok(EscrowError::NotFound)));
+        assert_eq!(result, Err(Ok(EscrowError::MetadataNotSet)));
     }
 
     #[test]
@@ -5262,7 +5277,7 @@ mod metadata_tests {
         });
         assert_eq!(
             client.try_batch_deposit(&buyer, &hash_only),
-            Err(Ok(EscrowError::NotFound))
+            Err(Ok(EscrowError::InvalidMetadata))
         );
 
         // (Schema only) — rejected with InvalidMetadata.
@@ -5278,7 +5293,7 @@ mod metadata_tests {
         });
         assert_eq!(
             client.try_batch_deposit(&buyer, &schema_only),
-            Err(Ok(EscrowError::NotFound))
+            Err(Ok(EscrowError::InvalidMetadata))
         );
 
         // Admin role is exercised only to keep the client bound; unused here.
