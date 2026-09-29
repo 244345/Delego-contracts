@@ -415,7 +415,7 @@ fn test_recompute_bumps_window_records_ttl() {
 
     // Advance time past the decay window to ensure records would expire
     // without TTL bumps. The ledger timestamp is used for TTL calculations.
-    let initial_ledger_timestamp = env.ledger().timestamp();
+    let _initial_ledger_timestamp = env.ledger().timestamp();
     advance_time(&env, cfg.decay_window_seconds + 100);
 
     // Record one more transaction to trigger recompute_score on the existing window
@@ -1171,7 +1171,7 @@ fn test_resolve_flag_not_flag_reporter() {
 
     client.flag_entity(&reporter, &entity, &symbol_short!("fraud"), &None);
 
-    let res = client.try_resolve_flag(&admin, &other_reporter, &entity);
+    let _res = client.try_resolve_flag(&admin, &other_reporter, &entity);
 }
 
 // --- freeze / unfreeze ---

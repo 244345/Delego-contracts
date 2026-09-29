@@ -5,7 +5,7 @@ use delego_escrow::{
     BatchDepositParams, EscrowConfig, EscrowContract, EscrowContractClient, EscrowError,
     EscrowStatus,
 };
-use delego_marketplace::{MarketplaceContract, MarketplaceContractClient, MarketplaceError};
+use delego_marketplace::MarketplaceError;
 use delego_permissions::{
     PermissionError, PermissionStatus, PermissionsContract, PermissionsContractClient,
     RelayedSpendMessage,
