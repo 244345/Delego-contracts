@@ -24,6 +24,9 @@ use soroban_sdk::{
     InvokeError, Map, Symbol, Vec,
 };
 
+// Formal verification specifications for escrow lifecycle invariants
+pub mod invariants;
+
 /// Lifecycle state of an escrow.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
