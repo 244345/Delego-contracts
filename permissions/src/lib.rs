@@ -64,6 +64,8 @@ pub const DEFAULT_DECREASE_TIMELOCK_SECS: u64 = 86_400;
 pub const MAX_DECREASE_TIMELOCK_SECS: u64 = 2_592_000;
 pub const MAX_SWEEP_BATCH_SIZE: u32 = 50;
 pub const MAX_SWEEP_BATCH: u32 = MAX_SWEEP_BATCH_SIZE;
+/// Number of ledgers a permission must be expired before it can be pruned by a keeper (issue #374).
+pub const PRUNE_EXPIRATION_THRESHOLD_LEDGERS: u32 = 100_000;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -183,7 +185,7 @@ mod error_code_tests {
 
     #[test]
     fn permission_error_codes_are_unique_and_in_reserved_range() {
-        assert_eq!(PERMISSION_ERROR_CODES.len(), 29);
+        assert_eq!(PERMISSION_ERROR_CODES.len(), 30);
 
         let permission_range = ERROR_CODE_RANGES
             .iter()
@@ -599,6 +601,17 @@ pub struct PermissionExpiryCappedEvent {
     pub owner: Address,
     pub delegate: Address,
     pub capped_at: u32,
+}
+
+/// Emitted when an expired permission record is pruned from persistent storage (issue #374).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub struct PermissionPrunedEvent {
+    pub owner: Address,
+    pub delegate: Address,
+    pub keeper: Address,
+    pub pruned_at_ledger: u32,
 }
 
 /// Emitted by `propose_admin` when the current admin proposes a successor
@@ -3075,6 +3088,89 @@ impl PermissionsContract {
         }
 
         Ok(transitioned)
+    }
+
+    /// Prunes a permission record that has been expired for more than
+    /// `PRUNE_EXPIRATION_THRESHOLD_LEDGERS` (100,000 ledgers) from persistent storage,
+    /// reclaiming contract rent and eliminating blockchain state bloat (issue #374).
+    ///
+    /// Callable by any keeper bot with authentication.
+    /// Returns `Ok(true)` if the permission was pruned, or `Ok(false)` if the
+    /// permission is active or has not yet reached the expiration threshold.
+    /// Returns `Err(PermissionError::PermissionNotFound)` if the permission does not exist.
+    pub fn prune_expired_permission(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        keeper: Address,
+    ) -> Result<bool, PermissionError> {
+        keeper.require_auth();
+
+        let key = DataKey::Permission(owner.clone(), delegate.clone());
+        let record: PermissionRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(PermissionError::PermissionNotFound)?;
+
+        let current_ledger = env.ledger().sequence();
+        if current_ledger.saturating_sub(record.expires_at_ledger) <= PRUNE_EXPIRATION_THRESHOLD_LEDGERS {
+            return Ok(false);
+        }
+
+        // Delete primary permission record from persistent storage
+        env.storage().persistent().remove(&key);
+
+        // Clean up secondary persistent storage entries associated with this permission
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingDecrement(owner.clone(), delegate.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PauseMetadata(owner.clone(), delegate.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Metadata(owner.clone(), delegate.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::MerchantAllowlist(owner.clone(), delegate.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::RelayerNonce(owner.clone(), delegate.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::LastSpendLedger(owner.clone(), delegate.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::LastSpendTimestamp(owner.clone(), delegate.clone()));
+
+        // Remove delegate from owner's user permissions index
+        let user_perms_key = DataKey::UserPermissions(owner.clone());
+        let mut delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&user_perms_key)
+            .unwrap_or(Vec::new(&env));
+        if let Some(index) = delegates.first_index_of(&delegate) {
+            delegates.remove(index);
+            if delegates.is_empty() {
+                env.storage().persistent().remove(&user_perms_key);
+            } else {
+                env.storage().persistent().set(&user_perms_key, &delegates);
+            }
+        }
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("pruned")),
+            PermissionPrunedEvent {
+                owner,
+                delegate,
+                keeper,
+                pruned_at_ledger: current_ledger,
+            },
+        );
+
+        Ok(true)
     }
 
     /// Bounded batch version of [`Self::sweep_inactive`].

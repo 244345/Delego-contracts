@@ -3044,4 +3044,267 @@ mod test {
         let result = client.try_decrease_allowance(&owner, &delegate, &-100);
         assert!(result.is_err());
     }
+
+    // --- Inactivity pruning and rent reclamation tests (issue #374) ---
+
+    #[test]
+    fn test_prune_expired_permission_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let keeper = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &10);
+
+        // Keep instance and record alive across the ledger jump
+        env.as_contract(&contract_id, || {
+            env.storage().instance().extend_ttl(1_000_000, 1_000_000);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Permission(owner.clone(), delegate.clone()),
+                1_000_000,
+                1_000_000,
+            );
+            env.storage().persistent().extend_ttl(
+                &DataKey::UserPermissions(owner.clone()),
+                1_000_000,
+                1_000_000,
+            );
+        });
+
+        // Advance ledger to 100_011 (> 10 + 100_000)
+        env.ledger().set_sequence_number(100_011);
+
+        let pruned = client.prune_expired_permission(&owner, &delegate, &keeper);
+        assert_eq!(pruned, true);
+
+        // Verify PermissionPrunedEvent was emitted
+        let events = env.events().all();
+        let mut found_event = false;
+        for event in events.iter() {
+            let (contract, topics, value) = event;
+            if contract != contract_id || topics.len() != 2 {
+                continue;
+            }
+            let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            if t0 == soroban_sdk::symbol_short!("perm") && t1 == soroban_sdk::symbol_short!("pruned") {
+                let evt: crate::PermissionPrunedEvent = value.try_into_val(&env).unwrap();
+                assert_eq!(evt.owner, owner);
+                assert_eq!(evt.delegate, delegate);
+                assert_eq!(evt.keeper, keeper);
+                assert_eq!(evt.pruned_at_ledger, 100_011);
+                found_event = true;
+            }
+        }
+        assert!(found_event, "PermissionPrunedEvent not found in emitted events");
+
+        // Verify storage deletion
+        assert_eq!(client.is_active(&owner, &delegate), false);
+        let get_res = client.try_get_permission(&owner, &delegate);
+        assert_eq!(get_res, Err(Ok(PermissionError::PermissionNotFound)));
+    }
+
+    #[test]
+    fn test_prune_active_permission_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let keeper = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        // Expiry at ledger 1000
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &1000);
+
+        // Sequence is 500 (permission is active and unexpired)
+        env.ledger().set_sequence_number(500);
+
+        let pruned = client.prune_expired_permission(&owner, &delegate, &keeper);
+        assert_eq!(pruned, false);
+
+        // Verify permission is still active and exists in storage
+        assert_eq!(client.is_active(&owner, &delegate), true);
+        assert!(client.try_get_permission(&owner, &delegate).is_ok());
+
+        // Verify no pruned event was emitted
+        let events = env.events().all();
+        for event in events.iter() {
+            let (contract, topics, _) = event;
+            if contract != contract_id || topics.len() != 2 {
+                continue;
+            }
+            let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            if t0 == soroban_sdk::symbol_short!("perm") && t1 == soroban_sdk::symbol_short!("pruned") {
+                panic!("PermissionPrunedEvent should not be emitted for active permission");
+            }
+        }
+    }
+
+    #[test]
+    fn test_prune_permission_boundary_checks() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let keeper = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        // Expiry at ledger 100
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &100);
+
+        // Keep instance and record alive across the ledger jumps
+        env.as_contract(&contract_id, || {
+            env.storage().instance().extend_ttl(1_000_000, 1_000_000);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Permission(owner.clone(), delegate.clone()),
+                1_000_000,
+                1_000_000,
+            );
+            env.storage().persistent().extend_ttl(
+                &DataKey::UserPermissions(owner.clone()),
+                1_000_000,
+                1_000_000,
+            );
+        });
+
+        // At ledger 100: just reached expiry (0 ledgers expired) -> reject
+        env.ledger().set_sequence_number(100);
+        assert_eq!(client.prune_expired_permission(&owner, &delegate, &keeper), false);
+        assert!(client.try_get_permission(&owner, &delegate).is_ok());
+
+        // At ledger 100_100: expired by exactly 100,000 ledgers (not > 100,000) -> reject
+        env.ledger().set_sequence_number(100_100);
+        assert_eq!(client.prune_expired_permission(&owner, &delegate, &keeper), false);
+        assert!(client.try_get_permission(&owner, &delegate).is_ok());
+
+        // At ledger 100_101: expired by 100,001 ledgers (> 100,000) -> succeeds!
+        env.ledger().set_sequence_number(100_101);
+        assert_eq!(client.prune_expired_permission(&owner, &delegate, &keeper), true);
+        assert_eq!(
+            client.try_get_permission(&owner, &delegate),
+            Err(Ok(PermissionError::PermissionNotFound))
+        );
+    }
+
+    #[test]
+    fn test_prune_nonexistent_permission_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let keeper = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let res = client.try_prune_expired_permission(&owner, &delegate, &keeper);
+        assert_eq!(res, Err(Ok(PermissionError::PermissionNotFound)));
+    }
+
+    #[test]
+    fn test_prune_already_swept_expired_permission() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let caller = Address::generate(&env);
+        let keeper = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        // Expiry at ledger 50
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &50);
+
+        // Sweep it at ledger 60
+        env.ledger().set_sequence_number(60);
+        let swept = client.sweep_expired(&owner, &delegate, &caller);
+        assert_eq!(swept, true);
+        assert_eq!(client.get_permission(&owner, &delegate).status, PermissionStatus::Expired);
+
+        // Keep instance and record alive across the ledger jump
+        env.as_contract(&contract_id, || {
+            env.storage().instance().extend_ttl(1_000_000, 1_000_000);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Permission(owner.clone(), delegate.clone()),
+                1_000_000,
+                1_000_000,
+            );
+            env.storage().persistent().extend_ttl(
+                &DataKey::UserPermissions(owner.clone()),
+                1_000_000,
+                1_000_000,
+            );
+        });
+
+        // Advance ledger to 100_051 (> 50 + 100_000)
+        env.ledger().set_sequence_number(100_051);
+        let pruned = client.prune_expired_permission(&owner, &delegate, &keeper);
+        assert_eq!(pruned, true);
+        assert_eq!(
+            client.try_get_permission(&owner, &delegate),
+            Err(Ok(PermissionError::PermissionNotFound))
+        );
+    }
+
+    #[test]
+    fn test_prune_cleans_up_user_permissions_index() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate1 = Address::generate(&env);
+        let delegate2 = Address::generate(&env);
+        let keeper = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate1, &1000, &100, &merchants, &10);
+        client.grant(&owner, &delegate2, &2000, &200, &merchants, &200_000);
+
+        assert_eq!(client.get_permissions_by_owner(&owner).len(), 2);
+
+        // Keep instance and records alive across the ledger jump
+        env.as_contract(&contract_id, || {
+            env.storage().instance().extend_ttl(1_000_000, 1_000_000);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Permission(owner.clone(), delegate1.clone()),
+                1_000_000,
+                1_000_000,
+            );
+            env.storage().persistent().extend_ttl(
+                &DataKey::Permission(owner.clone(), delegate2.clone()),
+                1_000_000,
+                1_000_000,
+            );
+            env.storage().persistent().extend_ttl(
+                &DataKey::UserPermissions(owner.clone()),
+                1_000_000,
+                1_000_000,
+            );
+        });
+
+        // Advance to prune delegate1
+        env.ledger().set_sequence_number(100_011);
+        assert_eq!(client.prune_expired_permission(&owner, &delegate1, &keeper), true);
+
+        // delegate1 is removed, delegate2 remains
+        let remaining = client.get_permissions_by_owner(&owner);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining.get(0).unwrap().delegate, delegate2);
+    }
 }
