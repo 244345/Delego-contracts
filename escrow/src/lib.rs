@@ -42,6 +42,15 @@ pub enum EscrowStatus {
     Cancelled,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbiterStakingRecord {
+    pub arbiter: Address,
+    pub staked_amount: i128,
+    pub assigned_disputes_count: u32,
+    pub is_slashed: bool,
+}
+
 /// Terminal states an escrow can reach after it is no longer active.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -820,6 +829,8 @@ pub enum DataKey {
     UpgradeProposal,
     /// M-of-N admin approvals required to execute an upgrade (issue #292).
     UpgradeThreshold,
+    ArbiterStake(Address),
+    DisputeDeadline(u64),
 }
 
 #[contracterror]
@@ -1054,6 +1065,12 @@ pub enum EscrowError {
     BatchLimitExceeded = 409,
     /// Dispute award amounts are negative or do not sum to the escrow balance.
     InvalidDisputeAward = 410,
+    /// Arbiter staked amount must be greater than zero
+    ArbiterStakedAmountZero = 411,
+    /// Dispute has not yet expired
+    DisputeNotExpired = 412,
+    /// Arbiter is not assigned to this dispute
+    ArbiterNotAssigned = 413,
 }
 
 /// Compact receipt returned to buyers after escrow creation via `get_receipt`.
@@ -2002,6 +2019,100 @@ impl EscrowContract {
             .persistent()
             .get(&votes_key)
             .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
+    }
+
+    pub fn register_arbiter_with_stake(
+        env: Env,
+        arbiter: Address,
+        stake_amount: i128,
+    ) -> Result<bool, EscrowError> {
+        arbiter.require_auth();
+        if stake_amount <= 0 {
+            return Err(EscrowError::ArbiterStakedAmountZero);
+        }
+        
+        let record = ArbiterStakingRecord {
+            arbiter: arbiter.clone(),
+            staked_amount: stake_amount,
+            assigned_disputes_count: 0,
+            is_slashed: false,
+        };
+        env.storage().persistent().set(&DataKey::ArbiterStake(arbiter), &record);
+        Ok(true)
+    }
+
+    pub fn slash_delinquent_arbiter(
+        env: Env,
+        escrow_id: u64,
+        caller: Address,
+    ) -> Result<bool, EscrowError> {
+        caller.require_auth();
+        let escrow_key = DataKey::Escrow(escrow_id);
+        let escrow: EscrowRecord = match env.storage().persistent().get(&escrow_key) {
+            Some(rec) => rec,
+            None => return Err(EscrowError::NotFound),
+        };
+        
+        let deadline: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeDeadline(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+            
+        if env.ledger().timestamp() <= deadline {
+            return Err(EscrowError::DisputeNotExpired);
+        }
+
+        let quorum_config: QuorumConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::QuorumConfig)
+            .ok_or(EscrowError::QuorumConfigNotSet)?;
+
+        let votes_key = DataKey::DisputeVotes(escrow_id);
+        let votes: soroban_sdk::Vec<DisputeVote> = env
+            .storage()
+            .persistent()
+            .get(&votes_key)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+
+        let token_client = soroban_sdk::token::Client::new(&env, &escrow.token);
+        
+        let mut slashed_any = false;
+        
+        for arbiter in quorum_config.arbiters.iter() {
+            let has_voted = votes.iter().any(|v| v.arbiter == arbiter);
+            if !has_voted {
+                let stake_key = DataKey::ArbiterStake(arbiter.clone());
+                if let Some(mut arbiter_record) = env.storage().persistent().get::<_, ArbiterStakingRecord>(&stake_key) {
+                    if !arbiter_record.is_slashed && arbiter_record.staked_amount > 0 {
+                        arbiter_record.is_slashed = true;
+                        let penalty = arbiter_record.staked_amount / 2;
+                        if penalty > 0 {
+                            token_client.transfer(
+                                &env.current_contract_address(),
+                                &escrow.buyer,
+                                &penalty,
+                            );
+                            token_client.transfer(
+                                &env.current_contract_address(),
+                                &escrow.seller,
+                                &penalty,
+                            );
+                        }
+                        arbiter_record.staked_amount = 0;
+                        env.storage().persistent().set(&stake_key, &arbiter_record);
+                        slashed_any = true;
+                    }
+                }
+            }
+        }
+        
+        if !slashed_any {
+            return Err(EscrowError::NotFound);
+        }
+        
+        Ok(true)
     }
 
     /// Update the fee percentage. Admin-only.
@@ -3962,6 +4073,10 @@ impl EscrowContract {
         record.status = EscrowStatus::Disputed;
         record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
+
+        // 7 days statutory resolution window (604800 seconds)
+        let deadline = env.ledger().timestamp() + 604800;
+        env.storage().persistent().set(&DataKey::DisputeDeadline(escrow_id), &deadline);
 
         env.events().publish(
             (
