@@ -169,11 +169,14 @@ mod error_code_tests {
         PermissionError::TimeLockActive as u32,
         PermissionError::LimitBelowSpent as u32,
         PermissionError::ExceedsAllowance as u32,
+        PermissionError::InvalidExpiry as u32,
         PermissionError::NotInitialized as u32,
     ];
 
     #[test]
     fn permission_error_codes_are_unique_and_in_reserved_range() {
+        assert_eq!(PERMISSION_ERROR_CODES.len(), 29);
+
         let permission_range = ERROR_CODE_RANGES
             .iter()
             .find(|entry| entry.0 == "PermissionError")
