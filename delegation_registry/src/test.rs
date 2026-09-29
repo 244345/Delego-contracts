@@ -343,6 +343,49 @@ fn test_sweep_expired_skips_revoked_and_unknown_ids() {
 }
 
 #[test]
+fn test_sweep_expired_rejects_empty_and_oversized_batches() {
+    let (env, client, _, _, _, _) = setup();
+    let empty = Vec::<u64>::new(&env);
+    assert_eq!(
+        client.try_sweep_expired(&empty),
+        Err(Ok(DelegationError::InvalidBatchSize))
+    );
+
+    let mut oversized = Vec::<u64>::new(&env);
+    for id in 1..=MAX_SWEEP_BATCH_SIZE + 1 {
+        oversized.push_back(id as u64);
+    }
+    assert_eq!(
+        client.try_sweep_expired(&oversized),
+        Err(Ok(DelegationError::InvalidBatchSize))
+    );
+}
+
+#[test]
+fn test_sweep_expired_full_batch_of_50_stays_within_budget() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "batch_sweep");
+    let mut ids = Vec::<u64>::new(&env);
+    for _ in 0..MAX_SWEEP_BATCH_SIZE {
+        ids.push_back(client.create_delegation(
+            &owner,
+            &agent_id,
+            &permissions_contract,
+            &label,
+            &100,
+        ));
+    }
+
+    env.ledger().set_sequence_number(300);
+    assert_eq!(client.sweep_expired(&ids).len(), MAX_SWEEP_BATCH_SIZE);
+    let budget = env.cost_estimate().budget();
+    assert!(budget.cpu_instruction_cost() < 50_000_000);
+    assert!(budget.memory_bytes_cost() < 30_000_000);
+}
+
+#[test]
 fn test_get_expired_delegations_returns_correct_list() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();

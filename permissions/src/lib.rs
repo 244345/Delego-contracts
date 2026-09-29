@@ -59,7 +59,8 @@ pub const MAX_VELOCITY_INTERVAL: u32 = 6_307_200;
 pub const DEFAULT_DECREASE_TIMELOCK_SECS: u64 = 86_400;
 /// Maximum configurable allowance-decrease timelock (30 days).
 pub const MAX_DECREASE_TIMELOCK_SECS: u64 = 2_592_000;
-pub const MAX_SWEEP_BATCH: u32 = 50;
+pub const MAX_SWEEP_BATCH_SIZE: u32 = 50;
+pub const MAX_SWEEP_BATCH: u32 = MAX_SWEEP_BATCH_SIZE;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -2952,7 +2953,7 @@ impl PermissionsContract {
     ) -> Result<u32, PermissionError> {
         caller.require_auth();
 
-        if pairs.len() > MAX_SWEEP_BATCH {
+        if pairs.is_empty() || pairs.len() > MAX_SWEEP_BATCH_SIZE {
             return Err(PermissionError::InvalidParam);
         }
 
@@ -2992,7 +2993,7 @@ impl PermissionsContract {
     ) -> Result<u32, PermissionError> {
         caller.require_auth();
 
-        if pairs.len() > MAX_SWEEP_BATCH {
+        if pairs.is_empty() || pairs.len() > MAX_SWEEP_BATCH_SIZE {
             return Err(PermissionError::InvalidParam);
         }
 
