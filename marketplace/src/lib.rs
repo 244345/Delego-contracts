@@ -224,6 +224,8 @@ pub enum MarketplaceError {
     MerchantCategoryNotAllowed = 4020,
     /// `metadata_uri` field exceeds [`MAX_METADATA_URI_LEN`] bytes.
     MetadataUriTooLong = 4021,
+    /// A payout address change is already pending for this merchant.
+    PendingPayoutChangeExists = 4022,
 }
 
 // --- Events ---
@@ -279,6 +281,14 @@ pub struct MerchantCategoryChangedEvent {
 pub struct MerchantMetadataUpdatedEvent {
     pub merchant_id: u64,
     pub new_metadata: Option<String>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantPayoutChangeScheduledEvent {
+    pub merchant_id: u64,
+    pub proposed_payout_address: Address,
+    pub effective_at_ledger: u32,
 }
 
 #[contracttype]
@@ -428,6 +438,8 @@ pub enum DataKey {
     LastMetadataUpdate(u64),
     GlobalReputationContract,
     Categories,
+    MerchantPayoutAddress(u64),
+    PendingPayoutChange(u64),
 }
 
 /// Mirror of `ReputationScore` from `delego-reputation` for cross-contract deserialization.
@@ -451,6 +463,7 @@ const MAX_METADATA_COOLDOWN_SECS: u64 = 30 * 24 * 60 * 60;
 const MAX_PAGE_LIMIT: u32 = 50;
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280; // ~1 day of ledgers (5s/ledger)
 const PERSISTENT_BUMP_AMOUNT: u32 = 518_400; // ~30 days of ledgers
+pub const PAYOUT_CHANGE_COOLDOWN_LEDGERS: u32 = 17_280; // ~24 hours
 
 pub(crate) fn normalize_symbol(env: &Env, sym: &Symbol) -> Symbol {
     use soroban_sdk::xdr::ToXdr;
@@ -476,6 +489,15 @@ pub(crate) fn normalize_symbol(env: &Env, sym: &Symbol) -> Symbol {
     }
     sym.clone()
 }
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingPayoutChange {
+    pub merchant_id: u64,
+    pub proposed_payout_address: Address,
+    pub effective_at_ledger: u32,
+}
+
 // --- Merchant profile field bounds ---
 //
 // Caps on `RegisterParams` (and the corresponding `update_merchant_profile`)
@@ -962,6 +984,146 @@ impl MarketplaceContract {
         );
 
         Ok(())
+    }
+
+    // --- Payout Address Timelock ---
+
+    /// Schedule a payout address change subject to a 24-hour ledger cooldown.
+    ///
+    /// Only the merchant owner may schedule a change. The proposed address is
+    /// not applied immediately; it becomes effective once the ledger sequence
+    /// reaches `effective_at_ledger`. Off-chain indexers are notified via
+    /// `MerchantPayoutChangeScheduledEvent`.
+    pub fn schedule_payout_change(
+        env: Env,
+        merchant_id: u64,
+        caller: Address,
+        proposed_payout_address: Address,
+    ) -> Result<(), MarketplaceError> {
+        caller.require_auth();
+
+        let merchant = Self::get_merchant(env.clone(), merchant_id)?;
+        Self::check_not_frozen_or_closed(&merchant)?;
+
+        if merchant.owner != Some(caller) {
+            return Err(MarketplaceError::Unauthorized);
+        }
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::PendingPayoutChange(merchant_id))
+        {
+            return Err(MarketplaceError::PendingPayoutChangeExists);
+        }
+
+        let effective_at_ledger = env
+            .ledger()
+            .sequence()
+            .saturating_add(PAYOUT_CHANGE_COOLDOWN_LEDGERS);
+
+        let pending = PendingPayoutChange {
+            merchant_id,
+            proposed_payout_address: proposed_payout_address.clone(),
+            effective_at_ledger,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingPayoutChange(merchant_id), &pending);
+        env.storage().persistent().extend_ttl(
+            &DataKey::PendingPayoutChange(merchant_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("pay_sched"),
+                merchant_id,
+            ),
+            MerchantPayoutChangeScheduledEvent {
+                merchant_id,
+                proposed_payout_address,
+                effective_at_ledger,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Cancel a pending payout address change during the timelock.
+    ///
+    /// Only the merchant owner may cancel, allowing recovery if the change was
+    /// unauthorized.
+    pub fn cancel_payout_change(
+        env: Env,
+        merchant_id: u64,
+        caller: Address,
+    ) -> Result<(), MarketplaceError> {
+        caller.require_auth();
+
+        let merchant = Self::get_merchant(env.clone(), merchant_id)?;
+        if merchant.owner != Some(caller) {
+            return Err(MarketplaceError::Unauthorized);
+        }
+
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::PendingPayoutChange(merchant_id))
+        {
+            return Err(MarketplaceError::MerchantNotFound);
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingPayoutChange(merchant_id));
+
+        Ok(())
+    }
+
+    /// Apply a pending payout address change once the cooldown has elapsed.
+    pub fn apply_payout_change(
+        env: Env,
+        merchant_id: u64,
+    ) -> Result<Address, MarketplaceError> {
+        let pending: PendingPayoutChange = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingPayoutChange(merchant_id))
+            .ok_or(MarketplaceError::MerchantNotFound)?;
+
+        if env.ledger().sequence() < pending.effective_at_ledger {
+            return Err(MarketplaceError::MetadataLockActive);
+        }
+
+        env.storage().persistent().set(
+            &DataKey::MerchantPayoutAddress(merchant_id),
+            &pending.proposed_payout_address,
+        );
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingPayoutChange(merchant_id));
+
+        Ok(pending.proposed_payout_address)
+    }
+
+    /// Return the currently effective payout address for a merchant, if set.
+    pub fn get_payout_address(env: Env, merchant_id: u64) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantPayoutAddress(merchant_id))
+    }
+
+    /// Return the pending payout change for a merchant, if any.
+    pub fn get_pending_payout_change(
+        env: Env,
+        merchant_id: u64,
+    ) -> Option<PendingPayoutChange> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingPayoutChange(merchant_id))
     }
 
     // --- Category Management ---
