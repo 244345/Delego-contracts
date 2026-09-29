@@ -40,6 +40,8 @@ pub enum EscrowStatus {
     Disputed,
     /// Escrow has been cancelled by an authorized party.
     Cancelled,
+    /// Initial ruling issued in two-tiered dispute — 48-hour appeal window open (issue #354).
+    InitialRuling,
 }
 
 /// Terminal states an escrow can reach after it is no longer active.
@@ -112,6 +114,10 @@ pub struct EscrowRecord {
 
 /// Token-unit threshold above which escrow releases require finance approval.
 pub const DUAL_CONTROL_THRESHOLD: i128 = 10_000;
+
+/// 48 hours in ledgers at ~5 seconds per ledger (17280 ledgers ≈ 48 hours).
+/// Used for the appeal window in two-tiered dispute resolution (issue #354).
+pub const APPEAL_WINDOW_LEDGERS: u32 = 17_280;
 
 /// Finance approval state for a high-value escrow.
 #[contracttype]
@@ -764,6 +770,35 @@ pub struct DisputeVotesPrunedEvent {
     pub pruned_by: Address,
 }
 
+/// Status of a dispute appeal in the two-tiered resolution system.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AppealStatus {
+    /// Initial ruling issued — 48-hour appeal window open.
+    PendingAppealWindow,
+    /// Appeal filed and bond deposited — awaiting council review.
+    Appealed,
+    /// Dispute finalized — either uncontested after deadline or appeal resolved.
+    Finalized,
+}
+
+/// Record tracking a dispute appeal's state in the two-tiered resolution system.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeAppealRecord {
+    /// The party who won the initial ruling.
+    pub initial_winner: Address,
+    /// The party who filed the appeal.
+    pub appealed_by: Address,
+    /// Amount in stroops locked as appeal bond.
+    pub appeal_bond_amount: i128,
+    /// Ledger sequence after which the appeal window closes.
+    /// If no appeal is filed before this ledger, ruling is auto-finalized.
+    pub appeal_deadline_ledger: u32,
+    /// Current status of the appeal.
+    pub status: AppealStatus,
+}
+
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -820,6 +855,10 @@ pub enum DataKey {
     UpgradeProposal,
     /// M-of-N admin approvals required to execute an upgrade (issue #292).
     UpgradeThreshold,
+    /// Two-tiered dispute appeal record, keyed by escrow_id (issue #354).
+    DisputeAppeal(u64),
+    /// Address of the appeals council authorized to finalize appeals (issue #354).
+    AppealsCouncil,
 }
 
 #[contracterror]
@@ -1054,6 +1093,18 @@ pub enum EscrowError {
     BatchLimitExceeded = 409,
     /// Dispute award amounts are negative or do not sum to the escrow balance.
     InvalidDisputeAward = 410,
+    /// Appeal filing window has expired (issue #354).
+    AppealWindowExpired = 411,
+    /// An appeal has already been filed for this dispute (issue #354).
+    AppealAlreadyFiled = 412,
+    /// No appeal found for this escrow (issue #354).
+    NoAppealFound = 413,
+    /// Caller is not the appeals council (issue #354).
+    NotAppealsCouncil = 414,
+    /// Escrow dispute is not in InitialRuling status (issue #354).
+    DisputeNotInitialRuling = 415,
+    /// Appeal bond amount is below minimum required (issue #354).
+    AppealBondInsufficient = 416,
 }
 
 /// Compact receipt returned to buyers after escrow creation via `get_receipt`.
@@ -3978,7 +4029,19 @@ impl EscrowContract {
         Ok(true)
     }
 
-    /// Resolve a disputed escrow. Only the admin may call.
+    /// Resolve a disputed escrow with an initial ruling. Only the admin may call.
+    ///
+    /// # Two-Tiered Resolution (issue #354)
+    ///
+    /// Instead of immediately releasing funds, this function transitions the escrow
+    /// to `InitialRuling` status and opens a 48-hour appeal window. Funds remain
+    /// escrowed until the ruling is finalized by either:
+    /// - `finalize_uncontested_ruling` (called after appeal window expires with no appeal)
+    /// - `finalize_dispute_appeal` (called by appeals council to finalize an appeal)
+    ///
+    /// The `release_to_seller` parameter determines who would win if the ruling stands:
+    /// - `true`: seller wins (receives funds minus fee)
+    /// - `false`: buyer wins (receives full refund)
     pub fn resolve_dispute(
         env: Env,
         escrow_id: u64,
@@ -4001,39 +4064,48 @@ impl EscrowContract {
             return Err(EscrowError::NotDisputed);
         }
 
-        let token_client = soroban_sdk::token::Client::new(&env, &record.token);
-        if release_to_seller {
-            let payout = Self::compute_payout(&env, record.amount)?;
-            Self::distribute_fee(&env, &token_client, payout.fee)?;
-            token_client.transfer(
-                &env.current_contract_address(),
-                &record.seller,
-                &payout.seller_net,
-            );
-            record.status = EscrowStatus::Released;
+        // Determine the initial winner based on the ruling direction
+        let initial_winner = if release_to_seller {
+            record.seller.clone()
         } else {
-            token_client.transfer(
-                &env.current_contract_address(),
-                &record.buyer,
-                &record.amount,
-            );
-            record.status = EscrowStatus::Refunded;
-        }
+            record.buyer.clone()
+        };
 
+        // Compute the minimum appeal bond (10% of escrow amount, minimum 100 stroops)
+        let appeal_bond = record.amount / 10;
+        let appeal_bond = appeal_bond.max(100);
+
+        // Create the appeal record with the 48-hour window
+        let appeal_record = DisputeAppealRecord {
+            initial_winner: initial_winner.clone(),
+            appealed_by: initial_winner.clone(), // placeholder, will be overwritten on actual appeal
+            appeal_bond_amount: appeal_bond,
+            appeal_deadline_ledger: env.ledger().sequence() + APPEAL_WINDOW_LEDGERS,
+            status: AppealStatus::PendingAppealWindow,
+        };
+
+        // Store the appeal record
+        env.storage().persistent().set(
+            &DataKey::DisputeAppeal(escrow_id),
+            &appeal_record,
+        );
+
+        // Transition escrow to InitialRuling (funds remain held)
+        record.status = EscrowStatus::InitialRuling;
         record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
+        // Emit event: initial ruling issued, appeal window open
         env.events().publish(
             (
                 symbol_short!("escrow"),
-                symbol_short!("resolved"),
+                symbol_short!("initial_r"),
                 escrow_id,
             ),
-            EscrowResolvedEvent {
-                escrow_id,
-                release_to_seller,
-                resolved_by: caller,
-            },
+            (
+                initial_winner.clone(),
+                appeal_record.appeal_deadline_ledger,
+            ),
         );
 
         Ok(true)
@@ -4126,6 +4198,295 @@ impl EscrowContract {
                 resolved_by: caller,
             },
         );
+        Ok(true)
+    }
+
+    /// Files an appeal against an initial dispute ruling (issue #354).
+    ///
+    /// The losing party must deposit the appeal bond within the 48-hour window
+    /// to escalate the dispute to the appeals council for review.
+    ///
+    /// # Bond mechanics
+    ///
+    /// - Bond amount is defined in the DisputeAppealRecord created during `resolve_dispute`
+    /// - Bond is transferred from appealer to the contract for escrow
+    /// - If appeal fails (council upholds initial ruling): bond is slashed to the initial winner
+    /// - If appeal succeeds (council reverses): bond is returned to the appealer
+    ///
+    /// # Errors
+    ///
+    /// * `DisputeNotInitialRuling` if escrow is not in InitialRuling status
+    /// * `AppealWindowExpired` if deadline_ledger has passed
+    /// * `AppealAlreadyFiled` if an appeal already exists for this dispute
+    /// * `AppealBondInsufficient` if the caller has insufficient token balance
+    pub fn file_dispute_appeal(
+        env: Env,
+        escrow_id: u64,
+        caller: Address,
+    ) -> Result<bool, EscrowError> {
+        caller.require_auth();
+
+        // Load escrow — must be in InitialRuling status
+        let key = DataKey::Escrow(escrow_id);
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+
+        if record.status != EscrowStatus::InitialRuling {
+            return Err(EscrowError::DisputeNotInitialRuling);
+        }
+
+        // Load appeal record
+        let appeal_key = DataKey::DisputeAppeal(escrow_id);
+        let mut appeal: DisputeAppealRecord = env
+            .storage()
+            .persistent()
+            .get(&appeal_key)
+            .ok_or(EscrowError::NoAppealFound)?;
+
+        // Check that appeal window is still open
+        if env.ledger().sequence() > appeal.appeal_deadline_ledger {
+            return Err(EscrowError::AppealWindowExpired);
+        }
+
+        // Check that an appeal hasn't already been filed
+        if appeal.status != AppealStatus::PendingAppealWindow {
+            return Err(EscrowError::AppealAlreadyFiled);
+        }
+
+        // Determine the losing party (whoever is not the initial winner)
+        let is_caller_winner = caller == appeal.initial_winner;
+        if is_caller_winner {
+            return Err(EscrowError::Unauthorized); // Winner can't file appeal
+        }
+
+        // Transfer bond from caller to contract
+        let token_client = soroban_sdk::token::Client::new(&env, &record.token);
+        token_client.transfer(
+            &caller,
+            &env.current_contract_address(),
+            &appeal.appeal_bond_amount,
+        );
+
+        // Record appeal
+        appeal.appealed_by = caller.clone();
+        appeal.status = AppealStatus::Appealed;
+        env.storage().persistent().set(&appeal_key, &appeal);
+
+        // Emit event
+        env.events().publish(
+            (
+                symbol_short!("escrow"),
+                symbol_short!("appealed"),
+                escrow_id,
+            ),
+            (caller, appeal.appeal_bond_amount),
+        );
+
+        Ok(true)
+    }
+
+    /// Finalizes an appeal and enforces the final ruling (issue #354).
+    ///
+    /// Called by the appeals council only. Resolves the appeal with a final winner
+    /// and handles bond slashing:
+    /// - If appeal fails (final_winner == initial_winner): bond is slashed to initial winner
+    /// - If appeal succeeds (final_winner != initial_winner): bond is returned to appealer
+    ///
+    /// After finalization, escrow funds are released according to the final ruling
+    /// and the escrow transitions to terminal state (Released or Refunded).
+    ///
+    /// # Errors
+    ///
+    /// * `NotAppealsCouncil` if caller is not the configured appeals council
+    /// * `NoAppealFound` if no appeal record exists for this escrow
+    /// * `NotFound` if escrow record doesn't exist
+    pub fn finalize_dispute_appeal(
+        env: Env,
+        escrow_id: u64,
+        caller: Address,
+        final_winner: Address,
+    ) -> Result<bool, EscrowError> {
+        caller.require_auth();
+
+        // Verify caller is the appeals council
+        let council_key = DataKey::AppealsCouncil;
+        let council: Address = env
+            .storage()
+            .instance()
+            .get(&council_key)
+            .ok_or(EscrowError::NotAppealsCouncil)?;
+
+        if caller != council {
+            return Err(EscrowError::NotAppealsCouncil);
+        }
+
+        // Load appeal — must be in Appealed status
+        let appeal_key = DataKey::DisputeAppeal(escrow_id);
+        let mut appeal: DisputeAppealRecord = env
+            .storage()
+            .persistent()
+            .get(&appeal_key)
+            .ok_or(EscrowError::NoAppealFound)?;
+
+        if appeal.status != AppealStatus::Appealed {
+            return Err(EscrowError::NoAppealFound);
+        }
+
+        // Load escrow
+        let key = DataKey::Escrow(escrow_id);
+        let mut record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+
+        // Determine if appeal succeeded (final winner is not the initial winner)
+        let appeal_succeeded = final_winner != appeal.initial_winner;
+
+        // Handle bond slashing logic
+        let token_client = soroban_sdk::token::Client::new(&env, &record.token);
+        let contract_address = env.current_contract_address();
+
+        if appeal_succeeded {
+            // Appeal succeeded — return bond to appealer
+            token_client.transfer(
+                &contract_address,
+                &appeal.appealed_by,
+                &appeal.appeal_bond_amount,
+            );
+        } else {
+            // Appeal failed — slash bond to initial winner
+            token_client.transfer(
+                &contract_address,
+                &appeal.initial_winner,
+                &appeal.appeal_bond_amount,
+            );
+        }
+
+        // Release escrow funds to final winner
+        let payout = Self::compute_payout(&env, record.amount)?;
+        
+        if final_winner == record.seller {
+            // Seller wins: release to seller minus fee
+            Self::distribute_fee(&env, &token_client, payout.fee)?;
+            token_client.transfer(
+                &contract_address,
+                &final_winner,
+                &payout.seller_net,
+            );
+            record.status = EscrowStatus::Released;
+        } else {
+            // Buyer wins: refund to buyer
+            token_client.transfer(
+                &contract_address,
+                &final_winner,
+                &record.amount,
+            );
+            record.status = EscrowStatus::Refunded;
+        }
+
+        // Finalize
+        appeal.status = AppealStatus::Finalized;
+        record.updated_at = env.ledger().timestamp();
+
+        env.storage().persistent().set(&appeal_key, &appeal);
+        env.storage().persistent().set(&key, &record);
+
+        // Emit event
+        env.events().publish(
+            (
+                symbol_short!("escrow"),
+                symbol_short!("fin_appea"),
+                escrow_id,
+            ),
+            (final_winner, appeal_succeeded),
+        );
+
+        Ok(true)
+    }
+
+    /// Auto-finalizes an uncontested ruling after the appeal window expires (issue #354).
+    ///
+    /// Can be called by anyone after the appeal deadline has passed without
+    /// an appeal being filed. Releases escrow funds to the initial winner
+    /// (since the ruling went uncontested).
+    ///
+    /// # Errors
+    ///
+    /// * `NoAppealFound` if no appeal record exists
+    /// * `AppealAlreadyFiled` if an appeal has already been filed
+    /// * `AppealWindowExpired` if the appeal window is still open (use correct condition)
+    pub fn finalize_uncontested_ruling(env: Env, escrow_id: u64) -> Result<bool, EscrowError> {
+        // Load appeal record
+        let appeal_key = DataKey::DisputeAppeal(escrow_id);
+        let appeal: DisputeAppealRecord = env
+            .storage()
+            .persistent()
+            .get(&appeal_key)
+            .ok_or(EscrowError::NoAppealFound)?;
+
+        // Must be in PendingAppealWindow status (no appeal filed yet)
+        if appeal.status != AppealStatus::PendingAppealWindow {
+            return Err(EscrowError::AppealAlreadyFiled);
+        }
+
+        // Must be past the deadline
+        if env.ledger().sequence() <= appeal.appeal_deadline_ledger {
+            return Err(EscrowError::AppealWindowExpired);
+        }
+
+        // Load escrow
+        let key = DataKey::Escrow(escrow_id);
+        let mut record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+
+        // Release to initial winner (ruling stands uncontested)
+        let token_client = soroban_sdk::token::Client::new(&env, &record.token);
+        let payout = Self::compute_payout(&env, record.amount)?;
+
+        if appeal.initial_winner == record.seller {
+            // Seller wins: release to seller minus fee
+            Self::distribute_fee(&env, &token_client, payout.fee)?;
+            token_client.transfer(
+                &env.current_contract_address(),
+                &appeal.initial_winner,
+                &payout.seller_net,
+            );
+            record.status = EscrowStatus::Released;
+        } else {
+            // Buyer wins: refund to buyer
+            token_client.transfer(
+                &env.current_contract_address(),
+                &appeal.initial_winner,
+                &record.amount,
+            );
+            record.status = EscrowStatus::Refunded;
+        }
+
+        // Finalize
+        let mut final_appeal = appeal;
+        final_appeal.status = AppealStatus::Finalized;
+        record.updated_at = env.ledger().timestamp();
+
+        env.storage().persistent().set(&appeal_key, &final_appeal);
+        env.storage().persistent().set(&key, &record);
+
+        // Emit event
+        env.events().publish(
+            (
+                symbol_short!("escrow"),
+                symbol_short!("uncontst"),
+                escrow_id,
+            ),
+            appeal.initial_winner,
+        );
+
         Ok(true)
     }
 
@@ -4609,6 +4970,28 @@ impl EscrowContract {
         env.storage()
             .instance()
             .set(&DataKey::MerchantRegistry, &registry);
+        Ok(true)
+    }
+
+    /// Set the appeals council address for two-tiered dispute resolution (issue #354).
+    ///
+    /// The appeals council is the only address authorized to call `finalize_dispute_appeal`
+    /// to resolve appeals. This enables a decentralized governance model where multiple
+    /// arbiters can review dispute appeals and overturn initial rulings.
+    ///
+    /// Admin-only.
+    pub fn set_appeals_council(
+        env: Env,
+        admin: Address,
+        council: Address,
+    ) -> Result<bool, EscrowError> {
+        admin.require_auth();
+        if !Self::is_admin(env.clone(), admin) {
+            return Err(EscrowError::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::AppealsCouncil, &council);
         Ok(true)
     }
 
