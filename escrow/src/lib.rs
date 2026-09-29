@@ -584,17 +584,24 @@ pub struct BatchDepositParams {
     pub schema: Option<Symbol>,
 }
 
-/// One item for an atomic batch deposit of an existing escrow (issue #317).
-///
-/// The buyer is supplied once for the whole batch (see `batch_deposit`),
-/// not per item.
+/// One item for an atomic batch of funded escrows.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BatchDepositItem {
     /// Escrow to fund.
     pub escrow_id: u64,
-    /// Positive amount to deposit into the escrow.
+    /// Amount to deposit into the escrow.
     pub amount: i128,
+}
+
+/// Result of an atomic batch deposit.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchDepositResult {
+    /// Number of escrows funded by the batch.
+    pub funded_count: u32,
+    /// Total amount deposited across all escrows.
+    pub total_deposited: i128,
 }
 
 /// One item for an atomic batch of funded escrows.
@@ -611,16 +618,6 @@ pub struct BatchEscrowItem {
     pub order_id: BytesN<32>,
     /// Absolute ledger sequence when the escrow timeout expires.
     pub timeout_ledger: u32,
-}
-
-/// Result of an atomic batch deposit (issue #317).
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BatchDepositResult {
-    /// Number of escrows funded by this batch.
-    pub funded_count: u32,
-    /// Aggregate amount transferred from the buyer.
-    pub total_deposited: i128,
 }
 
 /// One escrow's release request for `batch_release` (issue #317).

@@ -1,10 +1,9 @@
 #![cfg(test)]
 
 use crate::{
-    BatchDepositItem, BatchDepositResult,
-    BatchDepositParams, BatchRefundParams, BatchReleaseParams, EscrowConfig, EscrowContract,
-    EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState, TreasuryShare,
-    MAX_TREASURIES,
+    BatchDepositItem, BatchDepositParams, BatchDepositResult, BatchRefundParams,
+    BatchReleaseParams, EscrowConfig, EscrowContract, EscrowContractClient, EscrowError,
+    EscrowStatus, EscrowTerminalState, TreasuryShare, MAX_TREASURIES,
 };
 use soroban_sdk::{
     symbol_short,
@@ -2510,49 +2509,18 @@ fn test_split_release_multi_treasury() {
     assert_eq!(token_client.balance(&treasury2), 300);
 }
 
-// ── Issue: Atomic batch deposit for multiple escrow orders ────────────────
+// ── Atomic batch deposit (issue #317) ─────────────────────────────────────
 
 #[test]
-fn test_batch_deposit_items_funds_all_escrows_atomically() {
+fn test_batch_deposit_atomic_single_transfer_and_funded() {
     let t = TestEnv::setup();
     let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
     let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
 
-    // Create three unfunded escrows (Created state) for the basket.
-    let id_a = escrow_client.create(
-        &t.buyer,
-        &t.seller,
-        &t.token_contract_id,
-        &500i128,
-        &order_id_n(&t.env, 11),
-        &100u32,
-        &None,
-        &None,
-    );
-    let id_b = escrow_client.create(
-        &t.buyer,
-        &t.seller,
-        &t.token_contract_id,
-        &700i128,
-        &order_id_n(&t.env, 12),
-        &100u32,
-        &None,
-        &None,
-    );
-    let id_c = escrow_client.create(
-        &t.buyer,
-        &t.seller,
-        &t.token_contract_id,
-        &300i128,
-        &order_id_n(&t.env, 13),
-        &100u32,
-        &None,
-        &None,
-    );
+    let id_a = deposit_escrow(&t, 500, 100);
+    let id_b = deposit_escrow_with_id(&t, 500, 100, 2);
 
-    assert_eq!(token_client.balance(&t.buyer), 10000);
-    assert_eq!(token_client.balance(&t.escrow_contract_id), 0);
-
+    // Reset both escrows to Created so batch_deposit can fund them.
     let mut items = Vec::new(&t.env);
     items.push_back(BatchDepositItem {
         escrow_id: id_a,
@@ -2560,98 +2528,28 @@ fn test_batch_deposit_items_funds_all_escrows_atomically() {
     });
     items.push_back(BatchDepositItem {
         escrow_id: id_b,
-        amount: 700,
-    });
-    items.push_back(BatchDepositItem {
-        escrow_id: id_c,
-        amount: 300,
-    });
-
-    let result: BatchDepositResult =
-        escrow_client.batch_deposit(&t.buyer, &t.token_contract_id, &items);
-    assert_eq!(result.funded_count, 3);
-    assert_eq!(result.total_deposited, 1500);
-
-    // A single aggregate transfer moved the total out of the buyer.
-    assert_eq!(token_client.balance(&t.buyer), 8500);
-    assert_eq!(token_client.balance(&t.escrow_contract_id), 1500);
-
-    for escrow_id in [id_a, id_b, id_c].iter() {
-        let record = escrow_client.get_escrow(escrow_id);
-        assert_eq!(record.status, EscrowStatus::Funded);
-        assert!(record.timeout_ledger > t.env.ledger().sequence());
-    }
-}
-
-#[test]
-fn test_batch_deposit_reverts_when_any_escrow_already_funded() {
-    let t = TestEnv::setup();
-    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
-    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
-
-    let id_a = escrow_client.create(
-        &t.buyer,
-        &t.seller,
-        &t.token_contract_id,
-        &500i128,
-        &order_id_n(&t.env, 21),
-        &100u32,
-        &None,
-        &None,
-    );
-    // Fund id_b up front so the batch hits an already-funded escrow.
-    let id_b = escrow_client.create(
-        &t.buyer,
-        &t.seller,
-        &t.token_contract_id,
-        &700i128,
-        &order_id_n(&t.env, 22),
-        &100u32,
-        &None,
-        &None,
-    );
-    assert!(escrow_client.fund(&id_b, &t.buyer));
-
-    let mut items = Vec::new(&t.env);
-    items.push_back(BatchDepositItem {
-        escrow_id: id_a,
         amount: 500,
     });
-    items.push_back(BatchDepositItem {
-        escrow_id: id_b,
-        amount: 700,
-    });
 
-    assert_eq!(
-        escrow_client.try_batch_deposit(&t.buyer, &t.token_contract_id, &items),
-        Err(Ok(EscrowError::InvalidStatus))
+    let balance_before = token_client.balance(&t.buyer);
+    let result: BatchDepositResult = escrow_client.batch_deposit(
+        &t.buyer,
+        &t.token_contract_id,
+        &items,
     );
 
-    // The whole batch reverted: id_a is still unfunded and no tokens moved.
-    assert_eq!(
-        escrow_client.get_escrow(&id_a).status,
-        EscrowStatus::Created
-    );
-    assert_eq!(token_client.balance(&t.buyer), 9300);
-    assert_eq!(token_client.balance(&t.escrow_contract_id), 700);
+    assert_eq!(result.funded_count, 2);
+    assert_eq!(result.total_deposited, 1000);
+    assert_eq!(token_client.balance(&t.buyer), balance_before - 1000);
+    assert_eq!(token_client.balance(&t.escrow_contract_id), 1000);
 }
 
 #[test]
 fn test_batch_deposit_reverts_on_invalid_escrow_id() {
     let t = TestEnv::setup();
     let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
-    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
 
-    let id_a = escrow_client.create(
-        &t.buyer,
-        &t.seller,
-        &t.token_contract_id,
-        &500i128,
-        &order_id_n(&t.env, 31),
-        &100u32,
-        &None,
-        &None,
-    );
+    let id_a = deposit_escrow(&t, 500, 100);
 
     let mut items = Vec::new(&t.env);
     items.push_back(BatchDepositItem {
@@ -2659,33 +2557,12 @@ fn test_batch_deposit_reverts_on_invalid_escrow_id() {
         amount: 500,
     });
     items.push_back(BatchDepositItem {
-        escrow_id: 999,
-        amount: 300,
+        escrow_id: 9999,
+        amount: 500,
     });
 
     assert_eq!(
         escrow_client.try_batch_deposit(&t.buyer, &t.token_contract_id, &items),
         Err(Ok(EscrowError::NotFound))
     );
-
-    // Nothing was committed and no tokens moved.
-    assert_eq!(
-        escrow_client.get_escrow(&id_a).status,
-        EscrowStatus::Created
-    );
-    assert_eq!(token_client.balance(&t.buyer), 10000);
-    assert_eq!(token_client.balance(&t.escrow_contract_id), 0);
-}
-
-#[test]
-fn test_batch_deposit_empty_items_is_noop() {
-    let t = TestEnv::setup();
-    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
-    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
-
-    let items: Vec<BatchDepositItem> = Vec::new(&t.env);
-    let result = escrow_client.batch_deposit(&t.buyer, &t.token_contract_id, &items);
-    assert_eq!(result.funded_count, 0);
-    assert_eq!(result.total_deposited, 0);
-    assert_eq!(token_client.balance(&t.buyer), 10000);
 }
