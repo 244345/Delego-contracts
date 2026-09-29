@@ -3430,3 +3430,259 @@ use soroban_sdk::{
         assert_eq!(result, Err(Ok(EscrowError::Unauthorized)));
     }
 }
+
+#[cfg(test)]
+mod schema_and_milestone_tests {
+    use crate::{
+        EscrowConfig, EscrowContract, EscrowContractClient, EscrowError, EscrowStatus, Milestone,
+        MilestoneReleasedEvent, SchemaRegisteredEvent,
+    };
+    use soroban_sdk::{
+        symbol_short,
+        testutils::{Address as _, Events},
+        token::{StellarAssetClient, TokenClient},
+        Address, BytesN, Env, Symbol, TryIntoVal, Vec,
+    };
+
+    struct Setup<'a> {
+        client: EscrowContractClient<'a>,
+        contract_id: Address,
+        admin: Address,
+        buyer: Address,
+        seller: Address,
+        token: Address,
+    }
+
+    fn setup(env: &Env) -> Setup<'_> {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let buyer = Address::generate(env);
+        let seller = Address::generate(env);
+        let token = env
+            .register_stellar_asset_contract_v2(Address::generate(env))
+            .address();
+        let contract_id = env.register(
+            EscrowContract,
+            (EscrowConfig {
+                admin: admin.clone(),
+                fee_bps: 0,
+                treasury: Address::generate(env),
+                min_amount: 100,
+                max_amount: 1_000_000,
+            },),
+        );
+        let client = EscrowContractClient::new(env, &contract_id);
+        StellarAssetClient::new(env, &token).mint(&buyer, &10_000);
+        client.add_token(&admin, &token);
+        Setup {
+            client,
+            contract_id,
+            admin,
+            buyer,
+            seller,
+            token,
+        }
+    }
+
+    fn milestone(env: &Env, id: u32, amount: i128, label: &str) -> Milestone {
+        Milestone {
+            milestone_id: id,
+            amount,
+            description: Symbol::new(env, label),
+            is_completed: false,
+            completed_at: 0,
+        }
+    }
+
+    /// 30% deposit / 40% dispatch / 30% delivery on a 1_000 principal.
+    fn schedule(env: &Env) -> Vec<Milestone> {
+        Vec::from_array(
+            env,
+            [
+                milestone(env, 1, 300, "deposit"),
+                milestone(env, 2, 400, "dispatch"),
+                milestone(env, 3, 300, "delivery"),
+            ],
+        )
+    }
+
+    fn create(s: &Setup, env: &Env, milestones: &Vec<Milestone>) -> u64 {
+        s.client.create_milestone_escrow(
+            &s.buyer,
+            &s.seller,
+            &s.token,
+            &BytesN::from_array(env, &[7; 32]),
+            &1_000,
+            milestones,
+        )
+    }
+
+    // ── Schema registration ────────────────────────────────────────────────
+
+    #[test]
+    fn admin_registers_schema_and_emits_event() {
+        let env = Env::default();
+        let s = setup(&env);
+        let schema = symbol_short!("order_v2");
+        let def_hash = BytesN::from_array(&env, &[42; 32]);
+
+        s.client.register_schema(&s.admin, &schema, &def_hash);
+
+        assert_eq!(s.client.get_schema_definition(&schema), Some(def_hash.clone()));
+        let (contract, topics, data) = env.events().all().last().unwrap();
+        assert_eq!(contract, s.contract_id);
+        let t1: Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t1, symbol_short!("schemreg"));
+        let event: SchemaRegisteredEvent = data.try_into_val(&env).unwrap();
+        assert_eq!(event.schema, schema);
+        assert_eq!(event.schema_definition_uri, def_hash);
+        assert_eq!(event.registered_by, s.admin);
+    }
+
+    #[test]
+    fn non_admin_schema_registration_is_unauthorized() {
+        let env = Env::default();
+        let s = setup(&env);
+        let attacker = Address::generate(&env);
+        let schema = symbol_short!("fake_v1");
+
+        let result = s.client.try_register_schema(
+            &attacker,
+            &schema,
+            &BytesN::from_array(&env, &[1; 32]),
+        );
+
+        assert_eq!(result, Err(Ok(EscrowError::Unauthorized)));
+        assert_eq!(s.client.get_schema_definition(&schema), None);
+    }
+
+    #[test]
+    fn schema_registration_requires_admin_signature() {
+        let env = Env::default();
+        let s = setup(&env);
+        env.mock_auths(&[]);
+
+        let result = s.client.try_register_schema(
+            &s.admin,
+            &symbol_short!("order_v2"),
+            &BytesN::from_array(&env, &[1; 32]),
+        );
+
+        assert!(result.is_err());
+    }
+
+    // ── Milestone escrow ───────────────────────────────────────────────────
+
+    #[test]
+    fn milestones_disburse_on_schedule_and_escrow_terminates() {
+        let env = Env::default();
+        let s = setup(&env);
+        let token = TokenClient::new(&env, &s.token);
+        let escrow_id = create(&s, &env, &schedule(&env));
+
+        let record = s.client.get_escrow(&escrow_id);
+        assert_eq!(record.amount, 1_000);
+        assert_eq!(record.status, EscrowStatus::Funded);
+
+        let r1 = s.client.release_milestone(&escrow_id, &1);
+        assert_eq!((r1.released, r1.remaining, r1.fully_released), (300, 700, false));
+        assert_eq!(token.balance(&s.seller), 300);
+
+        let (_, topics, data) = env.events().all().last().unwrap();
+        let t1: Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t1, symbol_short!("milestone"));
+        let event: MilestoneReleasedEvent = data.try_into_val(&env).unwrap();
+        assert_eq!((event.escrow_id, event.milestone_id, event.amount), (escrow_id, 1, 300));
+        assert_eq!(event.remaining, 700);
+
+        // Out-of-order release is allowed; each milestone pays exactly once.
+        s.client.release_milestone(&escrow_id, &3);
+        assert_eq!(
+            s.client.try_release_milestone(&escrow_id, &3),
+            Err(Ok(EscrowError::MilestoneAlreadyReleased))
+        );
+        assert_eq!(s.client.get_escrow(&escrow_id).status, EscrowStatus::Funded);
+
+        let last = s.client.release_milestone(&escrow_id, &2);
+        assert!(last.fully_released);
+        assert_eq!(token.balance(&s.seller), 1_000);
+        assert_eq!(s.client.get_escrow(&escrow_id).status, EscrowStatus::Released);
+
+        let stored = s.client.get_milestones(&escrow_id).milestones;
+        assert!(stored.iter().all(|m| m.is_completed));
+    }
+
+    #[test]
+    fn release_milestone_requires_buyer_auth() {
+        let env = Env::default();
+        let s = setup(&env);
+        let escrow_id = create(&s, &env, &schedule(&env));
+        env.mock_auths(&[]);
+
+        assert!(s.client.try_release_milestone(&escrow_id, &1).is_err());
+    }
+
+    #[test]
+    fn unknown_milestone_is_rejected() {
+        let env = Env::default();
+        let s = setup(&env);
+        let escrow_id = create(&s, &env, &schedule(&env));
+
+        assert_eq!(
+            s.client.try_release_milestone(&escrow_id, &99),
+            Err(Ok(EscrowError::MilestoneNotFound))
+        );
+    }
+
+    #[test]
+    fn generic_release_paths_are_blocked_for_milestone_escrows() {
+        let env = Env::default();
+        let s = setup(&env);
+        let escrow_id = create(&s, &env, &schedule(&env));
+
+        assert_eq!(
+            s.client.try_partial_release(&escrow_id, &s.buyer, &500),
+            Err(Ok(EscrowError::MilestoneReleaseRequired))
+        );
+        assert_eq!(
+            s.client.try_release(&escrow_id, &s.buyer, &s.seller),
+            Err(Ok(EscrowError::MilestoneReleaseRequired))
+        );
+    }
+
+    #[test]
+    fn invalid_schedules_are_rejected() {
+        let env = Env::default();
+        let s = setup(&env);
+        let order_id = BytesN::from_array(&env, &[7; 32]);
+        let try_create = |milestones: Vec<Milestone>| {
+            s.client.try_create_milestone_escrow(
+                &s.buyer, &s.seller, &s.token, &order_id, &1_000, &milestones,
+            )
+        };
+        let invalid = Err(Ok(EscrowError::InvalidMilestoneSchedule));
+
+        assert_eq!(try_create(Vec::new(&env)), invalid);
+        assert_eq!(
+            try_create(Vec::from_array(&env, [milestone(&env, 1, 0, "zero")])),
+            invalid
+        );
+        assert_eq!(
+            try_create(Vec::from_array(
+                &env,
+                [milestone(&env, 1, 300, "a"), milestone(&env, 1, 300, "b")]
+            )),
+            invalid
+        );
+        let mut done = milestone(&env, 1, 300, "done");
+        done.is_completed = true;
+        assert_eq!(try_create(Vec::from_array(&env, [done])), invalid);
+        assert_eq!(
+            try_create(Vec::from_array(
+                &env,
+                [milestone(&env, 1, i128::MAX, "a"), milestone(&env, 2, 1, "b")]
+            )),
+            invalid
+        );
+    }
+}

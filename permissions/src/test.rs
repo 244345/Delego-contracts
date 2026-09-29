@@ -3045,3 +3045,167 @@ mod test {
         assert!(result.is_err());
     }
 }
+
+#[cfg(test)]
+mod expiry_and_allowance_sweep_tests {
+    use crate::{
+        compute_expiry_ledger, AllowanceReclaimedEvent, PermissionError, PermissionsContract,
+        PermissionsContractClient,
+    };
+    use soroban_sdk::{
+        symbol_short,
+        testutils::{Address as _, Events, Ledger},
+        token::{StellarAssetClient, TokenClient},
+        Address, Env, Symbol, TryIntoVal, Vec,
+    };
+
+    fn setup(env: &Env) -> (PermissionsContractClient<'_>, Address, Address, Address) {
+        env.mock_all_auths();
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(env, &contract_id);
+        (
+            client,
+            Address::generate(env),
+            Address::generate(env),
+            contract_id,
+        )
+    }
+
+    // ── compute_expiry_ledger ──────────────────────────────────────────────
+
+    #[test]
+    fn compute_expiry_ledger_handles_upper_bounds() {
+        assert_eq!(compute_expiry_ledger(100, 50), Ok(150));
+        assert_eq!(compute_expiry_ledger(0, u32::MAX), Ok(u32::MAX));
+        assert_eq!(compute_expiry_ledger(1, u32::MAX - 1), Ok(u32::MAX));
+        assert_eq!(
+            compute_expiry_ledger(1, u32::MAX),
+            Err(PermissionError::InvalidExpiry)
+        );
+        assert_eq!(
+            compute_expiry_ledger(u32::MAX, 1),
+            Err(PermissionError::InvalidExpiry)
+        );
+        assert_eq!(
+            compute_expiry_ledger(u32::MAX, u32::MAX),
+            Err(PermissionError::InvalidExpiry)
+        );
+    }
+
+    #[test]
+    fn invalid_expiry_code_is_2412() {
+        assert_eq!(PermissionError::InvalidExpiry as u32, 2412);
+    }
+
+    #[test]
+    fn grant_with_overflowing_ttl_is_rejected() {
+        let env = Env::default();
+        let (client, owner, delegate, _) = setup(&env);
+        env.ledger().set_sequence_number(1_000);
+
+        let result = client.try_grant(&owner, &delegate, &1_000, &100, &Vec::new(&env), &u32::MAX);
+
+        assert_eq!(result, Err(Ok(PermissionError::InvalidExpiry)));
+        assert_eq!(
+            client.try_get_permission(&owner, &delegate),
+            Err(Ok(PermissionError::PermissionNotFound))
+        );
+    }
+
+    #[test]
+    fn grant_with_max_non_overflowing_ttl_succeeds() {
+        let env = Env::default();
+        let (client, owner, delegate, _) = setup(&env);
+        env.ledger().set_sequence_number(1_000);
+
+        client.grant(&owner, &delegate, &1_000, &100, &Vec::new(&env), &(u32::MAX - 1_000));
+
+        assert_eq!(
+            client.get_permission(&owner, &delegate).expires_at_ledger,
+            u32::MAX
+        );
+    }
+
+    // ── sweep_expired_allowance ────────────────────────────────────────────
+
+    fn setup_with_allowance(
+        env: &Env,
+    ) -> (PermissionsContractClient<'_>, Address, Address, Address, Address) {
+        let (client, owner, delegate, contract_id) = setup(env);
+        let token = env
+            .register_stellar_asset_contract_v2(Address::generate(env))
+            .address();
+        StellarAssetClient::new(env, &token).mint(&owner, &10_000);
+        env.ledger().set_sequence_number(100);
+        client.grant(&owner, &delegate, &1_000, &100, &Vec::new(env), &50);
+        TokenClient::new(env, &token).approve(&owner, &delegate, &500, &10_000);
+        (client, owner, delegate, token, contract_id)
+    }
+
+    #[test]
+    fn sweep_resets_allowance_on_expired_delegation() {
+        let env = Env::default();
+        let (client, owner, delegate, token, contract_id) = setup_with_allowance(&env);
+        env.ledger().set_sequence_number(150);
+
+        client.sweep_expired_allowance(&owner, &delegate, &token);
+
+        assert_eq!(TokenClient::new(&env, &token).allowance(&owner, &delegate), 0);
+        let (contract, topics, data) = env.events().all().last().unwrap();
+        assert_eq!(contract, contract_id);
+        let t1: Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t1, symbol_short!("allow_rcl"));
+        let event: AllowanceReclaimedEvent = data.try_into_val(&env).unwrap();
+        assert_eq!(event.owner, owner);
+        assert_eq!(event.delegate, delegate);
+        assert_eq!(event.token, token);
+        assert_eq!(event.reclaimed_amount, 500);
+    }
+
+    #[test]
+    fn sweep_rejects_live_delegation() {
+        let env = Env::default();
+        let (client, owner, delegate, token, _) = setup_with_allowance(&env);
+        env.ledger().set_sequence_number(149);
+
+        assert_eq!(
+            client.try_sweep_expired_allowance(&owner, &delegate, &token),
+            Err(Ok(PermissionError::DelegationNotExpired))
+        );
+        assert_eq!(TokenClient::new(&env, &token).allowance(&owner, &delegate), 500);
+    }
+
+    #[test]
+    fn sweep_rejects_unknown_delegation() {
+        let env = Env::default();
+        let (client, owner, _, token, _) = setup_with_allowance(&env);
+        let stranger = Address::generate(&env);
+
+        assert_eq!(
+            client.try_sweep_expired_allowance(&owner, &stranger, &token),
+            Err(Ok(PermissionError::PermissionNotFound))
+        );
+    }
+
+    #[test]
+    fn sweep_with_zero_allowance_is_a_noop() {
+        let env = Env::default();
+        let (client, owner, delegate, contract_id) = setup(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(Address::generate(&env))
+            .address();
+        env.ledger().set_sequence_number(100);
+        client.grant(&owner, &delegate, &1_000, &100, &Vec::new(&env), &50);
+        env.ledger().set_sequence_number(150);
+
+        client.sweep_expired_allowance(&owner, &delegate, &token);
+
+        for (contract, topics, _) in env.events().all().iter() {
+            if contract != contract_id || topics.len() < 2 {
+                continue;
+            }
+            let t1: Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            assert_ne!(t1, symbol_short!("allow_rcl"));
+        }
+    }
+}
