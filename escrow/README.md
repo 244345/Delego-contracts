@@ -56,6 +56,7 @@ Soroban smart contract for holding purchase funds until fulfillment.
 | `remove_co_admin` | primary admin | Remove a co-admin |
 | `is_admin` | — | Check if an address is admin or co-admin |
 | `prune_dispute_votes` | admin | Prune dispute and timeout votes for settled escrows (bounded batch) |
+| `archive_terminal_escrow` | — | Reclaim all persistent storage of a terminal escrow past its retention window (issue #331) |
 
 ## `get_admin`
 
@@ -159,6 +160,7 @@ pub struct EscrowCancelledEvent {
 | `("escrow", "created")` | `EscrowCreatedEvent` | `create` / `deposit` |
 | `("escrow", "metadata")` | `EscrowMetadataEvent` | `create` / `deposit` (when metadata supplied) |
 | `("escrow", "cancelled")` | `EscrowCancelledEvent` | `cancel` |
+| `("escrow", "archived", escrow_id)` | `EscrowArchivedEvent` | `archive_terminal_escrow` |
 | `("escrow", "released")` | `EscrowReleasedEvent` | `partial_release` / `release` |
 | `("escrow", "refunded")` | `EscrowRefundedEvent` | `refund` |
 | `("escrow", "disputed")` | `EscrowDisputedEvent` | `dispute` |
@@ -199,6 +201,40 @@ amounts must be non-negative and sum exactly to the escrow balance. The
 mediator fee is explicit and no additional platform release fee is charged.
 The call transfers each nonzero award, records the buyer amount as refunded
 and seller-plus-mediator amounts as released, and emits `DisputeResolvedEvent`.
+
+## Storage reclamation for settled escrows
+
+`archive_terminal_escrow(escrow_id)` reclaims the rent held by an escrow that
+has finished. Once an escrow reaches a terminal state — `Released`, `Refunded`,
+or `Cancelled` — it can never move again, but its persistent entries keep
+paying rent indefinitely. The sweep deletes the `Escrow` record together with
+every per-escrow auxiliary entry: `DisputeVotes`, `TimeoutExtensionVotes`,
+`EscrowMetadataHash`, `EscrowMetadataSchema`, `ShipmentProof`,
+`ReleaseCondition`, `DualControlConfig`, `EscrowYieldConfig`,
+`RequireReleaseCondition`, and `LastBumpLedger`.
+
+Two conditions must hold before anything is deleted. The escrow must be in a
+terminal state — `Created`, `Funded`, and `Disputed` escrows are rejected with
+`InvalidStatus` — and it must have been settled for at least
+`ARCHIVAL_RETENTION_LEDGERS` (518,400 ledgers, ~30 days). The window is
+measured from the terminal transition, which `updated_at` freezes because
+every mutating entry point is gated on the terminal check, so a stale record
+cannot be kept alive by a late bump. A `Released` or `Refunded` escrow that
+still has an undrained balance is rejected rather than archived, so the sweep
+can never strand funds. Arriving early returns
+`ArchivalRetentionNotElapsed`; an unknown or already-archived escrow returns
+`NotFound`.
+
+The call requires no authorization. It can only ever touch state that is
+already dead, so any keeper — or an automated rent sweeper — can submit it, and
+a third party gains nothing by triggering it ahead of schedule.
+
+`EscrowIds` and `BuyerEscrowAt` are left untouched on purpose: the paginated
+listers already skip IDs whose record is gone, and rewriting a shared
+append-only index per escrow would cost more rent than the sweep reclaims. An
+archived escrow therefore reads back as `NotFound` from every getter, and
+`EscrowArchivedEvent` is published on `("escrow", "archived", escrow_id)`
+*before* the removals, recording what was purged.
 
 ## Development
 

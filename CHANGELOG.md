@@ -23,6 +23,26 @@ will reject the change.
 - Add immutable daily delivery Merkle roots and order-bound inclusion-proof escrow release.
 - Add atomic batch escrow creation with per-token aggregate allowance transfers.
 - Add admin split dispute settlements with buyer, seller, and mediator payouts.
+- Add `archive_terminal_escrow(escrow_id)`, a permissionless storage-recovery
+  sweep that deletes the record and every auxiliary entry of an escrow
+  (`Escrow`, `DisputeVotes`, `TimeoutExtensionVotes`, `EscrowMetadataHash`,
+  `EscrowMetadataSchema`, `ShipmentProof`, `ReleaseCondition`,
+  `DualControlConfig`, `EscrowYieldConfig`, `RequireReleaseCondition`,
+  `LastBumpLedger`) once it has held a terminal state — `Released`,
+  `Refunded`, `Cancelled` — for `ARCHIVAL_RETENTION_LEDGERS` (518,400
+  ledgers, ~30 days), reclaiming the rent a settled escrow would otherwise pin
+  down forever. The window runs from the terminal transition, which
+  `updated_at` freezes because every mutating path is gated on
+  `check_not_terminal`. Active (`Created`, `Funded`) and `Disputed` escrows are
+  rejected with `EscrowError::InvalidStatus`, and an unsettled payout-terminal
+  escrow is rejected rather than archived, so the sweep can never drop a live
+  record. The shared `EscrowIds` and `BuyerEscrowAt` indexes are left intact and
+  the paginated listers already skip ids whose record is gone, so an archived
+  escrow reads back as `NotFound` rather than panicking an index lookup. Emits
+  `EscrowArchivedEvent` on the `(escrow, archived, escrow_id)` topic *before*
+  the removals, and reports the reclaimed entry count. New
+  `EscrowError::ArchivalRetentionNotElapsed` (411) for a sweep that arrives
+  before the window has passed.
 
 ### 0.2.0 - 2026-08-29
 
