@@ -294,12 +294,16 @@ pub enum DataKey {
     NextId,
     /// Delegation record stored by id.
     Delegation(u64),
+    /// Snapshot for a delegation, stored separately by delegation id and version.
+    Snapshot(u64, u32),
     /// Delegation ids associated with an owner.
     UserDelegations(Address),
     /// Current version for a delegation.
     DelegationVersion(u64),
     /// Version history for a delegation.
     DelegationHistory(u64),
+    /// Snapshot key schema version used to lazily migrate legacy histories.
+    SnapshotSchemaVersion(u64),
     /// Admin address proposed to take over, pending acceptance.
     ProposedAdmin,
 }
@@ -579,28 +583,7 @@ impl DelegationRegistry {
             .persistent()
             .set(&DataKey::DelegationVersion(id), &1u32);
 
-        // Store snapshot for version 1
-        let snapshot = DelegationSnapshot {
-            version: 1,
-            snapshot_ledger: env.ledger().sequence(),
-            record: record.clone(),
-        };
-
-        let mut history = env
-            .storage()
-            .persistent()
-            .get::<_, Vec<DelegationSnapshot>>(&DataKey::DelegationHistory(id))
-            .unwrap_or(Vec::new(&env));
-
-        history.push_back(snapshot);
-        env.storage()
-            .persistent()
-            .set(&DataKey::DelegationHistory(id), &history);
-        env.storage().persistent().extend_ttl(
-            &DataKey::DelegationHistory(id),
-            PERSISTENT_BUMP_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
+        Self::store_snapshot(&env, id, &record);
 
         let mut user_dels = env
             .storage()
@@ -976,21 +959,12 @@ impl DelegationRegistry {
             return Err(DelegationError::VersionNotLower);
         }
 
-        let history: Vec<DelegationSnapshot> = env
+        Self::migrate_snapshot_keys(&env, delegation_id);
+        let snapshot: DelegationSnapshot = env
             .storage()
             .persistent()
-            .get(&DataKey::DelegationHistory(delegation_id))
-            .unwrap_or(Vec::new(&env));
-
-        let mut target_snapshot: Option<DelegationSnapshot> = None;
-        for snapshot in history.iter() {
-            if snapshot.version == target_version {
-                target_snapshot = Some(snapshot);
-                break;
-            }
-        }
-
-        let snapshot = target_snapshot.ok_or(DelegationError::SnapshotNotFound)?;
+            .get(&DataKey::Snapshot(delegation_id, target_version))
+            .ok_or(DelegationError::SnapshotNotFound)?;
 
         if snapshot.record.permissions_contract != record.permissions_contract {
             return Err(DelegationError::InvalidVersion);
@@ -1469,7 +1443,44 @@ impl DelegationRegistry {
         new_version
     }
 
+    fn migrate_snapshot_keys(env: &Env, delegation_id: u64) {
+        let schema_version: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SnapshotSchemaVersion(delegation_id))
+            .unwrap_or(0);
+        if schema_version >= 1 {
+            return;
+        }
+
+        let history: Vec<DelegationSnapshot> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegationHistory(delegation_id))
+            .unwrap_or(Vec::new(env));
+        for snapshot in history.iter() {
+            let key = DataKey::Snapshot(delegation_id, snapshot.version);
+            if !env.storage().persistent().has(&key) {
+                env.storage().persistent().set(&key, &snapshot);
+            }
+            env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+
+        let version_key = DataKey::SnapshotSchemaVersion(delegation_id);
+        env.storage().persistent().set(&version_key, &1u32);
+        env.storage().persistent().extend_ttl(
+            &version_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
     fn store_snapshot(env: &Env, delegation_id: u64, record: &DelegationRecord) {
+        Self::migrate_snapshot_keys(env, delegation_id);
         let version: u32 = env
             .storage()
             .persistent()
@@ -1480,6 +1491,14 @@ impl DelegationRegistry {
             snapshot_ledger: env.ledger().sequence(),
             record: record.clone(),
         };
+        let snapshot_key = DataKey::Snapshot(delegation_id, version);
+        env.storage().persistent().set(&snapshot_key, &snapshot);
+        env.storage().persistent().extend_ttl(
+            &snapshot_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
         let mut history: Vec<DelegationSnapshot> = env
             .storage()
             .persistent()
@@ -1489,6 +1508,11 @@ impl DelegationRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::DelegationHistory(delegation_id), &history);
+        env.storage().persistent().extend_ttl(
+            &DataKey::DelegationHistory(delegation_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 }
 
