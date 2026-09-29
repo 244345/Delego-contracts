@@ -20,6 +20,10 @@ will reject the change.
 
 ### Unreleased
 
+- Add immutable daily delivery Merkle roots and order-bound inclusion-proof escrow release.
+- Add atomic batch escrow creation with per-token aggregate allowance transfers.
+- Add admin split dispute settlements with buyer, seller, and mediator payouts.
+
 ### 0.2.0 - 2026-08-29
 
 - Initial tracked release for this contract. On-chain `version()` returns `0.2.0`
@@ -50,6 +54,8 @@ will reject the change.
 ## reputation (delego-reputation)
 
 ### Unreleased
+
+- Expose a fixed-point half-life decay helper that reduces stale scores toward zero.
 
 ### 0.0.1 - 2026-08-29
 
