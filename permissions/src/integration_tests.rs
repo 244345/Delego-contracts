@@ -2,7 +2,7 @@
 
 use crate::{
     MerchantAllowlist, PermissionError, PermissionStatus, PermissionsContract,
-    PermissionsContractClient, RelayedSpendMessage,
+    PermissionsContractClient, RelayedSpendMessage, ScopedPermissionConfig,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
@@ -1602,4 +1602,82 @@ fn test_cancel_nonce_requires_existing_permission() {
         client.try_cancel_nonce(&t.buyer, &t.agent, &0u64),
         Err(Ok(PermissionError::PermissionNotFound))
     );
+}
+
+// ── Issue #369: function-scoped permissions vs. the relayer path ───────────
+
+/// The signed `RelayedSpendMessage` carries no contract entrypoint, so a
+/// function-scoped grant cannot be spent through the gasless relayer path:
+/// the signature never attests *which* function the relayer is invoking. The
+/// check fails closed rather than being skipped, so a scoped delegate's
+/// allowance cannot be drained by relaying around the scope (issue #369).
+#[test]
+fn test_scoped_grant_rejects_relayed_spend() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+
+    let mut functions = Vec::new(&t.env);
+    functions.push_back(Symbol::new(&t.env, "fund"));
+    client.grant_scoped(
+        &t.buyer,
+        &t.agent,
+        &1000,
+        &100,
+        &merchants,
+        &3600u32,
+        &ScopedPermissionConfig {
+            target_contract: t._escrow_contract_id.clone(),
+            allowed_function_symbols: functions,
+        },
+    );
+
+    let (signing_key, public_key) = test_keypair(&t.env, 11);
+    client.set_relayer_key(&t.agent, &public_key);
+
+    let expiration_ledger = t.env.ledger().sequence() + 100;
+    let message = RelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 40,
+        nonce: 0,
+        expiration_ledger,
+    };
+    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+
+    assert_eq!(
+        client.try_execute_spend_via_relayer(
+            &relayer,
+            &t.buyer,
+            &t.agent,
+            &40,
+            &t.seller,
+            &0u64,
+            &expiration_ledger,
+            &signature,
+        ),
+        Err(Ok(PermissionError::UnauthorizedFunction))
+    );
+
+    // Nothing was spent and the nonce was not consumed.
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 1000);
+    assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 0);
+
+    // The delegate can still spend through the scoped entrypoint itself.
+    assert_eq!(
+        client.try_execute_spend_scoped(
+            &t.buyer,
+            &t.agent,
+            &40,
+            &t.seller,
+            &Some(t._escrow_contract_id.clone()),
+            &Some(Symbol::new(&t.env, "fund")),
+        ),
+        Ok(Ok(()))
+    );
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 960);
 }

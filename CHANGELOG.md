@@ -45,6 +45,30 @@ will reject the change.
 
 ### Unreleased
 
+- Added function-restricted permission grants (issue #369). A new
+  `ScopedPermissionConfig { target_contract, allowed_function_symbols }` limits
+  a delegation to one contract and an explicit list of entrypoints, so an owner
+  can authorise an agent for `escrow.fund` only and refuse every other
+  contract method. The scope is enforced in the new
+  `can_spend_scoped` / `execute_spend_scoped` entrypoints and **fails closed**:
+  the pre-existing `can_spend` / `execute_spend` entrypoints reject a scoped
+  grant with the new `PermissionError::UnauthorizedFunction` (2414), so the
+  check cannot be bypassed by omitting the invoked function. `grant_child`
+  sub-delegations inherit their parent's scope and `transfer_permission` carries
+  it to the incoming delegate, closing lateral privilege escalation along the
+  parent chain. `allowed_function_symbols` is bounded by the new
+  `MAX_FUNCTIONS_PER_PERMISSION` (10) and must be non-empty and duplicate-free.
+  New `grant_scoped` / `re_grant_scoped` / `set_permission_scope` /
+  `get_permission_scope` entry points and a `("perm", "scope")` event back the
+  feature. `re_grant` clears an existing scope while `re_grant_with_metadata`
+  preserves it, so a limit bump cannot silently widen a delegate's authority.
+  The scope lives under its own `DataKey::PermissionScope` slot rather
+  than inside `PermissionRecord`, so the serialized shape of existing
+  permissions is unchanged and pre-existing delegations keep loading. Since
+  `RelayedSpendMessage` carries no entrypoint field, a scoped grant is
+  deliberately rejected by `execute_spend_via_relayer` rather than being
+  allowed through unchecked.
+
 ### 0.1.0 - 2026-08-29
 
 - Initial tracked release for this contract. On-chain `version()` returns `0.1.0`
