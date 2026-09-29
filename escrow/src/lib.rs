@@ -1054,6 +1054,8 @@ pub enum EscrowError {
     BatchLimitExceeded = 409,
     /// Dispute award amounts are negative or do not sum to the escrow balance.
     InvalidDisputeAward = 410,
+    /// External oracle invocation failed (panic, revert, or paused oracle).
+    OracleInvocationFailed = 1019,
 }
 
 /// Compact receipt returned to buyers after escrow creation via `get_receipt`.
@@ -1701,6 +1703,31 @@ impl EscrowContract {
         config.secondary_approved_at = env.ledger().timestamp();
         env.storage().persistent().set(&config_key, &config);
         Ok(true)
+    }
+
+    /// Invoke an external oracle contract's `evaluate` entry point, catching
+    /// any cross-contract failure (panic, revert, or paused oracle) and
+    /// mapping it to [`EscrowError::OracleInvocationFailed`] so the caller
+    /// can retry or open a dispute instead of being trapped.
+    ///
+    /// Returns `Ok(true)` when the oracle reports the condition is met,
+    /// `Ok(false)` when the oracle reports it is not met, and
+    /// `Err(EscrowError::OracleInvocationFailed)` when the oracle call
+    /// itself fails for any reason.
+    pub fn safe_oracle_call(
+        env: &Env,
+        oracle: &Address,
+        condition: Symbol,
+    ) -> Result<bool, EscrowError> {
+        let result = env.try_invoke_contract::<bool, InvokeError>(
+            oracle,
+            &Symbol::new(env, "evaluate"),
+            soroban_sdk::vec![env, condition.into_val(env)],
+        );
+        match result {
+            Ok(Ok(met)) => Ok(met),
+            Ok(Err(_)) | Err(_) => Err(EscrowError::OracleInvocationFailed),
+        }
     }
 
     /// Set the quorum configuration for dispute resolution. Admin-only.
