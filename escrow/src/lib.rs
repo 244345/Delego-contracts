@@ -21,7 +21,7 @@
 #![warn(missing_docs)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
-    InvokeError, Map, Symbol, Vec,
+    IntoVal, InvokeError, Map, Symbol, Vec,
 };
 
 /// Lifecycle state of an escrow.
@@ -764,6 +764,96 @@ pub struct DisputeVotesPrunedEvent {
     pub pruned_by: Address,
 }
 
+// ── Cross-currency path payments (issue #337) ───────────────────────────────
+
+/// Maximum number of hops accepted in a single cross-currency route (issue #337).
+///
+/// Longer routes are rejected with [`EscrowError::InvalidPathRoute`] so the
+/// per-leg validation loop and the router invocation stay bounded regardless of
+/// what a caller submits.
+pub const MAX_PATH_LEGS: u32 = 5;
+
+/// Slippage tolerance committed on-chain for a cross-currency path payment
+/// (issue #337).
+///
+/// `min_output_amount` is the smallest amount of the route's destination token
+/// that may be delivered to the seller and `max_input_amount` the largest
+/// amount of the escrowed token the route may consume. Both are compared
+/// against the amounts the DEX router *actually* reports — never against the
+/// amounts it was asked for — so a sandwich attacker who moves the pool price
+/// between submission and inclusion cannot force a settlement outside this
+/// window: the whole invocation is reverted instead.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlippageBounds {
+    /// Smallest acceptable amount of the route's destination token.
+    pub min_output_amount: i128,
+    /// Largest acceptable amount of the escrowed token the route may spend.
+    pub max_input_amount: i128,
+}
+
+/// One hop of a cross-currency route: a single pool conversion (issue #337).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PathLeg {
+    /// Liquidity pool contract that services this hop.
+    pub pool: Address,
+    /// Token paid into this hop.
+    pub token_in: Address,
+    /// Token received from this hop.
+    pub token_out: Address,
+}
+
+/// An ordered cross-currency route submitted to a DEX router (issue #337).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PathRoute {
+    /// Ordered hops. The first leg consumes the escrowed token and the last leg
+    /// pays out the destination token; every leg's `token_out` must equal the
+    /// next leg's `token_in`.
+    pub legs: Vec<PathLeg>,
+}
+
+/// Amounts a DEX router reports after executing a route (issue #337).
+///
+/// The router is untrusted: `execute_path_payment` re-checks both amounts
+/// against the committed [`SlippageBounds`] before any token moves on-chain.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PathExecutionResult {
+    /// Amount of the escrowed token the route consumed.
+    pub input_amount: i128,
+    /// Amount of the destination token the route delivered.
+    pub output_amount: i128,
+}
+
+/// Emitted when the slippage window for an escrow is committed or tightened
+/// (issue #337).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SlippageBoundsSetEvent {
+    pub escrow_id: u64,
+    pub min_output_amount: i128,
+    pub max_input_amount: i128,
+    pub set_by: Address,
+}
+
+/// Emitted when a cross-currency path payment settles inside its committed
+/// slippage window (issue #337).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PathPaymentSettledEvent {
+    pub escrow_id: u64,
+    pub router: Address,
+    pub seller: Address,
+    pub leg_count: u32,
+    pub input_amount: i128,
+    pub output_amount: i128,
+    pub min_output_amount: i128,
+    pub max_input_amount: i128,
+    pub settled_by: Address,
+}
+
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -820,6 +910,9 @@ pub enum DataKey {
     UpgradeProposal,
     /// M-of-N admin approvals required to execute an upgrade (issue #292).
     UpgradeThreshold,
+    /// Slippage window committed for an escrow's cross-currency path payment
+    /// (issue #337).
+    PathSlippageBounds(u64),
 }
 
 #[contracterror]
@@ -892,11 +985,17 @@ pub enum DataKey {
 // | 404 | ShipmentProofNotFound | next major |
 // | 405 | FeeUpdateNotEffective | next major |
 // | 406 | FeeNoticeWindowNotMet | next major |
-// | 407 | UpgradeProposalExists | next major |
-// | 408 | UpgradeProposalNotFound | next major |
-// | 409 | UpgradeTimelockActive | next major |
-// | 410 | UpgradeHashMismatch | next major |
-// | 411+ | Reserved for new variants | next major |
+// | 407 | InvalidMerkleProof | next major |
+// | 408 | MerkleRootAlreadyPublished | next major |
+// | 409 | BatchLimitExceeded | next major |
+// | 410 | InvalidDisputeAward | next major |
+// | 411 | SlippageBoundsNotSet | next major |
+// | 412 | SlippageExceeded | next major |
+// | 413 | InvalidSlippageBounds | next major |
+// | 414 | SlippageBoundsTooLoose | next major |
+// | 415 | InvalidPathRoute | next major |
+// | 416 | PathExecutionFailed | next major |
+// | 417+ | Reserved for new variants | next major |
 //
 // # Allocating new variants
 //
@@ -1054,6 +1153,24 @@ pub enum EscrowError {
     BatchLimitExceeded = 409,
     /// Dispute award amounts are negative or do not sum to the escrow balance.
     InvalidDisputeAward = 410,
+    /// No slippage window has been committed for this escrow's path payment
+    /// (issue #337).
+    SlippageBoundsNotSet = 411,
+    /// The DEX route settled outside the committed slippage window — the
+    /// reported output is below `min_output_amount` or the reported input is
+    /// above `max_input_amount` (issue #337).
+    SlippageExceeded = 412,
+    /// A slippage bound is zero or negative (issue #337).
+    InvalidSlippageBounds = 413,
+    /// A committed slippage window may only be tightened, never widened
+    /// (issue #337).
+    SlippageBoundsTooLoose = 414,
+    /// The submitted cross-currency route is empty, too long, self-converting,
+    /// or does not chain its tokens from the escrowed token to a different
+    /// destination token (issue #337).
+    InvalidPathRoute = 415,
+    /// The DEX router call failed or returned an unusable result (issue #337).
+    PathExecutionFailed = 416,
 }
 
 /// Compact receipt returned to buyers after escrow creation via `get_receipt`.
@@ -2757,6 +2874,336 @@ impl EscrowContract {
             .instance()
             .get(&DataKey::LiquidityPool(token))
             .ok_or(EscrowError::PoolNotFound)
+    }
+
+    /// Commit the slippage window a cross-currency path payment for `escrow_id`
+    /// must settle inside (issue #337).
+    ///
+    /// The buyer (or an admin) fixes the tolerance *before* a route is
+    /// executed, so the party that executes the swap can never choose how much
+    /// slippage is tolerated. Once a window is committed it may only be
+    /// **tightened** — `min_output_amount` may rise and `max_input_amount` may
+    /// fall — and any attempt to widen it is rejected with
+    /// [`EscrowError::SlippageBoundsTooLoose`]. That is what makes the limit
+    /// dynamic over the life of an escrow: a user can lock in a tight window
+    /// before broadcasting a route and tighten it further at any point before
+    /// settlement, but a front-runner cannot relax it to let a worse fill
+    /// through.
+    ///
+    /// # Errors
+    /// - [`EscrowError::NotFound`] — unknown escrow.
+    /// - [`EscrowError::Unauthorized`] — caller is neither the buyer nor an admin.
+    /// - [`EscrowError::InvalidStatus`] — escrow is not `Created` or `Funded`.
+    /// - [`EscrowError::InvalidSlippageBounds`] — either bound is zero or negative.
+    /// - [`EscrowError::SlippageBoundsTooLoose`] — the new window is wider than
+    ///   the committed one.
+    pub fn set_slippage_bounds(
+        env: Env,
+        escrow_id: u64,
+        caller: Address,
+        bounds: SlippageBounds,
+    ) -> Result<bool, EscrowError> {
+        caller.require_auth();
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+
+        if caller != record.buyer && !Self::is_admin(env.clone(), caller.clone()) {
+            return Err(EscrowError::Unauthorized);
+        }
+        check_not_terminal(&record)?;
+        if record.status != EscrowStatus::Created && record.status != EscrowStatus::Funded {
+            return Err(EscrowError::InvalidStatus);
+        }
+        if bounds.min_output_amount <= 0 || bounds.max_input_amount <= 0 {
+            return Err(EscrowError::InvalidSlippageBounds);
+        }
+
+        let bounds_key = DataKey::PathSlippageBounds(escrow_id);
+        let committed: Option<SlippageBounds> = env.storage().persistent().get(&bounds_key);
+        if let Some(previous) = &committed {
+            if bounds.min_output_amount < previous.min_output_amount
+                || bounds.max_input_amount > previous.max_input_amount
+            {
+                return Err(EscrowError::SlippageBoundsTooLoose);
+            }
+        }
+
+        env.storage().persistent().set(&bounds_key, &bounds);
+        env.storage().persistent().extend_ttl(
+            &bounds_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("slipset"), escrow_id),
+            SlippageBoundsSetEvent {
+                escrow_id,
+                min_output_amount: bounds.min_output_amount,
+                max_input_amount: bounds.max_input_amount,
+                set_by: caller,
+            },
+        );
+
+        Ok(true)
+    }
+
+    /// Read-only getter for an escrow's committed slippage window.
+    ///
+    /// Returns `None` while no window has been committed, so callers can
+    /// distinguish "never set" from a committed window of `0` (which is
+    /// rejected at set time and can never be stored). Never mutates state.
+    pub fn get_slippage_bounds(env: Env, escrow_id: u64) -> Option<SlippageBounds> {
+        let bounds: Option<SlippageBounds> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PathSlippageBounds(escrow_id));
+        if bounds.is_some() {
+            env.storage().persistent().extend_ttl(
+                &DataKey::PathSlippageBounds(escrow_id),
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+        bounds
+    }
+
+    /// Read-only slippage check for off-chain quoting and monitoring (issue #337).
+    ///
+    /// Returns `true` only when `escrow_id` has a committed window that the
+    /// supplied amounts satisfy (`output_amount >= min_output_amount` and
+    /// `input_amount <= max_input_amount`) *and* the escrow still holds
+    /// `input_amount` of its escrowed token. Never mutates state.
+    pub fn is_within_slippage_bounds(
+        env: Env,
+        escrow_id: u64,
+        input_amount: i128,
+        output_amount: i128,
+    ) -> bool {
+        let bounds: Option<SlippageBounds> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PathSlippageBounds(escrow_id));
+        let bounds = match bounds {
+            Some(b) => b,
+            None => return false,
+        };
+        let record: Option<EscrowRecord> =
+            env.storage().persistent().get(&DataKey::Escrow(escrow_id));
+        let record = match record {
+            Some(r) => r,
+            None => return false,
+        };
+        let remaining = record.amount - record.released_amount - record.refunded_amount;
+        remaining >= input_amount
+            && output_amount >= bounds.min_output_amount
+            && input_amount <= bounds.max_input_amount
+    }
+
+    /// Settle a funded escrow in a different currency by executing a DEX route
+    /// under the slippage window committed by `set_slippage_bounds`
+    /// (issue #337).
+    ///
+    /// # Flow
+    /// 1. The escrow must be `Funded` and the caller must be its buyer or an
+    ///    admin. The route must be a well-formed cross-currency chain: every
+    ///    token whitelisted, no hop converting a token into itself, the first
+    ///    leg consuming the escrowed token, each leg feeding the next, and the
+    ///    last leg paying out a token other than the escrowed one.
+    /// 2. `router.execute_path(route, bounds, <this contract>)` is invoked. The
+    ///    router delivers the destination token to this contract and reports
+    ///    the amounts it moved.
+    /// 3. The **reported** amounts are checked against the committed
+    ///    [`SlippageBounds`]. A route that consumed more than
+    ///    `max_input_amount` or delivered less than `min_output_amount` reverts
+    ///    the whole invocation — the router's delivery included — with
+    ///    [`EscrowError::SlippageExceeded`]. This is the anti-sandwich guard:
+    ///    the guard reads the realised fill, never the requested amount.
+    /// 4. On success the escrow pays the router `input_amount` net of the
+    ///    platform fee, forwards `output_amount` of the destination token to
+    ///    the seller, and books the spent input against `released_amount`.
+    ///
+    /// The router may consume any amount up to `max_input_amount`; the
+    /// contract — not the executor — decides what is acceptable.
+    ///
+    /// # Errors
+    /// - [`EscrowError::NotFound`], [`EscrowError::Unauthorized`],
+    ///   [`EscrowError::InvalidStatus`], [`EscrowError::InvalidAddress`].
+    /// - [`EscrowError::SlippageBoundsNotSet`] — no window was committed.
+    /// - [`EscrowError::InvalidPathRoute`] / [`EscrowError::TokenNotWhitelisted`].
+    /// - [`EscrowError::PathExecutionFailed`] — the router call failed or its
+    ///   result is not usable.
+    /// - [`EscrowError::InsufficientEscrowBalance`] — the route consumed more
+    ///   than the escrow still holds.
+    /// - [`EscrowError::SlippageExceeded`] — the realised fill is outside the
+    ///   committed window.
+    pub fn execute_path_payment(
+        env: Env,
+        escrow_id: u64,
+        settled_by: Address,
+        router: Address,
+        route: PathRoute,
+    ) -> Result<PathExecutionResult, EscrowError> {
+        settled_by.require_auth();
+        if is_zero_address(&env, &router) {
+            return Err(EscrowError::InvalidAddress);
+        }
+
+        let key = DataKey::Escrow(escrow_id);
+        let mut record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+        if settled_by != record.buyer && !Self::is_admin(env.clone(), settled_by.clone()) {
+            return Err(EscrowError::Unauthorized);
+        }
+        check_not_terminal(&record)?;
+        if record.status != EscrowStatus::Funded {
+            return Err(EscrowError::InvalidStatus);
+        }
+
+        let bounds: SlippageBounds = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PathSlippageBounds(escrow_id))
+            .ok_or(EscrowError::SlippageBoundsNotSet)?;
+        let destination_token = Self::validate_path_route(&env, &record, &route)?;
+
+        let remaining = record.amount - record.released_amount - record.refunded_amount;
+        if remaining <= 0 {
+            return Err(EscrowError::ZeroAmount);
+        }
+
+        let executed = env.try_invoke_contract::<PathExecutionResult, InvokeError>(
+            &router,
+            &Symbol::new(&env, "execute_path"),
+            soroban_sdk::vec![
+                &env,
+                route.into_val(&env),
+                bounds.into_val(&env),
+                env.current_contract_address().to_val(),
+            ],
+        );
+        let result = match executed {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) | Err(_) => return Err(EscrowError::PathExecutionFailed),
+        };
+
+        if result.input_amount <= 0 || result.output_amount <= 0 {
+            return Err(EscrowError::PathExecutionFailed);
+        }
+        if result.output_amount < bounds.min_output_amount
+            || result.input_amount > bounds.max_input_amount
+        {
+            return Err(EscrowError::SlippageExceeded);
+        }
+        if result.input_amount > remaining {
+            return Err(EscrowError::InsufficientEscrowBalance);
+        }
+
+        let token_client = soroban_sdk::token::Client::new(&env, &record.token);
+        let payout = Self::compute_payout(&env, result.input_amount)?;
+        Self::distribute_fee(&env, &token_client, payout.fee)?;
+        token_client.transfer(&env.current_contract_address(), &router, &payout.seller_net);
+        soroban_sdk::token::Client::new(&env, &destination_token).transfer(
+            &env.current_contract_address(),
+            &record.seller,
+            &result.output_amount,
+        );
+
+        record.released_amount = record
+            .released_amount
+            .checked_add(result.input_amount)
+            .ok_or(EscrowError::InsufficientEscrowBalance)?;
+        let new_remaining = record.amount - record.released_amount - record.refunded_amount;
+        let fully_released = new_remaining == 0;
+        if fully_released {
+            record.status = EscrowStatus::Released;
+        }
+        record.updated_at = env.ledger().timestamp();
+        env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("pathset"), escrow_id),
+            PathPaymentSettledEvent {
+                escrow_id,
+                router,
+                seller: record.seller.clone(),
+                leg_count: route.legs.len(),
+                input_amount: result.input_amount,
+                output_amount: result.output_amount,
+                min_output_amount: bounds.min_output_amount,
+                max_input_amount: bounds.max_input_amount,
+                settled_by,
+            },
+        );
+
+        Ok(result)
+    }
+
+    /// Validate a cross-currency route against its escrow and return the
+    /// destination token the route must pay out (issue #337).
+    ///
+    /// Rejects empty and over-long routes, zero-address pools or tokens, hops
+    /// that convert a token into itself, tokens that are not whitelisted for
+    /// escrow, a route that does not start from the escrowed token, a broken
+    /// token chain between hops, and a route that ends back on the escrowed
+    /// token (which would not be a cross-currency conversion at all).
+    fn validate_path_route(
+        env: &Env,
+        record: &EscrowRecord,
+        route: &PathRoute,
+    ) -> Result<Address, EscrowError> {
+        let leg_count = route.legs.len();
+        if leg_count == 0 || leg_count > MAX_PATH_LEGS {
+            return Err(EscrowError::InvalidPathRoute);
+        }
+        let first = match route.legs.get(0) {
+            Some(leg) => leg,
+            None => return Err(EscrowError::InvalidPathRoute),
+        };
+        if first.token_in != record.token {
+            return Err(EscrowError::InvalidPathRoute);
+        }
+
+        let mut expected_token_in: Option<Address> = None;
+        for leg in route.legs.iter() {
+            if is_zero_address(env, &leg.pool)
+                || is_zero_address(env, &leg.token_in)
+                || is_zero_address(env, &leg.token_out)
+            {
+                return Err(EscrowError::InvalidAddress);
+            }
+            if leg.token_in == leg.token_out {
+                return Err(EscrowError::InvalidPathRoute);
+            }
+            if let Some(expected) = &expected_token_in {
+                if &leg.token_in != expected {
+                    return Err(EscrowError::InvalidPathRoute);
+                }
+            }
+            if !Self::is_token_allowed(env.clone(), leg.token_in.clone())
+                || !Self::is_token_allowed(env.clone(), leg.token_out.clone())
+            {
+                return Err(EscrowError::TokenNotWhitelisted);
+            }
+            expected_token_in = Some(leg.token_out.clone());
+        }
+
+        let destination = expected_token_in.ok_or(EscrowError::InvalidPathRoute)?;
+        if destination == record.token {
+            return Err(EscrowError::InvalidPathRoute);
+        }
+        Ok(destination)
     }
 
     /// Publish a delivery Merkle root for a UTC date.
@@ -6101,6 +6548,995 @@ mod metadata_tests {
     }
 }
 
+#[cfg(test)]
+mod path_slippage_tests {
+    use super::*;
+    use soroban_sdk::{
+        symbol_short,
+        testutils::{Address as _, Events},
+        token::{StellarAssetClient, TokenClient},
+        TryFromVal, TryIntoVal,
+    };
+
+    /// Mock DEX router used to drive the path-payment tests (issue #337).
+    ///
+    /// The mock prices every hop from a per-pool rate held on-chain, so a test
+    /// can simulate a sandwich by moving the rate *after* the slippage window
+    /// was committed. It spends exactly the committed `max_input_amount` — the
+    /// ceiling the escrow authorises — and delivers the destination token to
+    /// the caller (the escrow) before reporting the amounts it moved.
+    mod mock_dex_router {
+        use super::*;
+        use soroban_sdk::{contract, contractimpl, contracttype, token::TokenClient};
+
+        /// Storage keys for the mock router's manipulable pool state.
+        #[contracttype]
+        #[derive(Clone)]
+        pub enum MockRouterKey {
+            /// Destination units quoted per 10_000 input units by a pool.
+            PoolRate(Address),
+            /// Multiplier applied to the input the router reports it spent.
+            InputSkew,
+            /// Multiplier applied to the output the router actually delivers.
+            OutputFactor,
+        }
+
+        #[contract]
+        pub struct MockDexRouter;
+
+        #[contractimpl]
+        impl MockDexRouter {
+            /// Quotes `rate_bps` destination units per 10_000 input units.
+            pub fn set_pool_rate(env: Env, pool: Address, rate_bps: i128) {
+                env.storage()
+                    .persistent()
+                    .set(&MockRouterKey::PoolRate(pool), &rate_bps);
+            }
+
+            /// Makes the router report an input larger than the one it
+            /// committed to consuming, the way a hostile or misconfigured
+            /// router would.
+            pub fn set_input_skew(env: Env, skew_bps: i128) {
+                env.storage()
+                    .persistent()
+                    .set(&MockRouterKey::InputSkew, &skew_bps);
+            }
+
+            /// Scales the output actually delivered, independently of the
+            /// output the router reports. A factor below 10_000 under-delivers.
+            pub fn set_output_factor(env: Env, factor_bps: i128) {
+                env.storage()
+                    .persistent()
+                    .set(&MockRouterKey::OutputFactor, &factor_bps);
+            }
+
+            pub fn execute_path(
+                env: Env,
+                route: PathRoute,
+                bounds: SlippageBounds,
+                output_recipient: Address,
+            ) -> PathExecutionResult {
+                let ceiling = bounds.max_input_amount;
+                let mut quoted = ceiling;
+                let mut destination: Option<Address> = None;
+                for leg in route.legs.iter() {
+                    let rate: i128 = env
+                        .storage()
+                        .persistent()
+                        .get(&MockRouterKey::PoolRate(leg.pool))
+                        .unwrap_or(10_000);
+                    quoted = quoted * rate / 10_000;
+                    destination = Some(leg.token_out.clone());
+                }
+
+                let skew: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&MockRouterKey::InputSkew)
+                    .unwrap_or(10_000);
+                let factor: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&MockRouterKey::OutputFactor)
+                    .unwrap_or(10_000);
+                let delivered = quoted * factor / 10_000;
+
+                if let Some(token) = destination {
+                    if delivered > 0 {
+                        TokenClient::new(&env, &token).transfer(
+                            &env.current_contract_address(),
+                            &output_recipient,
+                            &delivered,
+                        );
+                    }
+                }
+
+                PathExecutionResult {
+                    input_amount: ceiling * skew / 10_000,
+                    output_amount: quoted,
+                }
+            }
+        }
+    }
+
+    /// Router whose `execute_path` returns a value the escrow cannot decode.
+    mod malformed_router {
+        use super::*;
+        use soroban_sdk::{contract, contractimpl};
+
+        #[contract]
+        pub struct MalformedRouter;
+
+        #[contractimpl]
+        impl MalformedRouter {
+            pub fn execute_path(
+                _env: Env,
+                _route: PathRoute,
+                _bounds: SlippageBounds,
+                _output_recipient: Address,
+            ) -> i128 {
+                1
+            }
+        }
+    }
+
+    use malformed_router::MalformedRouter;
+    use mock_dex_router::{MockDexRouter, MockDexRouterClient};
+
+    struct PathFixture<'a> {
+        client: EscrowContractClient<'a>,
+        router_client: MockDexRouterClient<'a>,
+        admin: Address,
+        treasury: Address,
+        buyer: Address,
+        seller: Address,
+        source: Address,
+        middle: Address,
+        dest: Address,
+        contract_id: Address,
+        router: Address,
+        pool: Address,
+        second_pool: Address,
+        escrow_id: u64,
+    }
+
+    impl<'a> PathFixture<'a> {
+        fn source_balance(&self, env: &Env, holder: &Address) -> i128 {
+            TokenClient::new(env, &self.source).balance(holder)
+        }
+
+        fn dest_balance(&self, env: &Env, holder: &Address) -> i128 {
+            TokenClient::new(env, &self.dest).balance(holder)
+        }
+
+        /// A `source -> dest` route quoted at 1:1.
+        fn direct_route(&self, env: &Env) -> PathRoute {
+            PathRoute {
+                legs: Vec::from_array(
+                    env,
+                    [PathLeg {
+                        pool: self.pool.clone(),
+                        token_in: self.source.clone(),
+                        token_out: self.dest.clone(),
+                    }],
+                ),
+            }
+        }
+
+        /// A `source -> middle -> dest` route quoted at 1:1 on both hops.
+        fn multi_hop_route(&self, env: &Env) -> PathRoute {
+            PathRoute {
+                legs: Vec::from_array(
+                    env,
+                    [
+                        PathLeg {
+                            pool: self.pool.clone(),
+                            token_in: self.source.clone(),
+                            token_out: self.middle.clone(),
+                        },
+                        PathLeg {
+                            pool: self.second_pool.clone(),
+                            token_in: self.middle.clone(),
+                            token_out: self.dest.clone(),
+                        },
+                    ],
+                ),
+            }
+        }
+    }
+
+    fn setup<'a>(env: &'a Env) -> PathFixture<'a> {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let buyer = Address::generate(env);
+        let seller = Address::generate(env);
+        let asset_admin = Address::generate(env);
+        let source = env
+            .register_stellar_asset_contract_v2(asset_admin.clone())
+            .address();
+        let middle = env
+            .register_stellar_asset_contract_v2(asset_admin.clone())
+            .address();
+        let dest = env
+            .register_stellar_asset_contract_v2(asset_admin)
+            .address();
+
+        let contract_id = env.register(
+            EscrowContract,
+            (EscrowConfig {
+                admin: admin.clone(),
+                fee_bps: 250,
+                treasury: treasury.clone(),
+                min_amount: 100,
+                max_amount: 1_000_000,
+            },),
+        );
+        let client = EscrowContractClient::new(env, &contract_id);
+        for token in [&source, &middle, &dest] {
+            client.add_token(&admin, token);
+        }
+        StellarAssetClient::new(env, &source).mint(&buyer, &10_000);
+
+        let router = env.register(MockDexRouter, ());
+        let router_client = MockDexRouterClient::new(env, &router);
+        // The mock pays the destination currency out of balances it already holds.
+        StellarAssetClient::new(env, &dest).mint(&router, &1_000_000);
+        StellarAssetClient::new(env, &middle).mint(&router, &1_000_000);
+
+        let pool = Address::generate(env);
+        router_client.set_pool_rate(&pool, &10_000);
+        let second_pool = Address::generate(env);
+        router_client.set_pool_rate(&second_pool, &10_000);
+
+        let escrow_id = client.deposit(
+            &buyer,
+            &seller,
+            &source,
+            &1_000,
+            &BytesN::from_array(env, &[71; 32]),
+            &1_000,
+            &None,
+            &None,
+        );
+
+        PathFixture {
+            client,
+            router_client,
+            admin,
+            treasury,
+            buyer,
+            seller,
+            source,
+            middle,
+            dest,
+            contract_id,
+            router,
+            pool,
+            second_pool,
+            escrow_id,
+        }
+    }
+
+    fn find_event<T>(env: &Env, contract_id: &Address, action: Symbol) -> Option<T>
+    where
+        T: TryFromVal<Env, soroban_sdk::Val>,
+    {
+        for (event_contract, topics, data) in env.events().all().iter() {
+            if event_contract != *contract_id || topics.len() != 3 {
+                continue;
+            }
+            let topic: Symbol = topics.get(1).unwrap().try_into_val(env).unwrap();
+            if topic == action {
+                return T::try_from_val(env, &data).ok();
+            }
+        }
+        None
+    }
+
+    fn commit_bounds(f: &PathFixture<'_>, min_output_amount: i128, max_input_amount: i128) {
+        assert!(f.client.set_slippage_bounds(
+            &f.escrow_id,
+            &f.buyer,
+            &SlippageBounds {
+                min_output_amount,
+                max_input_amount,
+            },
+        ));
+    }
+
+    #[test]
+    fn set_slippage_bounds_rejects_an_unknown_escrow() {
+        let env = Env::default();
+        let f = setup(&env);
+
+        assert_eq!(
+            f.client.try_set_slippage_bounds(
+                &999,
+                &f.buyer,
+                &SlippageBounds {
+                    min_output_amount: 950,
+                    max_input_amount: 1_000,
+                },
+            ),
+            Err(Ok(EscrowError::NotFound))
+        );
+    }
+
+    #[test]
+    fn set_slippage_bounds_rejects_callers_who_are_neither_buyer_nor_admin() {
+        let env = Env::default();
+        let f = setup(&env);
+        let stranger = Address::generate(&env);
+        let bounds = SlippageBounds {
+            min_output_amount: 950,
+            max_input_amount: 1_000,
+        };
+
+        assert_eq!(
+            f.client
+                .try_set_slippage_bounds(&f.escrow_id, &stranger, &bounds),
+            Err(Ok(EscrowError::Unauthorized))
+        );
+        assert_eq!(f.client.get_slippage_bounds(&f.escrow_id), None);
+    }
+
+    #[test]
+    fn set_slippage_bounds_rejects_non_positive_bounds() {
+        let env = Env::default();
+        let f = setup(&env);
+
+        for bounds in [
+            SlippageBounds {
+                min_output_amount: 0,
+                max_input_amount: 1_000,
+            },
+            SlippageBounds {
+                min_output_amount: 950,
+                max_input_amount: 0,
+            },
+            SlippageBounds {
+                min_output_amount: -1,
+                max_input_amount: 1_000,
+            },
+            SlippageBounds {
+                min_output_amount: 950,
+                max_input_amount: -1,
+            },
+        ] {
+            assert_eq!(
+                f.client
+                    .try_set_slippage_bounds(&f.escrow_id, &f.buyer, &bounds),
+                Err(Ok(EscrowError::InvalidSlippageBounds))
+            );
+        }
+        assert_eq!(f.client.get_slippage_bounds(&f.escrow_id), None);
+    }
+
+    #[test]
+    fn set_slippage_bounds_rejects_a_disputed_escrow() {
+        let env = Env::default();
+        let f = setup(&env);
+        f.client.dispute(&f.escrow_id, &f.buyer);
+
+        assert_eq!(
+            f.client.try_set_slippage_bounds(
+                &f.escrow_id,
+                &f.buyer,
+                &SlippageBounds {
+                    min_output_amount: 950,
+                    max_input_amount: 1_000,
+                },
+            ),
+            Err(Ok(EscrowError::InvalidStatus))
+        );
+    }
+
+    /// A committed window is the user's floor: it can be tightened at any time
+    /// before settlement, but never widened — otherwise a front-runner could
+    /// loosen the tolerance to let a worse fill through.
+    #[test]
+    fn committed_bounds_may_be_tightened_but_never_widened() {
+        let env = Env::default();
+        let f = setup(&env);
+        commit_bounds(&f, 950, 1_000);
+
+        // Tightening (a higher minimum output and a lower ceiling) is allowed.
+        commit_bounds(&f, 990, 900);
+        assert_eq!(
+            f.client.get_slippage_bounds(&f.escrow_id),
+            Some(SlippageBounds {
+                min_output_amount: 990,
+                max_input_amount: 900,
+            })
+        );
+
+        for looser in [
+            SlippageBounds {
+                min_output_amount: 989,
+                max_input_amount: 900,
+            },
+            SlippageBounds {
+                min_output_amount: 990,
+                max_input_amount: 901,
+            },
+            SlippageBounds {
+                min_output_amount: 1,
+                max_input_amount: 10_000,
+            },
+        ] {
+            assert_eq!(
+                f.client
+                    .try_set_slippage_bounds(&f.escrow_id, &f.buyer, &looser),
+                Err(Ok(EscrowError::SlippageBoundsTooLoose))
+            );
+        }
+        assert_eq!(
+            f.client.get_slippage_bounds(&f.escrow_id),
+            Some(SlippageBounds {
+                min_output_amount: 990,
+                max_input_amount: 900,
+            })
+        );
+    }
+
+    #[test]
+    fn set_slippage_bounds_publishes_the_committed_window() {
+        let env = Env::default();
+        let f = setup(&env);
+        commit_bounds(&f, 950, 1_000);
+
+        let event: SlippageBoundsSetEvent =
+            find_event(&env, &f.contract_id, symbol_short!("slipset")).unwrap();
+        assert_eq!(event.escrow_id, f.escrow_id);
+        assert_eq!(event.min_output_amount, 950);
+        assert_eq!(event.max_input_amount, 1_000);
+        assert_eq!(event.set_by, f.buyer);
+    }
+
+    #[test]
+    fn the_slippage_view_reports_whether_a_quoted_fill_would_settle() {
+        let env = Env::default();
+        let f = setup(&env);
+
+        assert!(!f
+            .client
+            .is_within_slippage_bounds(&f.escrow_id, &1_000, &1_000));
+        commit_bounds(&f, 950, 1_000);
+
+        assert!(f
+            .client
+            .is_within_slippage_bounds(&f.escrow_id, &1_000, &1_000));
+        // Boundary: the floor and the ceiling themselves are acceptable.
+        assert!(f
+            .client
+            .is_within_slippage_bounds(&f.escrow_id, &1_000, &950));
+        assert!(f.client.is_within_slippage_bounds(&f.escrow_id, &400, &950));
+        // Below the floor, above the ceiling, or beyond the escrow balance.
+        assert!(!f
+            .client
+            .is_within_slippage_bounds(&f.escrow_id, &1_000, &949));
+        assert!(!f
+            .client
+            .is_within_slippage_bounds(&f.escrow_id, &1_001, &1_000));
+        assert!(!f
+            .client
+            .is_within_slippage_bounds(&f.escrow_id, &1_001, &1_001));
+    }
+
+    #[test]
+    fn path_payment_requires_a_committed_slippage_window() {
+        let env = Env::default();
+        let f = setup(&env);
+        let route = f.direct_route(&env);
+
+        assert_eq!(
+            f.client
+                .try_execute_path_payment(&f.escrow_id, &f.buyer, &f.router, &route),
+            Err(Ok(EscrowError::SlippageBoundsNotSet))
+        );
+    }
+
+    #[test]
+    fn path_payment_settles_the_seller_in_the_destination_currency() {
+        let env = Env::default();
+        let f = setup(&env);
+        commit_bounds(&f, 950, 1_000);
+        let route = f.direct_route(&env);
+
+        let result = f
+            .client
+            .execute_path_payment(&f.escrow_id, &f.buyer, &f.router, &route);
+        assert_eq!(
+            result,
+            PathExecutionResult {
+                input_amount: 1_000,
+                output_amount: 1_000,
+            }
+        );
+
+        // Read the event before any further contract call: the test host only
+        // exposes the events of the invocation that is currently in scope.
+        let event: PathPaymentSettledEvent =
+            find_event(&env, &f.contract_id, symbol_short!("pathset")).unwrap();
+        assert_eq!(event.escrow_id, f.escrow_id);
+        assert_eq!(event.router, f.router);
+        assert_eq!(event.seller, f.seller);
+        assert_eq!(event.leg_count, 1);
+        assert_eq!(event.input_amount, 1_000);
+        assert_eq!(event.output_amount, 1_000);
+        assert_eq!(event.min_output_amount, 950);
+        assert_eq!(event.max_input_amount, 1_000);
+        assert_eq!(event.settled_by, f.buyer);
+
+        // The seller is paid in the destination currency, the router in the
+        // escrowed token net of the 250 bps platform fee, and the escrow keeps
+        // nothing.
+        assert_eq!(f.dest_balance(&env, &f.seller), 1_000);
+        assert_eq!(f.source_balance(&env, &f.treasury), 25);
+        assert_eq!(f.source_balance(&env, &f.router), 975);
+        assert_eq!(f.source_balance(&env, &f.contract_id), 0);
+
+        let record = f.client.get_escrow(&f.escrow_id);
+        assert_eq!(record.released_amount, 1_000);
+        assert_eq!(record.refunded_amount, 0);
+        assert_eq!(record.status, EscrowStatus::Released);
+    }
+
+    #[test]
+    fn a_multi_hop_route_settles_through_an_intermediate_currency() {
+        let env = Env::default();
+        let f = setup(&env);
+        commit_bounds(&f, 950, 1_000);
+        let route = f.multi_hop_route(&env);
+
+        let result = f
+            .client
+            .execute_path_payment(&f.escrow_id, &f.buyer, &f.router, &route);
+
+        assert_eq!(result.output_amount, 1_000);
+
+        // Read the event before any further contract call: the test host only
+        // exposes the events of the invocation that is currently in scope.
+        let event: PathPaymentSettledEvent =
+            find_event(&env, &f.contract_id, symbol_short!("pathset")).unwrap();
+        assert_eq!(event.leg_count, 2);
+        assert_eq!(event.input_amount, 1_000);
+        assert_eq!(event.output_amount, 1_000);
+
+        assert_eq!(f.dest_balance(&env, &f.seller), 1_000);
+        assert_eq!(
+            f.client.get_escrow(&f.escrow_id).status,
+            EscrowStatus::Released
+        );
+    }
+
+    /// Simulated sandwich attack (issue #337).
+    ///
+    /// The buyer commits a 5% window and broadcasts a route. A searcher
+    /// front-runs it with a large buy that pushes the pool price down 10%, so
+    /// the victim's back-run fill delivers 900 units instead of 1_000. Because
+    /// the contract checks the *realised* fill and not the requested amount,
+    /// the invocation is reverted: the router is never paid, the seller
+    /// receives nothing, and the escrow stays fully funded for a retry or a
+    /// refund once the pool recovers.
+    #[test]
+    fn a_simulated_sandwich_attack_cannot_settle_outside_the_window() {
+        let env = Env::default();
+        let f = setup(&env);
+        commit_bounds(&f, 950, 1_000);
+        let route = f.direct_route(&env);
+
+        // The searcher's front-run moves the pool price down by 10%.
+        f.router_client.set_pool_rate(&f.pool, &9_000);
+
+        assert_eq!(
+            f.client
+                .try_execute_path_payment(&f.escrow_id, &f.buyer, &f.router, &route),
+            Err(Ok(EscrowError::SlippageExceeded))
+        );
+
+        // No settlement event was published, and nothing moved: the router is
+        // unpaid, the seller is unpaid, and the escrow still holds the full
+        // amount. The event is read first because the test host only exposes
+        // the events of the invocation currently in scope.
+        assert!(find_event::<PathPaymentSettledEvent>(
+            &env,
+            &f.contract_id,
+            symbol_short!("pathset")
+        )
+        .is_none());
+        assert_eq!(f.source_balance(&env, &f.router), 0);
+        assert_eq!(f.dest_balance(&env, &f.seller), 0);
+        assert_eq!(f.source_balance(&env, &f.contract_id), 1_000);
+        let record = f.client.get_escrow(&f.escrow_id);
+        assert_eq!(record.status, EscrowStatus::Funded);
+        assert_eq!(record.released_amount, 0);
+
+        // Once the pool recovers the same committed window settles normally.
+        f.router_client.set_pool_rate(&f.pool, &10_000);
+        assert!(
+            f.client
+                .execute_path_payment(&f.escrow_id, &f.buyer, &f.router, &route)
+                .output_amount
+                > 0
+        );
+
+        // Sanity-check the negative assertion above: the same lookup does find
+        // the event once the payment actually settles.
+        let event: PathPaymentSettledEvent =
+            find_event(&env, &f.contract_id, symbol_short!("pathset")).unwrap();
+        assert_eq!(event.output_amount, 1_000);
+        assert_eq!(f.dest_balance(&env, &f.seller), 1_000);
+    }
+
+    /// The dynamic part of the limit: a window tightened after the attacker
+    /// started moving the price rejects a move the original window allowed.
+    #[test]
+    fn a_tightened_window_rejects_a_move_the_wider_window_allowed() {
+        let env = Env::default();
+        let f = setup(&env);
+        let route = f.direct_route(&env);
+
+        commit_bounds(&f, 950, 1_000);
+        f.router_client.set_pool_rate(&f.pool, &9_600);
+        assert!(f
+            .client
+            .try_execute_path_payment(&f.escrow_id, &f.buyer, &f.router, &route)
+            .is_ok());
+
+        // Same adverse move, but the second escrow committed a tighter floor.
+        let second_id = f.client.deposit(
+            &f.buyer,
+            &f.seller,
+            &f.source,
+            &1_000,
+            &BytesN::from_array(&env, &[72; 32]),
+            &1_000,
+            &None,
+            &None,
+        );
+        assert!(f.client.set_slippage_bounds(
+            &second_id,
+            &f.buyer,
+            &SlippageBounds {
+                min_output_amount: 980,
+                max_input_amount: 1_000,
+            },
+        ));
+        assert_eq!(
+            f.client
+                .try_execute_path_payment(&second_id, &f.buyer, &f.router, &route),
+            Err(Ok(EscrowError::SlippageExceeded))
+        );
+    }
+
+    #[test]
+    fn path_payment_reverts_when_the_router_consumes_more_than_the_ceiling() {
+        let env = Env::default();
+        let f = setup(&env);
+        commit_bounds(&f, 950, 1_000);
+        let route = f.direct_route(&env);
+
+        // The router reports spending 5% more than it was authorised to.
+        f.router_client.set_input_skew(&10_500);
+
+        assert_eq!(
+            f.client
+                .try_execute_path_payment(&f.escrow_id, &f.buyer, &f.router, &route),
+            Err(Ok(EscrowError::SlippageExceeded))
+        );
+        assert_eq!(f.source_balance(&env, &f.router), 0);
+        assert_eq!(f.source_balance(&env, &f.contract_id), 1_000);
+    }
+
+    #[test]
+    fn path_payment_reverts_when_the_route_spends_more_than_the_escrow_holds() {
+        let env = Env::default();
+        let f = setup(&env);
+        // A prior partial refund shrinks the balance the route may draw on.
+        f.client.partial_refund(&f.escrow_id, &f.seller, &200);
+        commit_bounds(&f, 900, 1_000);
+        let route = f.direct_route(&env);
+
+        assert_eq!(
+            f.client
+                .try_execute_path_payment(&f.escrow_id, &f.buyer, &f.router, &route),
+            Err(Ok(EscrowError::InsufficientEscrowBalance))
+        );
+        assert_eq!(f.source_balance(&env, &f.contract_id), 800);
+    }
+
+    #[test]
+    fn a_partial_path_payment_leaves_the_remainder_refundable() {
+        let env = Env::default();
+        let f = setup(&env);
+        commit_bounds(&f, 350, 400);
+        let route = f.direct_route(&env);
+
+        f.client
+            .execute_path_payment(&f.escrow_id, &f.buyer, &f.router, &route);
+
+        let record = f.client.get_escrow(&f.escrow_id);
+        assert_eq!(record.released_amount, 400);
+        assert_eq!(record.status, EscrowStatus::Funded);
+        assert_eq!(f.dest_balance(&env, &f.seller), 400);
+        assert_eq!(f.source_balance(&env, &f.contract_id), 600);
+
+        assert!(f.client.refund(&f.escrow_id, &f.seller));
+        assert_eq!(f.source_balance(&env, &f.buyer), 9_600);
+        assert_eq!(
+            f.client.get_escrow(&f.escrow_id).status,
+            EscrowStatus::Refunded
+        );
+    }
+
+    #[test]
+    fn a_refunded_escrow_cannot_settle_a_path_payment() {
+        let env = Env::default();
+        let f = setup(&env);
+        commit_bounds(&f, 950, 1_000);
+        let route = f.direct_route(&env);
+        f.client.refund(&f.escrow_id, &f.seller);
+
+        assert_eq!(
+            f.client
+                .try_execute_path_payment(&f.escrow_id, &f.buyer, &f.router, &route),
+            Err(Ok(EscrowError::AlreadyRefunded))
+        );
+    }
+
+    #[test]
+    fn path_payment_rejects_callers_who_are_neither_buyer_nor_admin() {
+        let env = Env::default();
+        let f = setup(&env);
+        commit_bounds(&f, 950, 1_000);
+        let route = f.direct_route(&env);
+        let stranger = Address::generate(&env);
+
+        assert_eq!(
+            f.client
+                .try_execute_path_payment(&f.escrow_id, &stranger, &f.router, &route),
+            Err(Ok(EscrowError::Unauthorized))
+        );
+
+        // An admin may settle on the buyer's behalf.
+        assert!(
+            f.client
+                .execute_path_payment(&f.escrow_id, &f.admin, &f.router, &route)
+                .output_amount
+                > 0
+        );
+    }
+
+    #[test]
+    fn path_payment_rejects_an_unknown_escrow_and_a_zero_router() {
+        let env = Env::default();
+        let f = setup(&env);
+        commit_bounds(&f, 950, 1_000);
+        let route = f.direct_route(&env);
+        let zero_contract = Address::from_str(&env, ZERO_CONTRACT_STRKEY);
+
+        assert_eq!(
+            f.client
+                .try_execute_path_payment(&999, &f.buyer, &f.router, &route),
+            Err(Ok(EscrowError::NotFound))
+        );
+        assert_eq!(
+            f.client
+                .try_execute_path_payment(&f.escrow_id, &f.buyer, &zero_contract, &route),
+            Err(Ok(EscrowError::InvalidAddress))
+        );
+    }
+
+    #[test]
+    fn path_payment_rejects_routes_that_do_not_convert_the_escrowed_token() {
+        let env = Env::default();
+        let f = setup(&env);
+        commit_bounds(&f, 950, 1_000);
+
+        // Starts from the wrong token.
+        let wrong_start = PathRoute {
+            legs: Vec::from_array(
+                &env,
+                [PathLeg {
+                    pool: f.pool.clone(),
+                    token_in: f.dest.clone(),
+                    token_out: f.source.clone(),
+                }],
+            ),
+        };
+        assert_eq!(
+            f.client
+                .try_execute_path_payment(&f.escrow_id, &f.buyer, &f.router, &wrong_start),
+            Err(Ok(EscrowError::InvalidPathRoute))
+        );
+
+        // Converts a token into itself.
+        let self_converting = PathRoute {
+            legs: Vec::from_array(
+                &env,
+                [PathLeg {
+                    pool: f.pool.clone(),
+                    token_in: f.source.clone(),
+                    token_out: f.source.clone(),
+                }],
+            ),
+        };
+        assert_eq!(
+            f.client
+                .try_execute_path_payment(&f.escrow_id, &f.buyer, &f.router, &self_converting),
+            Err(Ok(EscrowError::InvalidPathRoute))
+        );
+
+        // Pays out the escrowed token, so it is not a cross-currency payment.
+        let round_trip = PathRoute {
+            legs: Vec::from_array(
+                &env,
+                [
+                    PathLeg {
+                        pool: f.pool.clone(),
+                        token_in: f.source.clone(),
+                        token_out: f.middle.clone(),
+                    },
+                    PathLeg {
+                        pool: f.pool.clone(),
+                        token_in: f.middle.clone(),
+                        token_out: f.source.clone(),
+                    },
+                ],
+            ),
+        };
+        assert_eq!(
+            f.client
+                .try_execute_path_payment(&f.escrow_id, &f.buyer, &f.router, &round_trip),
+            Err(Ok(EscrowError::InvalidPathRoute))
+        );
+    }
+
+    #[test]
+    fn path_payment_rejects_a_route_whose_hops_do_not_chain() {
+        let env = Env::default();
+        let f = setup(&env);
+        commit_bounds(&f, 950, 1_000);
+
+        // The second hop pays out a different token than the first hop produces.
+        let broken = PathRoute {
+            legs: Vec::from_array(
+                &env,
+                [
+                    PathLeg {
+                        pool: f.pool.clone(),
+                        token_in: f.source.clone(),
+                        token_out: f.middle.clone(),
+                    },
+                    PathLeg {
+                        pool: f.pool.clone(),
+                        token_in: f.source.clone(),
+                        token_out: f.dest.clone(),
+                    },
+                ],
+            ),
+        };
+        assert_eq!(
+            f.client
+                .try_execute_path_payment(&f.escrow_id, &f.buyer, &f.router, &broken),
+            Err(Ok(EscrowError::InvalidPathRoute))
+        );
+    }
+
+    #[test]
+    fn path_payment_rejects_empty_and_oversized_routes() {
+        let env = Env::default();
+        let f = setup(&env);
+        commit_bounds(&f, 950, 1_000);
+
+        let empty = PathRoute {
+            legs: Vec::new(&env),
+        };
+        assert_eq!(
+            f.client
+                .try_execute_path_payment(&f.escrow_id, &f.buyer, &f.router, &empty),
+            Err(Ok(EscrowError::InvalidPathRoute))
+        );
+
+        // The hop limit is checked first, so an over-long route is rejected
+        // before any of its legs are inspected.
+        let mut legs: Vec<PathLeg> = Vec::new(&env);
+        for i in 0..=MAX_PATH_LEGS {
+            let hop = if i % 2 == 0 {
+                PathLeg {
+                    pool: f.pool.clone(),
+                    token_in: f.source.clone(),
+                    token_out: f.middle.clone(),
+                }
+            } else {
+                PathLeg {
+                    pool: f.pool.clone(),
+                    token_in: f.middle.clone(),
+                    token_out: f.source.clone(),
+                }
+            };
+            legs.push_back(hop);
+        }
+        assert_eq!(
+            f.client.try_execute_path_payment(
+                &f.escrow_id,
+                &f.buyer,
+                &f.router,
+                &PathRoute { legs },
+            ),
+            Err(Ok(EscrowError::InvalidPathRoute))
+        );
+    }
+
+    #[test]
+    fn path_payment_rejects_route_tokens_that_are_not_whitelisted() {
+        let env = Env::default();
+        let f = setup(&env);
+        commit_bounds(&f, 950, 1_000);
+        let unlisted = env
+            .register_stellar_asset_contract_v2(Address::generate(&env))
+            .address();
+        let route = PathRoute {
+            legs: Vec::from_array(
+                &env,
+                [PathLeg {
+                    pool: f.pool.clone(),
+                    token_in: f.source.clone(),
+                    token_out: unlisted,
+                }],
+            ),
+        };
+
+        assert_eq!(
+            f.client
+                .try_execute_path_payment(&f.escrow_id, &f.buyer, &f.router, &route),
+            Err(Ok(EscrowError::TokenNotWhitelisted))
+        );
+    }
+
+    #[test]
+    fn path_payment_rejects_a_router_that_returns_an_unusable_result() {
+        let env = Env::default();
+        let f = setup(&env);
+        commit_bounds(&f, 950, 1_000);
+        let route = f.direct_route(&env);
+        let broken_router = env.register(MalformedRouter, ());
+
+        assert_eq!(
+            f.client
+                .try_execute_path_payment(&f.escrow_id, &f.buyer, &broken_router, &route),
+            Err(Ok(EscrowError::PathExecutionFailed))
+        );
+        assert_eq!(f.source_balance(&env, &f.contract_id), 1_000);
+    }
+
+    #[test]
+    fn a_router_that_does_not_deliver_is_never_paid() {
+        let env = Env::default();
+        let f = setup(&env);
+        commit_bounds(&f, 950, 1_000);
+        let route = f.direct_route(&env);
+
+        // The router reports a full output but delivers nothing.
+        f.router_client.set_output_factor(&0);
+
+        assert!(f
+            .client
+            .try_execute_path_payment(&f.escrow_id, &f.buyer, &f.router, &route)
+            .is_err());
+        assert_eq!(f.source_balance(&env, &f.router), 0);
+        assert_eq!(f.source_balance(&env, &f.treasury), 0);
+        assert_eq!(f.dest_balance(&env, &f.seller), 0);
+        assert_eq!(f.source_balance(&env, &f.contract_id), 1_000);
+        assert_eq!(
+            f.client.get_escrow(&f.escrow_id).status,
+            EscrowStatus::Funded
+        );
+    }
+}
+
 #[cfg(all(test, feature = "full_suite"))]
 mod integration_tests;
 #[cfg(all(test, feature = "full_suite"))]
@@ -6180,7 +7616,7 @@ mod error_code_allocation_tests {
         (3_000, 3_999),
         (4_000, 4_999),
     ];
-    fn escrow_error_codes() -> [u32; 45] {
+    fn escrow_error_codes() -> [u32; 51] {
         [
             EscrowError::AlreadyInitialized as u32,
             EscrowError::NotFound as u32,
@@ -6227,6 +7663,12 @@ mod error_code_allocation_tests {
             EscrowError::SignedProofRequired as u32,
             EscrowError::InvalidSignedDeliveryProof as u32,
             EscrowError::OraclePublicKeyNotSet as u32,
+            EscrowError::SlippageBoundsNotSet as u32,
+            EscrowError::SlippageExceeded as u32,
+            EscrowError::InvalidSlippageBounds as u32,
+            EscrowError::SlippageBoundsTooLoose as u32,
+            EscrowError::InvalidPathRoute as u32,
+            EscrowError::PathExecutionFailed as u32,
         ]
     }
     #[test]
