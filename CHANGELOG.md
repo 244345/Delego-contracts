@@ -20,6 +20,16 @@ will reject the change.
 
 ### Unreleased
 
+- Add dynamic platform fee tiering based on merchant settled volume (issue #328): admin-configured
+  `FeeTier` ladder, per-merchant volume accumulation on every successful release, tier-aware fee
+  computation on escrow release, and a `MerchantVolumeTierUpdatedEvent` emitted when a merchant
+  reaches a higher volume bracket. Adds `set_fee_tiers`, `remove_fee_tier`, `get_fee_tiers`,
+  `get_merchant_settled_volume`, `get_merchant_tier`, and `get_effective_fee_bps` entry points
+  with `InvalidTier`/`TierLimitExceeded`/`TierNotFound` error codes.
+- Fix pre-existing build breakage: declare the missing `EscrowError` variants used by the
+  multi-sig upgrade and merchant-category validation paths, add the missing `DataKey::MerkleRoot`
+  storage key, correct an `into_val` call in merchant-category validation, and skip the XDR spec
+  export for `EscrowError` (the spec format caps error enums at 50 cases).
 - Add immutable daily delivery Merkle roots and order-bound inclusion-proof escrow release.
 - Add atomic batch escrow creation with per-token aggregate allowance transfers.
 - Add admin split dispute settlements with buyer, seller, and mediator payouts.

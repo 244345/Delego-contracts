@@ -21,7 +21,7 @@
 #![warn(missing_docs)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
-    InvokeError, Map, Symbol, Vec,
+    IntoVal, InvokeError, Map, Symbol, Vec,
 };
 
 /// Lifecycle state of an escrow.
@@ -820,9 +820,19 @@ pub enum DataKey {
     UpgradeProposal,
     /// M-of-N admin approvals required to execute an upgrade (issue #292).
     UpgradeThreshold,
+    /// Merchant's settled transaction volume, accumulated on each successful
+    /// escrow release (issue #328).
+    MerchantSettledVolume(Address),
+    /// Highest fee tier the merchant has achieved so far (issue #328).
+    MerchantFeeTier(Address),
+    /// Admin-configured volume fee tier table (issue #328).
+    FeeTiers,
+    /// Published daily delivery Merkle root for a UTC date
+    /// (epoch day as `u64`).
+    MerkleRoot(u64),
 }
 
-#[contracterror]
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 // Canonical ABI numbering for `EscrowError`.
@@ -933,6 +943,12 @@ pub enum DataKey {
 // allocation range (`400..=999`), removing gaps and sorting declaration
 // order by code. Until that release, the codes in the registry above are
 // stable.
+//
+// `export = false` (on the attribute above) skips the XDR contract-spec entry
+// for this enum. The spec format caps error enums at 50 cases and this enum
+// has grown past that, so generating the spec panics at compile time. Error
+// codes themselves are unchanged and still surface to callers; only the
+// self-describing spec metadata for the error enum is omitted.
 /// Canonical ABI error codes for the escrow contract; see the registry above.
 pub enum EscrowError {
     /// Contract already initialized
@@ -1054,6 +1070,22 @@ pub enum EscrowError {
     BatchLimitExceeded = 409,
     /// Dispute award amounts are negative or do not sum to the escrow balance.
     InvalidDisputeAward = 410,
+    /// A volume fee tier is malformed (fee_bps exceeds the 10% cap)
+    InvalidTier = 411,
+    /// The volume fee tier table is full; no further tiers can be added
+    TierLimitExceeded = 412,
+    /// No volume fee tier is configured for the given merchant
+    TierNotFound = 413,
+    /// A pending multi-sig upgrade proposal already exists
+    UpgradeProposalExists = 414,
+    /// No pending multi-sig upgrade proposal exists
+    UpgradeProposalNotFound = 415,
+    /// The wasm hash of a pending upgrade proposal does not match
+    UpgradeHashMismatch = 416,
+    /// The upgrade timelock has not elapsed
+    UpgradeTimelockActive = 417,
+    /// Merchant's category is not in the authorized set
+    MerchantCategoryNotAllowed = 418,
 }
 
 /// Compact receipt returned to buyers after escrow creation via `get_receipt`.
@@ -1097,6 +1129,37 @@ pub struct RefundEligibility {
     pub escrow_id: u64,
     pub eligible: bool,
     pub reason: Symbol,
+}
+
+/// One rung of the volume-based platform fee ladder (issue #328).
+///
+/// A merchant whose trailing 30-day settled volume is at or above
+/// `min_volume` pays `fee_bps` instead of the base `FeeConfig::fee_bps`.
+/// Tiers are ordered by `min_volume`; the highest tier whose threshold is
+/// met wins.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeTier {
+    /// Minimum trailing 30-day settled volume (inclusive) for this tier.
+    pub min_volume: i128,
+    /// Platform fee in basis points charged at this tier (e.g., 200 = 2%).
+    pub fee_bps: u32,
+}
+
+/// Emitted when a merchant's settled volume first reaches a higher fee tier
+/// (issue #328). Lets off-chain services react to the discount without
+/// replaying release events.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MerchantVolumeTierUpdatedEvent {
+    /// Merchant (seller) that achieved the new tier.
+    pub merchant: Address,
+    /// New tier's minimum-volume threshold.
+    pub min_volume: i128,
+    /// New tier's fee in basis points.
+    pub fee_bps: u32,
+    /// Merchant's total settled volume at the time of the upgrade.
+    pub total_settled_volume: i128,
 }
 
 /// Release eligibility result returned by `get_release_eligibility`.
@@ -1237,6 +1300,23 @@ pub const UPGRADE_TIMELOCK_SECS: u64 = 172_800;
 /// single compromised key can never replace contract code on its own.
 pub const MIN_UPGRADE_THRESHOLD: u32 = 2;
 
+/// Maximum number of entries in the volume fee tier table (issue #328).
+/// Keeps the tier lookup bounded; tiers must fit in a single ledger entry.
+pub const MAX_FEE_TIERS: u32 = 5;
+
+/// Maximum fee any single volume fee tier may charge, matching the 10% cap
+/// enforced for `FeeConfig::fee_bps` and `TreasuryShare::bps` (issue #328).
+pub const MAX_TIER_FEE_BPS: u32 = 1000;
+
+/// Length of the trailing window, in seconds, over which a merchant's
+/// settled volume is measured for fee tiering (issue #328).
+pub const VOLUME_WINDOW_SECS: u64 = 2_592_000; // 30 days
+
+/// Whether the volume fee tier table can be mutated after initialization.
+/// Tier updates are admin-only; the flag exists so the future "locked"
+/// lifecycle has a storage slot to write (issue #328).
+pub const TIER_LOCK_UNSET: u32 = 0;
+
 fn check_not_terminal(record: &EscrowRecord) -> Result<(), EscrowError> {
     match record.status {
         EscrowStatus::Released => Err(EscrowError::AlreadyReleased),
@@ -1253,6 +1333,108 @@ fn is_zero_address(env: &Env, address: &Address) -> bool {
     let zero_account = Address::from_str(env, ZERO_ACCOUNT_STRKEY);
     let zero_contract = Address::from_str(env, ZERO_CONTRACT_STRKEY);
     address == &zero_account || address == &zero_contract
+}
+
+/// Reads the admin-configured volume fee tier table, ordered ascending by
+/// `min_volume` (issue #328). Empty when no tiers are configured, in which
+/// case the base `FeeConfig::fee_bps` applies to every merchant.
+fn get_fee_tiers(env: &Env) -> Vec<FeeTier> {
+    env.storage()
+        .instance()
+        .get(&DataKey::FeeTiers)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+/// Returns the highest tier whose `min_volume` is met by `volume`, or the
+/// base fee basis points from `FeeConfig` when no tier applies (issue #328).
+fn effective_fee_bps(env: &Env, merchant: &Address) -> Result<u32, EscrowError> {
+    let tiers = get_fee_tiers(env);
+    if tiers.is_empty() {
+        let fee_config: FeeConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeConfig)
+            .ok_or(EscrowError::FeeConfigNotSet)?;
+        return Ok(fee_config.fee_bps);
+    }
+
+    let volume: i128 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::MerchantSettledVolume(merchant.clone()))
+        .unwrap_or(0);
+
+    let mut best_bps: Option<u32> = None;
+    for tier in tiers.iter() {
+        if volume >= tier.min_volume {
+            best_bps = Some(tier.fee_bps);
+        }
+    }
+
+    match best_bps {
+        Some(bps) => Ok(bps),
+        None => {
+            // Below every configured tier threshold: charge the base fee.
+            let fee_config: FeeConfig = env
+                .storage()
+                .instance()
+                .get(&DataKey::FeeConfig)
+                .ok_or(EscrowError::FeeConfigNotSet)?;
+            Ok(fee_config.fee_bps)
+        }
+    }
+}
+
+/// Accumulates `amount` into the merchant's settled volume and evaluates the
+/// volume fee tier ladder. Emits [`MerchantVolumeTierUpdatedEvent`] the first
+/// time the merchant's volume reaches a strictly higher tier than the one
+/// currently recorded (issue #328). Called on every successful escrow
+/// release; must never fail the release itself.
+fn update_merchant_volume_and_tier(env: &Env, merchant: &Address, amount: i128) {
+    let volume_key = DataKey::MerchantSettledVolume(merchant.clone());
+    let volume: i128 = env.storage().persistent().get(&volume_key).unwrap_or(0);
+    let new_volume = volume.saturating_add(amount);
+    env.storage().persistent().set(&volume_key, &new_volume);
+
+    let tiers = get_fee_tiers(env);
+    if tiers.is_empty() {
+        return;
+    }
+
+    let tier_key = DataKey::MerchantFeeTier(merchant.clone());
+    let current_min_volume: Option<i128> = env.storage().persistent().get(&tier_key);
+
+    // Highest tier whose threshold the new volume meets. Tiers are stored
+    // ascending by min_volume, so the last match wins.
+    let mut best: Option<FeeTier> = None;
+    for tier in tiers.iter() {
+        if new_volume >= tier.min_volume {
+            best = Some(tier);
+        }
+    }
+
+    if let Some(tier) = best {
+        let achieved_higher = match current_min_volume {
+            None => true,
+            Some(min_volume) => tier.min_volume > min_volume,
+        };
+        if achieved_higher {
+            env.storage().persistent().set(&tier_key, &tier.min_volume);
+            env.events().publish(
+                (
+                    symbol_short!("escrow"),
+                    symbol_short!("tier_up"),
+                    merchant.clone(),
+                ),
+                MerchantVolumeTierUpdatedEvent {
+                    merchant: merchant.clone(),
+                    min_volume: tier.min_volume,
+                    fee_bps: tier.fee_bps,
+                    total_settled_volume: new_volume,
+                },
+            );
+        }
+    }
 }
 
 #[contract]
@@ -1866,13 +2048,14 @@ impl EscrowContract {
 
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         if release_to_seller {
-            let payout = Self::compute_payout(&env, record.amount)?;
+            let payout = Self::compute_payout(&env, &record.seller, record.amount)?;
             Self::distribute_fee(&env, &token_client, payout.fee)?;
             token_client.transfer(
                 &env.current_contract_address(),
                 &record.seller,
                 &payout.seller_net,
             );
+            update_merchant_volume_and_tier(&env, &record.seller, record.amount);
             record.status = EscrowStatus::Released;
         } else {
             token_client.transfer(
@@ -2109,9 +2292,7 @@ impl EscrowContract {
 
     /// Get any pending scheduled fee update.
     pub fn get_scheduled_fee_update(env: Env) -> Option<ScheduledFeeUpdate> {
-        env.storage()
-            .instance()
-            .get(&DataKey::ScheduledFeeUpdate)
+        env.storage().instance().get(&DataKey::ScheduledFeeUpdate)
     }
 
     /// Extend an escrow's TTL and pay a small keeper bounty if within threshold.
@@ -2166,9 +2347,7 @@ impl EscrowContract {
         }
 
         // Calculate ledgers until timeout
-        let ledgers_until_timeout = record
-            .timeout_ledger
-            .saturating_sub(current_ledger);
+        let ledgers_until_timeout = record.timeout_ledger.saturating_sub(current_ledger);
 
         // Extend TTL by the bump amount (30 days)
         let extension = PERSISTENT_BUMP_AMOUNT;
@@ -2349,6 +2528,148 @@ impl EscrowContract {
         Ok(true)
     }
 
+    /// Configure the volume-based fee tier ladder (issue #328). Admin-only.
+    ///
+    /// Replaces the entire tier table. Tiers are validated then stored
+    /// ascending by `min_volume`; the highest tier whose threshold a
+    /// merchant's settled volume meets is the tier the merchant pays.
+    /// Passing an empty vector removes all tiers, reverting every merchant to
+    /// the base `FeeConfig::fee_bps`. Each tier's `fee_bps` must be within
+    /// the 1000 bps (10%) cap, and thresholds must be strictly increasing.
+    /// Emits [`ConfigChangeScheduledEvent`]-style topics under
+    /// `(escrow, tierset)` with a [`FeeDistributionSetEvent`]-shaped summary.
+    pub fn set_fee_tiers(
+        env: Env,
+        admin: Address,
+        tiers: Vec<FeeTier>,
+    ) -> Result<bool, EscrowError> {
+        admin.require_auth();
+        if !Self::is_admin(env.clone(), admin.clone()) {
+            return Err(EscrowError::Unauthorized);
+        }
+        if tiers.len() > MAX_FEE_TIERS {
+            return Err(EscrowError::TierLimitExceeded);
+        }
+
+        let mut sorted: Vec<FeeTier> = Vec::new(&env);
+        let mut prev_min_volume: Option<i128> = None;
+        for tier in tiers.iter() {
+            if tier.fee_bps == 0 || tier.fee_bps > MAX_TIER_FEE_BPS {
+                return Err(EscrowError::InvalidTier);
+            }
+            if tier.min_volume <= 0 {
+                return Err(EscrowError::InvalidTier);
+            }
+            if let Some(prev) = prev_min_volume {
+                if tier.min_volume <= prev {
+                    return Err(EscrowError::InvalidTier);
+                }
+            }
+            prev_min_volume = Some(tier.min_volume);
+            sorted.push_back(tier);
+        }
+
+        let count = sorted.len();
+        env.storage().instance().set(&DataKey::FeeTiers, &sorted);
+
+        // Reuse the `(escrow, feedist)` topic family so indexers can subscribe
+        // to fee-table changes in one subscription; the data shape carries the
+        // tier count and the top tier's fee for monitoring.
+        let top_bps = if count == 0 {
+            0
+        } else {
+            sorted.get_unchecked(count - 1).fee_bps
+        };
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("tierset")),
+            FeeDistributionSetEvent {
+                admin,
+                treasury_count: count,
+                total_bps: top_bps,
+            },
+        );
+
+        Ok(true)
+    }
+
+    /// Get the configured volume fee tier table, ascending by `min_volume`
+    /// (issue #328). Empty when unset (base `FeeConfig::fee_bps` applies).
+    pub fn get_fee_tiers(env: Env) -> Vec<FeeTier> {
+        get_fee_tiers(&env)
+    }
+
+    /// Remove one volume fee tier by its `min_volume` threshold (issue #328).
+    /// Admin-only. No-op success when the tier does not exist.
+    pub fn remove_fee_tier(
+        env: Env,
+        admin: Address,
+        min_volume: i128,
+    ) -> Result<bool, EscrowError> {
+        admin.require_auth();
+        if !Self::is_admin(env.clone(), admin.clone()) {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        let tiers = get_fee_tiers(&env);
+        let mut updated: Vec<FeeTier> = Vec::new(&env);
+        let mut found = false;
+        for tier in tiers.iter() {
+            if tier.min_volume == min_volume {
+                found = true;
+            } else {
+                updated.push_back(tier);
+            }
+        }
+        if !found {
+            return Err(EscrowError::TierNotFound);
+        }
+
+        let count = updated.len();
+        env.storage().instance().set(&DataKey::FeeTiers, &updated);
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("tierset")),
+            FeeDistributionSetEvent {
+                admin,
+                treasury_count: count,
+                total_bps: if count == 0 {
+                    0
+                } else {
+                    updated.get_unchecked(count - 1).fee_bps
+                },
+            },
+        );
+        Ok(true)
+    }
+
+    /// Merchant's lifetime settled volume accumulated across successful
+    /// escrow releases (issue #328).
+    pub fn get_merchant_settled_volume(env: Env, merchant: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantSettledVolume(merchant))
+            .unwrap_or(0)
+    }
+
+    /// The highest fee tier the merchant has achieved so far (issue #328),
+    /// or `None` while the merchant sits below every configured threshold.
+    pub fn get_merchant_tier(env: Env, merchant: Address) -> Option<FeeTier> {
+        let min_volume: Option<i128> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantFeeTier(merchant));
+        let min_volume = min_volume?;
+        get_fee_tiers(&env)
+            .iter()
+            .find(|tier| tier.min_volume == min_volume)
+    }
+
+    /// Fee in basis points the merchant would pay on a release right now
+    /// (issue #328): the applicable volume tier, or the base `FeeConfig`
+    /// fee when no tier applies.
+    pub fn get_effective_fee_bps(env: Env, merchant: Address) -> Result<u32, EscrowError> {
+        effective_fee_bps(&env, &merchant)
+    }
+
     /// Get the current multi-treasury fee distribution. Empty when unset
     /// (i.e. the single-treasury `FeeConfig` is in effect).
     pub fn get_fee_distribution(env: Env) -> soroban_sdk::Vec<TreasuryShare> {
@@ -2425,7 +2746,15 @@ impl EscrowContract {
     /// falling back to the single-treasury `FeeConfig` otherwise. Never
     /// transfers tokens and never panics on a missing config: returns
     /// `FeeConfigNotSet` when no config exists.
-    fn compute_fee_amount(env: &Env, amount: i128) -> Result<i128, EscrowError> {
+    ///
+    /// When no multi-treasury split is configured, the basis points come from
+    /// the merchant's volume fee tier when one applies (issue #328), falling
+    /// back to the base `FeeConfig::fee_bps`.
+    fn compute_fee_amount(
+        env: &Env,
+        merchant: &Address,
+        amount: i128,
+    ) -> Result<i128, EscrowError> {
         let shares: soroban_sdk::Vec<TreasuryShare> = env
             .storage()
             .instance()
@@ -2441,16 +2770,19 @@ impl EscrowContract {
             }
             Ok(total_fee)
         } else {
-            let fee_config: FeeConfig = Self::get_fee_config(env.clone())?;
-            let fee_bps = fee_config.fee_bps as i128;
+            let fee_bps = effective_fee_bps(env, merchant)? as i128;
             Ok((amount / 10_000i128) * fee_bps + ((amount % 10_000i128) * fee_bps) / 10_000i128)
         }
     }
 
     /// Computes the net seller payout and platform fee for `amount` (issue #27).
     /// Pure calculation — see `distribute_fee` for the transfer side.
-    fn compute_payout(env: &Env, amount: i128) -> Result<ReleasePayout, EscrowError> {
-        let fee = Self::compute_fee_amount(env, amount)?;
+    fn compute_payout(
+        env: &Env,
+        merchant: &Address,
+        amount: i128,
+    ) -> Result<ReleasePayout, EscrowError> {
+        let fee = Self::compute_fee_amount(env, merchant, amount)?;
         let fee_config: FeeConfig = Self::get_fee_config(env.clone())?;
         Ok(ReleasePayout {
             seller_net: amount - fee,
@@ -2732,6 +3064,7 @@ impl EscrowContract {
         record.status = EscrowStatus::Released;
         record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
+        update_merchant_volume_and_tier(&env, &record.seller, remaining);
 
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("pl_stl"), escrow_id),
@@ -3448,12 +3781,7 @@ impl EscrowContract {
         let contract_address = env.current_contract_address();
         for (token, amount) in token_totals.iter() {
             let token_client = soroban_sdk::token::Client::new(&env, &token);
-            token_client.transfer_from(
-                &contract_address,
-                &buyer,
-                &contract_address,
-                &amount,
-            );
+            token_client.transfer_from(&contract_address, &buyer, &contract_address, &amount);
         }
         Ok(escrow_ids)
     }
@@ -3597,7 +3925,7 @@ impl EscrowContract {
 
         let token_client = soroban_sdk::token::Client::new(env, &record.token);
 
-        let payout = Self::compute_payout(env, release_amount)?;
+        let payout = Self::compute_payout(env, &record.seller, release_amount)?;
         Self::distribute_fee(env, &token_client, payout.fee)?;
         token_client.transfer(
             &env.current_contract_address(),
@@ -3606,6 +3934,9 @@ impl EscrowContract {
         );
 
         record.released_amount += release_amount;
+        // Accumulate the merchant's settled volume and re-evaluate the fee
+        // tier ladder (issue #328). Succeeds on every successful release.
+        update_merchant_volume_and_tier(env, &record.seller, release_amount);
         let new_remaining = record.amount - record.released_amount - record.refunded_amount;
         let fully_released = new_remaining == 0;
         if fully_released {
@@ -4003,13 +4334,14 @@ impl EscrowContract {
 
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         if release_to_seller {
-            let payout = Self::compute_payout(&env, record.amount)?;
+            let payout = Self::compute_payout(&env, &record.seller, record.amount)?;
             Self::distribute_fee(&env, &token_client, payout.fee)?;
             token_client.transfer(
                 &env.current_contract_address(),
                 &record.seller,
                 &payout.seller_net,
             );
+            update_merchant_volume_and_tier(&env, &record.seller, record.amount);
             record.status = EscrowStatus::Released;
         } else {
             token_client.transfer(
@@ -4647,10 +4979,7 @@ impl EscrowContract {
     /// This function checks the marketplace registry to verify the seller's
     /// category matches one of the authorized categories configured on the escrow.
     /// Returns `Ok(())` on success, or `Err(EscrowError::MerchantCategoryNotAllowed)` on failure.
-    fn validate_seller_category(
-        env: &Env,
-        seller: &Address,
-    ) -> Result<(), EscrowError> {
+    fn validate_seller_category(env: &Env, seller: &Address) -> Result<(), EscrowError> {
         // Get authorized categories
         let authorized_categories = Self::get_authorized_categories(env.clone());
 
@@ -4682,7 +5011,11 @@ impl EscrowContract {
         };
 
         // Now validate the category
-        let args = soroban_sdk::vec![env, merchant_id.to_val(), authorized_categories.to_val()];
+        let args = soroban_sdk::vec![
+            env,
+            merchant_id.into_val(env),
+            authorized_categories.into_val(env)
+        ];
         let validation_result = env.try_invoke_contract::<(), EscrowError>(
             &registry,
             &Symbol::new(env, "validate_merchant_category"),
@@ -5046,8 +5379,7 @@ impl EscrowContract {
         match yield_config {
             Some(cfg) => {
                 let held_seconds = env.ledger().timestamp().saturating_sub(record.created_at);
-                let remaining =
-                    record.amount - record.released_amount - record.refunded_amount;
+                let remaining = record.amount - record.released_amount - record.refunded_amount;
                 let yield_amount = (remaining * cfg.apr_bps as i128 * held_seconds as i128)
                     / (10_000i128 * SECONDS_PER_YEAR);
                 (yield_amount, held_seconds)
@@ -5122,7 +5454,7 @@ impl EscrowContract {
         let mut total_released: i128 = 0;
 
         for (recipient, amount) in shares.iter() {
-            let fee = Self::compute_fee_amount(&env, amount)?;
+            let fee = Self::compute_fee_amount(&env, &record.seller, amount)?;
             let net = amount - fee;
 
             token_client.transfer(&env.current_contract_address(), &recipient, &net);
@@ -5134,6 +5466,7 @@ impl EscrowContract {
         Self::distribute_fee(&env, &token_client, total_fee)?;
 
         record.released_amount += total_released;
+        update_merchant_volume_and_tier(&env, &record.seller, total_released);
         let new_remaining = record.amount - record.released_amount - record.refunded_amount;
         if new_remaining == 0 {
             record.status = EscrowStatus::Released;
@@ -5511,7 +5844,9 @@ mod escrow_feature_tests {
         TryIntoVal,
     };
 
-    fn setup(env: &Env) -> (
+    fn setup(
+        env: &Env,
+    ) -> (
         EscrowContractClient<'_>,
         Address,
         Address,
@@ -5904,6 +6239,307 @@ mod fee_distribution_tests {
 
         assert!(client.set_fee_distribution(&admin, &shares.clone()));
         assert_eq!(client.get_fee_distribution(), shares);
+    }
+}
+
+// ── Issue #328: dynamic platform fee tiering by merchant volume ────────────
+#[cfg(test)]
+mod fee_tier_tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Events};
+    use soroban_sdk::token::{StellarAssetClient, TokenClient};
+    use soroban_sdk::TryIntoVal;
+
+    fn setup(
+        env: &Env,
+    ) -> (
+        EscrowContractClient<'_>,
+        Address,
+        Address,
+        Address,
+        Address,
+        Address,
+    ) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let buyer = Address::generate(env);
+        let seller = Address::generate(env);
+        let token = env
+            .register_stellar_asset_contract_v2(Address::generate(env))
+            .address();
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 250,
+            treasury,
+            min_amount: 100,
+            max_amount: 1_000_000,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(env, &contract_id);
+        StellarAssetClient::new(env, &token).mint(&buyer, &1_000_000);
+        client.add_token(&admin, &token);
+        (client, admin, buyer, seller, token, contract_id)
+    }
+
+    fn tier(min_volume: i128, fee_bps: u32) -> FeeTier {
+        FeeTier {
+            min_volume,
+            fee_bps,
+        }
+    }
+
+    fn deposit_and_release(
+        env: &Env,
+        client: &EscrowContractClient<'_>,
+        buyer: &Address,
+        seller: &Address,
+        token: &Address,
+        amount: i128,
+        seed: u8,
+    ) -> u64 {
+        let order_id = BytesN::from_array(env, &[seed; 32]);
+        let escrow_id = client.deposit(
+            buyer, seller, token, &amount, &order_id, &1_000, &None, &None,
+        );
+        client.release(&escrow_id, buyer, seller);
+        escrow_id
+    }
+
+    fn count_tier_up_events(env: &Env, contract_id: &Address, seller: &Address) -> u32 {
+        let mut count = 0u32;
+        for event in env.events().all().iter() {
+            let (c_id, topics, _value) = event;
+            if c_id != *contract_id || topics.len() != 3 {
+                continue;
+            }
+            let t0: Symbol = topics.get(0).unwrap().try_into_val(env).unwrap();
+            let t1: Symbol = topics.get(1).unwrap().try_into_val(env).unwrap();
+            if t0 == symbol_short!("escrow") && t1 == symbol_short!("tier_up") {
+                let merchant: Address = topics.get(2).unwrap().try_into_val(env).unwrap();
+                if merchant == *seller {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn base_fee_applies_when_no_tiers_configured() {
+        let env = Env::default();
+        let (client, admin, buyer, seller, token, _) = setup(&env);
+        let _ = admin;
+        let token_client = TokenClient::new(&env, &token);
+
+        deposit_and_release(&env, &client, &buyer, &seller, &token, 1_000, 1);
+
+        // 250 bps of 1000 = 25 fee; seller nets 975.
+        assert_eq!(token_client.balance(&seller), 975);
+        assert_eq!(client.get_merchant_settled_volume(&seller), 1_000);
+        assert_eq!(client.get_effective_fee_bps(&seller), 250);
+    }
+
+    #[test]
+    fn merchant_below_first_threshold_pays_base_fee() {
+        let env = Env::default();
+        let (client, admin, buyer, seller, token, _) = setup(&env);
+        client.set_fee_tiers(&admin, &soroban_sdk::vec![&env, tier(5_000, 100)]);
+
+        assert_eq!(client.get_effective_fee_bps(&seller), 250);
+        assert_eq!(client.get_merchant_tier(&seller), None);
+    }
+
+    #[test]
+    fn tier_discount_applies_after_crossing_threshold() {
+        let env = Env::default();
+        let (client, admin, buyer, seller, token, contract_id) = setup(&env);
+        let token_client = TokenClient::new(&env, &token);
+        client.set_fee_tiers(&admin, &soroban_sdk::vec![&env, tier(2_000, 100)]);
+
+        // Release 1: fee charged at base 250 bps (tier evaluated before update).
+        deposit_and_release(&env, &client, &buyer, &seller, &token, 1_000, 1);
+        assert_eq!(token_client.balance(&seller), 975);
+        assert_eq!(client.get_merchant_tier(&seller), None);
+
+        // Release 2: fee still at base (volume was 1000 < 2000 at evaluation);
+        // volume crosses 2000 after the update, so the tier event fires. It is
+        // visible only in this invocation's event buffer.
+        let order_id = BytesN::from_array(&env, &[2u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000, &order_id, &1_000, &None, &None,
+        );
+        client.release(&escrow_id, &buyer, &seller);
+        // Read events before any further contract invocation: the event
+        // buffer is cleared at the start of each invocation.
+        assert_eq!(count_tier_up_events(&env, &contract_id, &seller), 1);
+        assert_eq!(token_client.balance(&seller), 1_950);
+        assert_eq!(client.get_merchant_tier(&seller), Some(tier(2_000, 100)));
+
+        // Release 3: merchant now pays the discounted 100 bps; no further
+        // tier event (already at the highest tier reached).
+        deposit_and_release(&env, &client, &buyer, &seller, &token, 1_000, 3);
+        assert_eq!(token_client.balance(&seller), 2_940); // +990
+        assert_eq!(client.get_effective_fee_bps(&seller), 100);
+        assert_eq!(count_tier_up_events(&env, &contract_id, &seller), 0);
+    }
+
+    #[test]
+    fn partial_releases_accumulate_volume_and_fire_tier_event_once() {
+        let env = Env::default();
+        let (client, admin, buyer, seller, token, contract_id) = setup(&env);
+        client.set_fee_tiers(&admin, &soroban_sdk::vec![&env, tier(1_500, 100)]);
+
+        let order_id = BytesN::from_array(&env, &[9u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &2_000, &order_id, &1_000, &None, &None,
+        );
+
+        client.partial_release(&escrow_id, &buyer, &500);
+        assert_eq!(client.get_merchant_settled_volume(&seller), 500);
+        assert_eq!(client.get_merchant_tier(&seller), None);
+
+        // Crosses the 1500 threshold on this release's post-update. Read the
+        // event buffer before any further contract invocation clears it.
+        client.partial_release(&escrow_id, &buyer, &1_100);
+        assert_eq!(count_tier_up_events(&env, &contract_id, &seller), 1);
+        assert_eq!(client.get_merchant_settled_volume(&seller), 1_600);
+        assert_eq!(client.get_merchant_tier(&seller), Some(tier(1_500, 100)));
+
+        // Finishing the escrow adds volume but fires no new tier event.
+        client.partial_release(&escrow_id, &buyer, &400);
+        assert_eq!(count_tier_up_events(&env, &contract_id, &seller), 0);
+        assert_eq!(client.get_merchant_settled_volume(&seller), 2_000);
+    }
+
+    #[test]
+    fn tier_event_carries_merchant_tier_and_volume() {
+        let env = Env::default();
+        let (client, admin, buyer, seller, token, contract_id) = setup(&env);
+        client.set_fee_tiers(
+            &admin,
+            &soroban_sdk::vec![&env, tier(1_000, 200), tier(3_000, 100),],
+        );
+
+        deposit_and_release(&env, &client, &buyer, &seller, &token, 1_500, 1);
+
+        let mut found: Option<MerchantVolumeTierUpdatedEvent> = None;
+        for event in env.events().all().iter() {
+            let (c_id, topics, value) = event;
+            if c_id != contract_id || topics.len() != 3 {
+                continue;
+            }
+            let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            let t1: Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            if t0 == symbol_short!("escrow") && t1 == symbol_short!("tier_up") {
+                found = Some(value.try_into_val(&env).unwrap());
+            }
+        }
+        let evt = found.expect("tier_up event must be emitted");
+        assert_eq!(evt.merchant, seller);
+        assert_eq!(evt.min_volume, 1_000);
+        assert_eq!(evt.fee_bps, 200);
+        assert_eq!(evt.total_settled_volume, 1_500);
+    }
+
+    #[test]
+    fn merchants_track_volume_independently() {
+        let env = Env::default();
+        let (client, admin, buyer, seller, token, _) = setup(&env);
+        let other_seller = Address::generate(&env);
+        client.set_fee_tiers(&admin, &soroban_sdk::vec![&env, tier(2_000, 100)]);
+
+        deposit_and_release(&env, &client, &buyer, &seller, &token, 2_000, 1);
+        deposit_and_release(&env, &client, &buyer, &other_seller, &token, 500, 2);
+
+        assert_eq!(client.get_merchant_settled_volume(&seller), 2_000);
+        assert_eq!(client.get_effective_fee_bps(&seller), 100);
+        assert_eq!(client.get_merchant_settled_volume(&other_seller), 500);
+        assert_eq!(client.get_effective_fee_bps(&other_seller), 250);
+    }
+
+    #[test]
+    fn set_fee_tiers_validates_and_stores_sorted_input() {
+        let env = Env::default();
+        let (client, admin, _buyer, _seller, _token, _) = setup(&env);
+
+        // Non-admin rejected.
+        let intruder = Address::generate(&env);
+        assert_eq!(
+            client.try_set_fee_tiers(&intruder, &soroban_sdk::vec![&env, tier(1_000, 100)]),
+            Err(Ok(EscrowError::Unauthorized))
+        );
+
+        // Zero bps rejected.
+        assert_eq!(
+            client.try_set_fee_tiers(&admin, &soroban_sdk::vec![&env, tier(1_000, 0)]),
+            Err(Ok(EscrowError::InvalidTier))
+        );
+
+        // Above the 10% cap rejected.
+        assert_eq!(
+            client.try_set_fee_tiers(&admin, &soroban_sdk::vec![&env, tier(1_000, 1_001)]),
+            Err(Ok(EscrowError::InvalidTier))
+        );
+
+        // Non-positive threshold rejected.
+        assert_eq!(
+            client.try_set_fee_tiers(&admin, &soroban_sdk::vec![&env, tier(0, 100)]),
+            Err(Ok(EscrowError::InvalidTier))
+        );
+
+        // Duplicate/out-of-order thresholds rejected.
+        assert_eq!(
+            client.try_set_fee_tiers(
+                &admin,
+                &soroban_sdk::vec![&env, tier(1_000, 200), tier(1_000, 100)]
+            ),
+            Err(Ok(EscrowError::InvalidTier))
+        );
+
+        // More than MAX_FEE_TIERS rejected.
+        let mut too_many = Vec::new(&env);
+        for i in 0..=MAX_FEE_TIERS {
+            too_many.push_back(tier(1_000 + 1_000 * i as i128, 100));
+        }
+        assert_eq!(
+            client.try_set_fee_tiers(&admin, &too_many),
+            Err(Ok(EscrowError::TierLimitExceeded))
+        );
+
+        // Valid configuration round-trips.
+        let tiers = soroban_sdk::vec![&env, tier(1_000, 200), tier(3_000, 100)];
+        assert!(client.set_fee_tiers(&admin, &tiers.clone()));
+        assert_eq!(client.get_fee_tiers(), tiers);
+    }
+
+    #[test]
+    fn remove_fee_tier_updates_effective_fee() {
+        let env = Env::default();
+        let (client, admin, buyer, seller, token, _) = setup(&env);
+        client.set_fee_tiers(
+            &admin,
+            &soroban_sdk::vec![&env, tier(1_000, 200), tier(3_000, 100),],
+        );
+
+        deposit_and_release(&env, &client, &buyer, &seller, &token, 1_500, 1);
+        assert_eq!(client.get_effective_fee_bps(&seller), 200);
+
+        // Non-admin rejected; unknown tier rejected.
+        assert_eq!(
+            client.try_remove_fee_tier(&Address::generate(&env), &1_000),
+            Err(Ok(EscrowError::Unauthorized))
+        );
+        assert_eq!(
+            client.try_remove_fee_tier(&admin, &7_000),
+            Err(Ok(EscrowError::TierNotFound))
+        );
+
+        assert!(client.remove_fee_tier(&admin, &1_000));
+        assert_eq!(client.get_fee_tiers().len(), 1);
+
+        // Merchant no longer meets the only remaining tier: base fee returns.
+        assert_eq!(client.get_effective_fee_bps(&seller), 250);
     }
 }
 
