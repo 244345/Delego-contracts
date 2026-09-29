@@ -134,13 +134,6 @@ pub enum PermissionError {
     /// Nonce cancellation targets a nonce that was already consumed or
     /// would overflow the nonce counter (issue #297)
     NonceAlreadyUsed = 2413,
-    /// Merchant has not yet acquired the attestations required by the
-    /// currently active verification policy, and the grace period for
-    /// pre-existing merchants has elapsed.
-    VerificationPolicyNotMet = 2414,
-    /// Revalidation was attempted before the grace period for a policy
-    /// transition has elapsed.
-    GracePeriodActive = 2415,
 }
 
 #[cfg(test)]
@@ -186,13 +179,11 @@ mod error_code_tests {
         PermissionError::InvalidExpiry as u32,
         PermissionError::NotInitialized as u32,
         PermissionError::NonceAlreadyUsed as u32,
-        PermissionError::VerificationPolicyNotMet as u32,
-        PermissionError::GracePeriodActive as u32,
     ];
 
     #[test]
     fn permission_error_codes_are_unique_and_in_reserved_range() {
-        assert_eq!(PERMISSION_ERROR_CODES.len(), 31);
+        assert_eq!(PERMISSION_ERROR_CODES.len(), 29);
 
         let permission_range = ERROR_CODE_RANGES
             .iter()
@@ -791,53 +782,6 @@ pub struct ChildPermission {
     pub created_at: u64,
 }
 
-/// Verification policy governing how many attestations a merchant must hold
-/// before it is considered verified (issue: handle verification policy
-/// threshold increases for pre-existing merchants).
-///
-/// `required` is the minimum number of attestations a merchant must have
-/// accumulated. `grace_period_secs` is the window granted to merchants that
-/// were already verified under a previous, lower threshold so they can
-/// acquire the additional attestations before their status is downgraded.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(missing_docs)]
-pub struct VerificationPolicy {
-    pub required: u32,
-    pub grace_period_secs: u64,
-}
-
-/// Per-merchant verification state. Verification is *derived* from the
-/// current policy and the merchant's attestation count rather than stored
-/// as a static boolean, so a policy threshold increase automatically
-/// applies to pre-existing merchants.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(missing_docs)]
-pub struct MerchantVerification {
-    pub merchant_id: u64,
-    pub attestations: u32,
-    /// Ledger timestamp at which the merchant first became verified under
-    /// the policy that was active at that time. Used to anchor the grace
-    /// period when the policy threshold later increases.
-    pub verified_since: u64,
-    /// Policy threshold in force when `verified_since` was recorded.
-    pub verified_under_required: u32,
-}
-
-/// Emitted when a merchant's verification status is re-evaluated against
-/// the current policy.
-#[contracttype]
-#[derive(Clone, Debug)]
-#[allow(missing_docs)]
-pub struct MerchantRevalidatedEvent {
-    pub merchant_id: u64,
-    pub verified: bool,
-    pub attestations: u32,
-    pub required: u32,
-    pub grace_period_ends_at: u64,
-}
-
 #[contracttype]
 pub enum DataKey {
     Permission(Address, Address),
@@ -886,16 +830,24 @@ pub enum DataKey {
     UserPermissions(Address),
     /// Seller-specific allowlist for a sensitive (owner, delegate) delegation.
     MerchantAllowlist(Address, Address),
-    /// Instance-level active verification policy.
-    VerificationPolicy,
-    /// Per-merchant verification state (attestation count and verification anchor).
-    MerchantVerification(u64),
-    /// Ledger timestamp at which the current verification policy took effect.
-    VerificationPolicyEffectiveAt,
+    /// Number of verifications a merchant has accumulated (issue: policy
+    /// threshold increases for pre-existing merchants).
+    MerchantVerifications(u64),
+    /// Ledger at which a merchant's grace period for meeting an increased
+    /// verification policy expires.
+    MerchantGraceDeadline(u64),
+    /// Instance-level grace period (in ledgers) granted to pre-existing
+    /// merchants when the required verification policy increases.
+    VerificationGracePeriod,
 }
 
 #[contract]
 pub struct PermissionsContract;
+
+/// Default grace period (in ledgers) granted to pre-existing merchants when
+/// the required verification policy increases. At ~5s per ledger this is
+/// roughly 30 days.
+pub const DEFAULT_VERIFICATION_GRACE_LEDGERS: u32 = 518_400;
 
 // The `#[contractimpl]` macro generates client/wrapper functions that mirror
 // the ABI entry-point signatures above; they cannot be annotated individually
@@ -904,6 +856,101 @@ pub struct PermissionsContract;
 #[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl PermissionsContract {
+    /// Returns the number of verifications recorded for `merchant_id`.
+    fn get_merchant_verifications_count(env: &Env, merchant_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantVerifications(merchant_id))
+            .unwrap_or(0)
+    }
+
+    /// Dynamically evaluates whether `merchant_id` currently satisfies
+    /// `policy.required` verifications, rather than trusting a static
+    /// boolean flag that may have been set under an older policy.
+    pub fn recheck_merchant_verification(
+        env: &Env,
+        merchant_id: u64,
+        policy: &VerificationPolicy,
+    ) -> bool {
+        let current_verifications = Self::get_merchant_verifications_count(env, merchant_id);
+        current_verifications >= policy.required
+    }
+
+    /// Re-evaluates a merchant's verification status against the current
+    /// policy. Pre-existing merchants that no longer meet the (possibly
+    /// increased) required verification count are given a grace period
+    /// before their status transitions.
+    pub fn revalidate_merchant_status(
+        env: Env,
+        merchant_id: u64,
+        policy: VerificationPolicy,
+    ) -> bool {
+        let current_verifications = Self::get_merchant_verifications_count(&env, merchant_id);
+        if current_verifications >= policy.required {
+            return true;
+        }
+
+        let deadline_key = DataKey::MerchantGraceDeadline(merchant_id);
+        let now = env.ledger().sequence();
+        let grace_ledgers: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::VerificationGracePeriod)
+            .unwrap_or(DEFAULT_VERIFICATION_GRACE_LEDGERS);
+
+        match env.storage().persistent().get::<DataKey, u32>(&deadline_key) {
+            Some(deadline) => now <= deadline,
+            None => {
+                let deadline = now.saturating_add(grace_ledgers);
+                env.storage().persistent().set(&deadline_key, &deadline);
+                true
+            }
+        }
+    }
+
+    /// Records an additional verification attestation for `merchant_id`.
+    /// Once the merchant meets the current policy, any pending grace
+    /// deadline is cleared.
+    pub fn record_merchant_verification(
+        env: Env,
+        merchant_id: u64,
+        policy: VerificationPolicy,
+    ) -> u32 {
+        let key = DataKey::MerchantVerifications(merchant_id);
+        let current = Self::get_merchant_verifications_count(&env, merchant_id);
+        let updated = current.saturating_add(1);
+        env.storage().persistent().set(&key, &updated);
+
+        if updated >= policy.required {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::MerchantGraceDeadline(merchant_id));
+        }
+        updated
+    }
+
+    /// Configures the grace period (in ledgers) granted to pre-existing
+    /// merchants when the required verification policy increases. Admin-only.
+    pub fn set_verification_grace_period(
+        env: Env,
+        admin: Address,
+        ledgers: u32,
+    ) -> Result<(), PermissionError> {
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::VerificationGracePeriod, &ledgers);
+        Ok(())
+    }
+
+    /// Returns the configured verification grace period in ledgers.
+    pub fn get_verification_grace_period(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::VerificationGracePeriod)
+            .unwrap_or(DEFAULT_VERIFICATION_GRACE_LEDGERS)
+    }
+
     /// Records a (owner, delegate) delegation as a **first grant**.
     ///
     /// A plain `grant` refuses to silently overwrite a live permission

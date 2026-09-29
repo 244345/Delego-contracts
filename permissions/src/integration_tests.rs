@@ -1128,6 +1128,7 @@ fn test_transfer_permission_fails_if_old_permission_not_found() {
     );
 }
 
+
 #[test]
 fn test_transfer_permission_fails_for_self_transfer() {
     let t = TestEnv::setup();

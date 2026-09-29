@@ -33,6 +33,8 @@ pause/resume, and permission transfers.
 | `sweep_expired` / `sweep_expired_batch` | any | Sweep expired permissions into Expired status (single or bounded batch) |
 | `sweep_inactive` / `sweep_inactive_batch` | any | Auto-revoke inactive permissions idle past threshold (single or bounded batch) |
 | `get_audit_log_page` | — | Read up to 20 retained audit entries using a zero-based cursor |
+| `recheck_merchant_verification` | — | Dynamic check whether a merchant meets the current verification policy |
+| `revalidate_merchant_status` | any | Re-evaluate a merchant against the current policy, applying the grace period |
 
 ## Events
 
@@ -48,6 +50,26 @@ Events are emitted with the topic prefix `("perm", …)`:
 | `"spent"` / `"mspent"` / `"relayed"` | `PermissionSpendEvent` | `execute_spend` / `execute_spend_multi` / `execute_spend_via_relayer` |
 | `"allowinc"` / `"allowdec"` | — | `increase_allowance` / `decrease_allowance` |
 | `"paused"` / `"resumed"` / `"gpaused"` | `PermissionPausedEvent` / `PermissionResumedEvent` | `pause` / `resume` / `pause_grants` |
+| `"vpolicy"` | `VerificationPolicyUpdatedEvent` | Policy update capturing the grace period |
+| `"vrevalid"` | `VerificationRevalidatedEvent` | `revalidate_merchant_status` |
+
+## Verification Policy Threshold Increases
+
+Merchant verification is evaluated dynamically against the current
+policy rather than a cached boolean flag. When governance raises the
+required attestation count (e.g. from 1 to 2), merchants verified under the
+previous policy are not immediately de-verified. Instead they receive a
+30-day grace period (counted in ledgers) to acquire the additional
+attestations.
+
+- `recheck_merchant_verification` is the pure dynamic check. It returns
+true only when the merchant's attestation count meets or exceeds the
+current policy's `required` threshold.
+- `revalidate_merchant_status` is the on-chain entrypoint. It re-evaluates
+the merchant against the current policy and applies the grace period to
+pre-existing merchants. Merchants that fail to meet the updated standard
+transition gracefully to a `Suspended` status once the grace period has
+elapsed.
 
 ## Development
 
@@ -66,6 +88,6 @@ cargo build --target wasm32-unknown-unknown --release
 > published from the Delego-backend repository.
 
 Audit entries are stored under individual indexed persistent keys in a
-200-entry ring buffer. `get_audit_log_page(owner, delegate, cursor)` returns
+10-entry ring buffer. `get_audit_log_page(owner, delegate, cursor)` returns
 `AuditTrailPage`; follow `next_cursor` until it is `None`. Queries deserialize
 at most 20 entries rather than the full trail.
