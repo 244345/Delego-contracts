@@ -214,6 +214,32 @@ mod test {
     }
 
     #[test]
+    fn test_competing_spends_cannot_exceed_remaining_allowance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let merchant = Address::generate(&env);
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &100, &100, &merchants, &10_000);
+
+        client.execute_spend(&owner, &delegate, &60, &merchant);
+        assert_eq!(
+            client.try_execute_spend(&owner, &delegate, &60, &merchant),
+            Err(Ok(PermissionError::ExceedsTotalLimit))
+        );
+
+        let permission = client.get_permission(&owner, &delegate);
+        assert_eq!(permission.spent, 60);
+        assert_eq!(client.get_remaining_allowance(&owner, &delegate), 40);
+        let stats = client.get_usage_stats(&owner, &delegate);
+        assert_eq!(stats.total_spends, 1);
+        assert_eq!(stats.total_spent, 60);
+    }
+
+    #[test]
     fn test_get_remaining_allowance_missing_returns_error() {
         let env = Env::default();
         env.mock_all_auths();
