@@ -20,6 +20,8 @@ will reject the change.
 
 ### Unreleased
 
+- Require a 24-hour vetoable review for escrow fee and token-whitelist changes, with authenticated guardian setup/rotation and explicit single-use execution (#329).
+
 - Add immutable daily delivery Merkle roots and order-bound inclusion-proof escrow release.
 - Add atomic batch escrow creation with per-token aggregate allowance transfers.
 - Add admin split dispute settlements with buyer, seller, and mediator payouts.

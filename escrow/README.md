@@ -228,3 +228,51 @@ The oracle signs the XDR encoding of the ordered payload fields
 `(escrow_id, carrier_code, tracking_hash, delivery_timestamp)`. The proof is
 accepted only for the configured public key and when the delivery timestamp is
 between the escrow's creation timestamp and the current ledger timestamp.
+
+## Vetoable administrative changes (#329)
+
+Fee rate/recipient changes, multi-treasury distributions, and token-contract
+whitelist additions/removals require explicit review. This changes the behavior
+of `update_fee`, `set_fee_distribution`, `add_token`, and `remove_token`: they
+only apply an exact matching queued action after its review period. A `true`
+execution result still means the change was applied, not merely scheduled.
+
+1. The primary admin and designated security council authenticate
+   `set_security_guardian(admin, guardian)` once. The guardian can be a multisig
+   contract address. No critical action can be queued before this bootstrap.
+2. An admin calls `queue_admin_action(admin, action)` and receives a unique ID.
+   `AdminAction` supports `Fee`, `FeeConfig`, `FeeDistribution`, `AddToken`,
+   `RemoveToken`, and `Guardian`. The proposal commits to the complete typed
+   arguments with SHA-256 of their XDR encoding.
+3. Inspect `get_admin_action(id)`. Execution requires **both** 17,280 additional
+   ledgers and 86,400 elapsed seconds. Ledger speed cannot shorten the 24-hour
+   review period; slower ledgers can extend it. Equality at both deadlines is
+   sufficient. Arithmetic overflow rejects the proposal.
+4. The current guardian may call `veto_admin_action(guardian, id)` any time
+   before execution, including after unlock. The veto is permanent for that ID.
+   Re-proposing the same payload receives a new ID and a fresh full review period.
+5. A current admin calls `execute_admin_action(admin, id)`. It applies the stored
+   arguments atomically and consumes the proposal, preventing replay. Calling a
+   legacy setter with the exact queued arguments consumes the same approval.
+
+Guardian rotation also requires review (`AdminAction::Guardian`) and the new
+address's authentication at execution; the previous guardian can veto it.
+Bootstrap cannot replace or disable an existing guardian. Admin queue/execute
+permissions do not confer veto permission.
+
+`schedule_fee_update` now queues `FeeConfig` and publishes its ID in the
+`admin/queued` event. Fees no longer activate implicitly from `get_fee_config`.
+The legacy `get_scheduled_fee_update` only exposes old pre-upgrade scheduling
+state; use `get_admin_action` for new proposals. Any legacy pending fee update
+must be re-proposed through the guardian review flow after upgrade.
+
+Events use `(admin, queued|vetoed|executed)` topics; queued data includes the ID
+and full proposal, while veto/execution data contains the ID. `(admin, guardian)`
+announces bootstrap/rotation. Proposal storage has bounded TTL; archived/expired
+records never grant execution permission. Keep normal contract instance TTL
+maintenance in place; the guardian and monotonic ID live in instance storage.
+
+This review policy covers escrow fee and token-contract whitelist configuration.
+Existing upgrade quorum/timelock and operational emergency-pause controls remain
+separate. Veto cancels a pending change; it does not undo an already executed
+change. Reversing an executed setting requires another reviewed proposal.
