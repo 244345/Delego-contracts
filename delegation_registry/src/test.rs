@@ -1980,3 +1980,104 @@ fn test_benchmark_scoped_check_stays_within_cpu_budget() {
          {identity_check_cpu}-instruction check, which is more than the 10% budget"
     );
 }
+
+#[test]
+fn test_get_delegations_by_agent_returns_empty_vec_for_unknown_agent() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let unknown_agent = BytesN::from_array(&env, &[99u8; 32]);
+
+    // Initial state: no delegations exist at all
+    let empty_before = client.get_delegations_by_agent(&unknown_agent);
+    assert_eq!(empty_before.len(), 0);
+
+    // Create delegations for a different agent
+    let label = Symbol::new(&env, "Agent_Test");
+    client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    // Query for unknown agent still returns empty vec
+    let empty_after = client.get_delegations_by_agent(&unknown_agent);
+    assert_eq!(empty_after.len(), 0);
+}
+
+#[test]
+fn test_get_delegations_by_agent_returns_matching_delegations_for_known_agent() {
+    let (env, client, _, owner, agent_id_1, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let agent_id_2 = BytesN::from_array(&env, &[2u8; 32]);
+
+    let label_1a = Symbol::new(&env, "Agent1_A");
+    let label_1b = Symbol::new(&env, "Agent1_B");
+    let label_2 = Symbol::new(&env, "Agent2_A");
+
+    let id_1a =
+        client.create_delegation(&owner, &agent_id_1, &permissions_contract, &label_1a, &1000);
+    let id_1b =
+        client.create_delegation(&owner, &agent_id_1, &permissions_contract, &label_1b, &1000);
+    let id_2 =
+        client.create_delegation(&owner, &agent_id_2, &permissions_contract, &label_2, &1000);
+
+    // Fetch delegations for agent_id_1
+    let agent_1_dels = client.get_delegations_by_agent(&agent_id_1);
+    assert_eq!(agent_1_dels.len(), 2);
+    assert_eq!(agent_1_dels.get(0).unwrap().id, id_1a);
+    assert_eq!(agent_1_dels.get(0).unwrap().agent_id, agent_id_1);
+    assert_eq!(agent_1_dels.get(1).unwrap().id, id_1b);
+    assert_eq!(agent_1_dels.get(1).unwrap().agent_id, agent_id_1);
+
+    // Fetch delegations for agent_id_2
+    let agent_2_dels = client.get_delegations_by_agent(&agent_id_2);
+    assert_eq!(agent_2_dels.len(), 1);
+    assert_eq!(agent_2_dels.get(0).unwrap().id, id_2);
+    assert_eq!(agent_2_dels.get(0).unwrap().agent_id, agent_id_2);
+}
+
+#[test]
+fn test_get_delegations_by_agent_multiple_owners() {
+    let (env, client, _, owner_a, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let owner_b = Address::generate(&env);
+
+    let label_a = Symbol::new(&env, "Del_OwnerA");
+    let label_b = Symbol::new(&env, "Del_OwnerB");
+
+    let id_a =
+        client.create_delegation(&owner_a, &agent_id, &permissions_contract, &label_a, &1000);
+    let id_b =
+        client.create_delegation(&owner_b, &agent_id, &permissions_contract, &label_b, &1000);
+
+    let dels = client.get_delegations_by_agent(&agent_id);
+    assert_eq!(dels.len(), 2);
+    assert_eq!(dels.get(0).unwrap().id, id_a);
+    assert_eq!(dels.get(0).unwrap().owner, owner_a);
+    assert_eq!(dels.get(1).unwrap().id, id_b);
+    assert_eq!(dels.get(1).unwrap().owner, owner_b);
+}
+
+#[test]
+fn test_get_delegations_by_agent_bumps_ttl() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "TTL_AgentDel");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &LARGE_TTL);
+
+    let del_key = DataKey::Delegation(id);
+    let initial_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&del_key)
+    });
+    assert!(initial_ttl > 17_280);
+
+    // Advance to the bump boundary and call get_delegations_by_agent
+    env.ledger().set_sequence_number(initial_ttl - 17_280 + 1);
+    let records = client.get_delegations_by_agent(&agent_id);
+    assert_eq!(records.len(), 1);
+
+    let refreshed_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&del_key)
+    });
+    assert!(refreshed_ttl > 17_280);
+}

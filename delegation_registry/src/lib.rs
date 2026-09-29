@@ -763,7 +763,11 @@ impl DelegationRegistry {
     ///
     /// Returns `Ok(true)` if the delegation transitioned to `Revoked`.
     /// Returns `Ok(false)` if the delegation was already `Revoked` (idempotent no-op).
-    pub fn admin_revoke(env: Env, caller: Address, delegation_id: u64) -> Result<bool, DelegationError> {
+    pub fn admin_revoke(
+        env: Env,
+        caller: Address,
+        delegation_id: u64,
+    ) -> Result<bool, DelegationError> {
         caller.require_auth();
 
         let admin = env
@@ -899,17 +903,9 @@ impl DelegationRegistry {
     /// Walks the `1..NextId` id range, collects records whose stored status is
     /// `Expired`, then pages the result. `next_offset` is `None` on the final
     /// page.
-    pub fn get_expired_delegations_paged(
-        env: Env,
-        offset: u32,
-        limit: u32,
-    ) -> DelegationPage {
+    pub fn get_expired_delegations_paged(env: Env, offset: u32, limit: u32) -> DelegationPage {
         let current_ledger = env.ledger().sequence();
-        let next_id: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::NextId)
-            .unwrap_or(1);
+        let next_id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
         let mut expired = Vec::new(&env);
         let mut id = 1u64;
         while id < next_id {
@@ -1096,6 +1092,33 @@ impl DelegationRegistry {
             {
                 Self::bump_delegation(&env, id, &record.owner);
                 records.push_back(record);
+            }
+        }
+        records
+    }
+
+    /// Returns all delegations associated with the given agent identifier.
+    ///
+    /// Iterates through all issued delegations and collects records matching
+    /// `agent_id`.
+    pub fn get_delegations_by_agent(env: Env, agent_id: BytesN<32>) -> Vec<DelegationRecord> {
+        let next_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextId)
+            .unwrap_or(1u64);
+
+        let mut records = Vec::new(&env);
+        for id in 1..next_id {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, DelegationRecord>(&DataKey::Delegation(id))
+            {
+                if record.agent_id == agent_id {
+                    Self::bump_delegation(&env, id, &record.owner);
+                    records.push_back(record);
+                }
             }
         }
         records
