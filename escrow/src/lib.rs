@@ -23,6 +23,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
     InvokeError, Map, Symbol, Vec,
 };
+use delego_interfaces::LendingPoolClient;
 
 /// Lifecycle state of an escrow.
 #[contracttype]
@@ -4329,6 +4330,11 @@ impl EscrowContract {
     /// always return identical results; calls in different ledgers produce
     /// monotonically increasing `held_seconds` and `accrued`.
     ///
+    /// When a `YieldConfig` is set, `accrued` is delegated to the configured
+    /// external lending pool through the shared interface (issue #326),
+    /// falling back to the internal APR estimate if the pool is unreachable,
+    /// paused, or reports a non-positive figure.
+    ///
     /// Returns zero yield fields when no `YieldConfig` is set.
     /// Never mutates storage.
     ///
@@ -4348,7 +4354,10 @@ impl EscrowContract {
             .get(&DataKey::EscrowYieldConfig(escrow_id));
         let apy_bps = yield_config.as_ref().map(|c| c.apr_bps).unwrap_or(0);
         let snapshot_ledger = env.ledger().sequence();
-        let (accrued, held_seconds) = Self::compute_yield(&record, yield_config.as_ref(), &env);
+        let (accrued, held_seconds) = match yield_config.as_ref() {
+            Some(cfg) => Self::accrued_yield(&record, cfg, &env),
+            None => (0, 0),
+        };
 
         let remaining = record.amount - record.released_amount - record.refunded_amount;
 
@@ -5031,6 +5040,34 @@ impl EscrowContract {
         }
 
         Ok(())
+    }
+
+    /// Yield accrued for an escrow, preferring the configured external
+    /// lending pool's own accounting when available (issue #326).
+    ///
+    /// When a `YieldConfig` is set, the escrow drives its `lending_contract`
+    /// through the shared [`LendingPoolClient`] and trusts the pool-reported
+    /// `get_accrued_yield`, which reflects the actual on-pool position rather
+    /// than the simple APR formula.  If the pool is unreachable, paused, or
+    /// reports a non-positive figure, it falls back to the internal
+    /// [`Self::compute_yield`] estimate so the escrow keeps returning honest
+    /// numbers while the external protocol is degraded.  `held_seconds`
+    /// remains ledger-derived so the [`YieldView`] stays monotonic.
+    ///
+    /// Never mutates storage.
+    fn accrued_yield(
+        record: &EscrowRecord,
+        yield_config: &YieldConfig,
+        env: &Env,
+    ) -> (i128, u64) {
+        let (fallback, held_seconds) = Self::compute_yield(record, Some(yield_config), env);
+        let pool_yield = match LendingPoolClient::new(env, &yield_config.lending_contract)
+            .try_get_accrued_yield(&env.current_contract_address())
+        {
+            Ok(Ok(pool_report)) if pool_report > 0 => Some(pool_report),
+            _ => None,
+        };
+        (pool_yield.unwrap_or(fallback), held_seconds)
     }
 
     /// Computes yield accrued on an escrow's remaining principal for the time
@@ -6272,5 +6309,159 @@ mod error_code_allocation_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod lending_pool_delegation_tests {
+    use super::*;
+    use delego_interfaces::{MockLendingPool, MockLendingPoolClient};
+    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::{token, Address, BytesN, Env};
+
+    fn setup_pool_escrow(env: &Env) -> (EscrowContractClient<'_>, Address, Address) {
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 0u32,
+            treasury: treasury.clone(),
+            min_amount: 1i128,
+            max_amount: 100_000i128,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(env, &contract_id);
+        (client, admin, contract_id)
+    }
+
+    fn funded_escrow(
+        env: &Env,
+        client: &EscrowContractClient<'_>,
+        admin: &Address,
+    ) -> (u64, Address) {
+        let buyer = Address::generate(env);
+        let seller = Address::generate(env);
+        let token_admin = Address::generate(env);
+        let token = env.register_stellar_asset_contract(token_admin);
+        let token_client = token::StellarAssetClient::new(env, &token);
+        token_client.mint(&buyer, &10_000i128);
+        client.add_token(admin, &token);
+
+        let order_id = BytesN::from_array(env, &[90u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer,
+            &seller,
+            &token,
+            &1_000i128,
+            &order_id,
+            &1_000u32,
+            &None::<BytesN<32>>,
+            &None::<soroban_sdk::Symbol>,
+        );
+        (escrow_id, token)
+    }
+
+    /// When a pool is configured and reports yield, `get_accrued_yield` must
+    /// return the pool-reported figure rather than the internal APR estimate.
+    #[test]
+    fn get_accrued_yield_delegates_to_pool() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, contract_id) = setup_pool_escrow(&env);
+        let (escrow_id, token) = funded_escrow(&env, &client, &admin);
+
+        let pool_id = env.register(MockLendingPool, ());
+        let pool = MockLendingPoolClient::new(&env, &pool_id);
+        client.set_yield_config(&admin, &escrow_id, &pool_id, &500u32);
+
+        // Seed the escrow's notional pool position at creation time, accruing
+        // at a deliberately different rate (100% APR) than the escrow config.
+        pool.set_position(&contract_id, &token, &1_000i128);
+        pool.set_yield_rate(&10_000u32);
+
+        // Advance one year: internal estimate = 1000 * 500bps = 50, while the
+        // pool reports 1000 * 10000bps = 1000.
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 1000;
+            li.timestamp = 31_536_000;
+        });
+
+        let view = client.get_accrued_yield(&escrow_id);
+        assert_eq!(view.accrued, 1_000i128, "pool-reported yield must win");
+        assert_eq!(view.apy_bps, 500, "apy_bps still reflects escrow config");
+        assert_eq!(view.held_seconds, 31_536_000);
+    }
+
+    /// A paused (unreachable) pool must not break yield reads: the escrow
+    /// falls back to the internal APR estimate.
+    #[test]
+    fn get_accrued_yield_falls_back_when_pool_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, contract_id) = setup_pool_escrow(&env);
+        let (escrow_id, token) = funded_escrow(&env, &client, &admin);
+
+        let pool_id = env.register(MockLendingPool, ());
+        let pool = MockLendingPoolClient::new(&env, &pool_id);
+        client.set_yield_config(&admin, &escrow_id, &pool_id, &500u32);
+
+        pool.set_position(&contract_id, &token, &1_000i128);
+        pool.set_yield_rate(&10_000u32);
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 1000;
+            li.timestamp = 31_536_000;
+        });
+
+        // Pool reachable: delegated figure wins.
+        let before = client.get_accrued_yield(&escrow_id);
+        assert_eq!(before.accrued, 1_000i128);
+
+        // Pause the pool: reads must fall back to the internal 5% estimate (50).
+        pool.set_paused(&true);
+        let after = client.get_accrued_yield(&escrow_id);
+        assert_eq!(after.accrued, 50i128, "fallback must kick in when pool is paused");
+    }
+
+    /// A pool with no position for this escrow reports zero; the escrow treats
+    /// zero as non-authoritative and falls back to its internal estimate.
+    #[test]
+    fn get_accrued_yield_falls_back_when_pool_reports_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_pool_escrow(&env);
+        let (escrow_id, _token) = funded_escrow(&env, &client, &admin);
+
+        let pool_id = env.register(MockLendingPool, ());
+        client.set_yield_config(&admin, &escrow_id, &pool_id, &500u32);
+
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 1000;
+            li.timestamp = 31_536_000;
+        });
+
+        // No position seeded: pool returns 0, escrow must use its own estimate.
+        let view = client.get_accrued_yield(&escrow_id);
+        assert_eq!(view.accrued, 50i128, "zero pool report must fall back internally");
+    }
+
+    /// An unreachable lending address (no contract) must not break reads: the
+    /// escrow falls back to the internal APR estimate.
+    #[test]
+    fn get_accrued_yield_falls_back_when_pool_unreachable() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_pool_escrow(&env);
+        let (escrow_id, _token) = funded_escrow(&env, &client, &admin);
+
+        let lending = Address::generate(&env);
+        client.set_yield_config(&admin, &escrow_id, &lending, &500u32);
+
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 1000;
+            li.timestamp = 31_536_000;
+        });
+
+        let view = client.get_accrued_yield(&escrow_id);
+        assert_eq!(view.accrued, 50i128, "unreachable pool must fall back internally");
     }
 }
