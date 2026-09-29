@@ -747,6 +747,27 @@ mod test {
         assert_eq!(res, Err(Ok(PermissionError::Unauthorized)));
     }
 
+    #[test]
+    fn test_admin_operations_before_initialization_return_typed_error() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        assert_eq!(
+            client.try_pause_grants(&admin),
+            Err(Ok(PermissionError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_unpause_grants(&admin),
+            Err(Ok(PermissionError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_set_inactivity_threshold(&admin, &1000),
+            Err(Ok(PermissionError::NotInitialized))
+        );
+    }
+
     // --- Issue #187: GrantPauseChangedEvent tests ---
 
     #[test]
