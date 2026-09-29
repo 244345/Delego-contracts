@@ -165,6 +165,8 @@ pub struct EscrowCancelledEvent {
 | `("escrow", "resolved")` | `EscrowResolvedEvent` | `resolve_dispute` / `resolve_dispute_quorum` |
 | `("escrow", "dispsplit")` | `DisputeResolvedEvent` | `resolve_dispute_split` |
 | `("escrow", "merkroot", date)` | `BytesN<32>` | `publish_merkle_root` |
+| `("escrow", "dctmo")` | `DualControlTimeoutSetEvent` | `set_dual_control_timeout` |
+| `("escrow", "dcfb")` | `DualControlTimeoutFallbackEvent` | `handle_dual_control_timeout` |
 | `("escrow", "paused")` | `EscrowPauseChangedEvent` | `set_create_paused` |
 | `("admin", "proposed")` | `AdminProposedEvent` | `propose_admin` |
 | `("admin", "accepted")` | `AdminAcceptedEvent` | `accept_admin` |
@@ -199,6 +201,46 @@ amounts must be non-negative and sum exactly to the escrow balance. The
 mediator fee is explicit and no additional platform release fee is charged.
 The call transfers each nonzero award, records the buyer amount as refunded
 and seller-plus-mediator amounts as released, and emits `DisputeResolvedEvent`.
+
+## Secondary-approver expiration (issue #336)
+
+Escrows above `DUAL_CONTROL_THRESHOLD` require a second signature from the
+finance approver configured by `set_dual_control_config` before
+`verify_delivery_and_release` can settle. `set_dual_control_timeout(admin,
+escrow_id, timeout_ledgers, fallback_action)` (admin-only) arms an expiration on
+that window, storing a `DualControlTimeout { approver_deadline_ledger,
+fallback_action }` where the deadline is the current ledger sequence plus
+`timeout_ledgers`. `fallback_action` must be `Disputed` or `Refunded` — the
+timeout may only divert funds away from the seller, never authorize a release
+the approver never signed. The escrow must be `Funded` and already have a
+configured approver.
+
+| Function | Purpose |
+|---|---|
+| `set_dual_control_timeout` | Arm (or re-arm) the deadline and pick the fallback action |
+| `get_dual_control_timeout` | Read the stored `DualControlTimeout` |
+| `is_approver_deadline_passed` | Read-only "is the window closed" check for relayers |
+| `handle_dual_control_timeout` | Permissionless executor for the fallback |
+
+Once `current_ledger >= approver_deadline_ledger`, `approve_release` returns
+`ApproverDeadlineExpired` — a late signature cannot resurrect an order whose
+fallback is due. Any address may then call
+`handle_dual_control_timeout(escrow_id, caller)`, whose outcome is fully
+determined by stored state:
+
+- `Refunded` pays the buyer the full remaining balance and moves the escrow to
+  `Refunded`. This deliberately bypasses `EscrowRecord::timeout_ledger`: the
+  approver deadline, not the escrow timeout, is the clock that governs the
+  fallback.
+- `Disputed` only moves the escrow to `Disputed`, leaving settlement to the
+  arbiter quorum; no funds move.
+
+A fallback publishes `DualControlTimeoutFallbackEvent` (`("escrow", "dcfb")`)
+alongside the ordinary `EscrowRefundedEvent` / `EscrowDisputedEvent`, so
+existing settlement indexers stay in sync. `set_dual_control_timeout` publishes
+`DualControlTimeoutSetEvent` (`("escrow", "dctmo")`). The stored deadline is
+left in place after execution as an audit record; a second call is rejected by
+the escrow's status.
 
 ## Development
 

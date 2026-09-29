@@ -21,7 +21,7 @@
 #![warn(missing_docs)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
-    InvokeError, Map, Symbol, Vec,
+    IntoVal, InvokeError, Map, Symbol, Vec,
 };
 
 /// Lifecycle state of an escrow.
@@ -123,6 +123,35 @@ pub struct DualControlConfig {
     pub is_secondary_approved: bool,
     /// Ledger timestamp of the secondary approval, or zero before approval.
     pub secondary_approved_at: u64,
+}
+
+/// Secondary-approver expiration for a high-value dual-control escrow (#336).
+///
+/// Stored per escrow by `set_dual_control_timeout`. The deadline is expressed
+/// as an absolute ledger sequence (like `EscrowRecord::timeout_ledger`) so the
+/// check stays deterministic and cannot be pushed back by a relayer. Once
+/// `current_ledger >= approver_deadline_ledger` and the secondary approver has
+/// not signed, `handle_dual_control_timeout` applies `fallback_action` so the
+/// order can no longer be held hostage by an unresponsive finance approver.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DualControlTimeout {
+    /// Ledger sequence at which the secondary approval window closes.
+    pub approver_deadline_ledger: u32,
+    /// State applied when the deadline passes unapproved (`Disputed` or `Refunded`).
+    pub fallback_action: EscrowStatus,
+}
+
+impl DualControlTimeout {
+    /// Returns `true` when `fallback_action` is one of the two settlement
+    /// states a fallback may produce.
+    ///
+    /// `Released` is deliberately rejected: the timeout may only divert funds
+    /// away from the seller (dispute or refund), never authorize a release that
+    /// the secondary approver never signed off on.
+    pub fn is_valid_fallback(action: &EscrowStatus) -> bool {
+        matches!(action, EscrowStatus::Disputed | EscrowStatus::Refunded)
+    }
 }
 
 /// Outcome of a partial release.
@@ -266,6 +295,34 @@ pub struct EscrowRefundedEvent {
     pub remaining: i128,
     /// Address that triggered the refund.
     pub refunded_by: Address,
+}
+
+/// Emitted when an admin configures a secondary-approver deadline.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct DualControlTimeoutSetEvent {
+    /// Unique identifier for the escrow.
+    pub escrow_id: u64,
+    /// Ledger sequence at which the secondary approval window closes.
+    pub approver_deadline_ledger: u32,
+    /// State applied when the deadline passes unapproved.
+    pub fallback_action: EscrowStatus,
+}
+
+/// Emitted when an expired secondary-approver deadline triggers the fallback.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct DualControlTimeoutFallbackEvent {
+    /// Unique identifier for the escrow.
+    pub escrow_id: u64,
+    /// Ledger sequence at which the deadline was observed as reached.
+    pub approver_deadline_ledger: u32,
+    /// State applied by this fallback.
+    pub fallback_action: EscrowStatus,
+    /// Amount refunded to the buyer by a `Refunded` fallback (zero otherwise).
+    pub refunded_amount: i128,
+    /// Address that triggered the fallback.
+    pub executed_by: Address,
 }
 
 /// Emitted when a release condition is attached to an escrow.
@@ -770,6 +827,8 @@ pub enum DataKey {
     Escrow(u64),
     /// Per-escrow finance approval configuration.
     DualControlConfig(u64),
+    /// Per-escrow secondary-approver expiration (issue #336).
+    DualControlTimeout(u64),
     LastEscrowId,
     PendingAdmin,
     AdminList,
@@ -820,9 +879,19 @@ pub enum DataKey {
     UpgradeProposal,
     /// M-of-N admin approvals required to execute an upgrade (issue #292).
     UpgradeThreshold,
+    /// Published delivery Merkle root for a UTC epoch date (issue #338).
+    MerkleRoot(u64),
 }
 
-#[contracterror]
+// `export = false` suppresses the generated `contractspecv0` entry for this
+// enum only. The Soroban XDR spec caps `ScSpecUdtErrorEnumV0.cases` at 50
+// entries, and this enum carries more variants than that (the codes are frozen
+// and cannot be pruned to fit). Dropping the spec entry keeps the crate
+// compiling and leaves the runtime ABI untouched: every variant still converts
+// to and from `soroban_sdk::Error` through the `TryFrom`/`From` impls generated
+// below, with the same numeric codes. The registry table in this attribute is
+// the authoritative error catalogue for tooling.
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 // Canonical ABI numbering for `EscrowError`.
@@ -892,11 +961,21 @@ pub enum DataKey {
 // | 404 | ShipmentProofNotFound | next major |
 // | 405 | FeeUpdateNotEffective | next major |
 // | 406 | FeeNoticeWindowNotMet | next major |
-// | 407 | UpgradeProposalExists | next major |
-// | 408 | UpgradeProposalNotFound | next major |
-// | 409 | UpgradeTimelockActive | next major |
-// | 410 | UpgradeHashMismatch | next major |
-// | 411+ | Reserved for new variants | next major |
+// | 407 | InvalidMerkleProof | next major |
+// | 408 | MerkleRootAlreadyPublished | next major |
+// | 409 | BatchLimitExceeded | next major |
+// | 410 | InvalidDisputeAward | next major |
+// | 411 | ApproverDeadlineExpired | next major |
+// | 412 | ApproverDeadlineNotReached | next major |
+// | 413 | InvalidFallbackAction | next major |
+// | 414 | DualControlTimeoutNotConfigured | next major |
+// | 415 | DualControlAlreadyApproved | next major |
+// | 416 | UpgradeProposalExists | next major |
+// | 417 | UpgradeProposalNotFound | next major |
+// | 418 | UpgradeTimelockActive | next major |
+// | 419 | UpgradeHashMismatch | next major |
+// | 420 | MerchantCategoryNotAllowed | next major |
+// | 421+ | Reserved for new variants | next major |
 //
 // # Allocating new variants
 //
@@ -1054,6 +1133,26 @@ pub enum EscrowError {
     BatchLimitExceeded = 409,
     /// Dispute award amounts are negative or do not sum to the escrow balance.
     InvalidDisputeAward = 410,
+    /// The secondary-approver deadline passed before the approval was recorded.
+    ApproverDeadlineExpired = 411,
+    /// The secondary-approver deadline has not been reached yet.
+    ApproverDeadlineNotReached = 412,
+    /// Dual-control fallback action must be `Disputed` or `Refunded`.
+    InvalidFallbackAction = 413,
+    /// No secondary-approver deadline is configured for this escrow.
+    DualControlTimeoutNotConfigured = 414,
+    /// The secondary approver already signed, so no fallback is due.
+    DualControlAlreadyApproved = 415,
+    /// An unexecuted upgrade proposal is already pending.
+    UpgradeProposalExists = 416,
+    /// No upgrade proposal is pending or recorded.
+    UpgradeProposalNotFound = 417,
+    /// The upgrade timelock has not elapsed yet.
+    UpgradeTimelockActive = 418,
+    /// Approved upgrade does not match the pending proposal's WASM hash.
+    UpgradeHashMismatch = 419,
+    /// Seller's merchant category is not authorized for escrow spending.
+    MerchantCategoryNotAllowed = 420,
 }
 
 /// Compact receipt returned to buyers after escrow creation via `get_receipt`.
@@ -1671,7 +1770,113 @@ impl EscrowContract {
         Ok(())
     }
 
+    /// Configure a secondary-approver deadline for a dual-control escrow.
+    /// Admin-only. Issue #336.
+    ///
+    /// `timeout_ledgers` is measured from the current ledger sequence and must
+    /// be greater than zero, so the deadline is always in the future. Once the
+    /// deadline passes without a recorded secondary approval,
+    /// [`Self::handle_dual_control_timeout`] applies `fallback_action`.
+    ///
+    /// # Errors
+    /// - [`EscrowError::NotFound`] when the escrow does not exist.
+    /// - [`EscrowError::DualControlNotConfigured`] when no secondary approver
+    ///   is configured for the escrow.
+    /// - [`EscrowError::InvalidExtension`] when `timeout_ledgers` is zero.
+    /// - [`EscrowError::InvalidFallbackAction`] when `fallback_action` is not
+    ///   `Disputed` or `Refunded`.
+    pub fn set_dual_control_timeout(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        timeout_ledgers: u32,
+        fallback_action: EscrowStatus,
+    ) -> Result<DualControlTimeout, EscrowError> {
+        admin.require_auth();
+        if !Self::is_admin(env.clone(), admin) {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+        check_not_terminal(&record)?;
+        if record.status != EscrowStatus::Funded {
+            return Err(EscrowError::InvalidStatus);
+        }
+
+        // A deadline without a secondary approver could never be satisfied.
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::DualControlConfig(escrow_id))
+        {
+            return Err(EscrowError::DualControlNotConfigured);
+        }
+
+        if timeout_ledgers == 0 {
+            return Err(EscrowError::InvalidExtension);
+        }
+        if !DualControlTimeout::is_valid_fallback(&fallback_action) {
+            return Err(EscrowError::InvalidFallbackAction);
+        }
+
+        let timeout = DualControlTimeout {
+            approver_deadline_ledger: env.ledger().sequence().saturating_add(timeout_ledgers),
+            fallback_action: fallback_action.clone(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::DualControlTimeout(escrow_id), &timeout);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("dctmo"), escrow_id),
+            DualControlTimeoutSetEvent {
+                escrow_id,
+                approver_deadline_ledger: timeout.approver_deadline_ledger,
+                fallback_action,
+            },
+        );
+
+        Ok(timeout)
+    }
+
+    /// Read-only getter for the secondary-approver deadline of an escrow.
+    pub fn get_dual_control_timeout(
+        env: Env,
+        escrow_id: u64,
+    ) -> Result<DualControlTimeout, EscrowError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DualControlTimeout(escrow_id))
+            .ok_or(EscrowError::DualControlTimeoutNotConfigured)
+    }
+
+    /// Read-only check for whether the secondary-approver window has closed.
+    ///
+    /// Returns `false` when no deadline is configured, so callers must gate on
+    /// [`Self::get_dual_control_timeout`] (or the `NotConfigured` error) rather
+    /// than treat a `false` answer as "not yet expired".
+    pub fn is_approver_deadline_passed(env: Env, escrow_id: u64) -> bool {
+        let timeout: Option<DualControlTimeout> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DualControlTimeout(escrow_id));
+        match timeout {
+            Some(cfg) => env.ledger().sequence() >= cfg.approver_deadline_ledger,
+            None => false,
+        }
+    }
+
     /// Record explicit finance authorization for a configured high-value escrow.
+    ///
+    /// # Errors
+    /// Returns [`EscrowError::ApproverDeadlineExpired`] when a deadline
+    /// configured by `set_dual_control_timeout` has already passed: a late
+    /// signature must not resurrect an order whose fallback is due, and the
+    /// approver is expected to take the dispute/refund path instead.
     pub fn approve_release(
         env: Env,
         escrow_id: u64,
@@ -1697,9 +1902,129 @@ impl EscrowContract {
             return Err(EscrowError::InvalidStatus);
         }
 
+        if Self::is_approver_deadline_passed(env.clone(), escrow_id) {
+            return Err(EscrowError::ApproverDeadlineExpired);
+        }
+
         config.is_secondary_approved = true;
         config.secondary_approved_at = env.ledger().timestamp();
         env.storage().persistent().set(&config_key, &config);
+        Ok(true)
+    }
+
+    /// Apply the configured fallback once the secondary-approver deadline has
+    /// passed without an approval. Issue #336.
+    ///
+    /// Permissionless: the outcome is fully determined by stored state, so any
+    /// address (typically a keeper or either escrow party) may trigger it.
+    /// A `Refunded` fallback pays the buyer the full remaining balance and
+    /// bypasses the escrow `timeout_ledger` — the approver deadline is the
+    /// governing clock here. A `Disputed` fallback only moves the escrow to
+    /// `Disputed`, leaving settlement to the arbiter quorum.
+    ///
+    /// # Errors
+    /// - [`EscrowError::NotFound`] when the escrow does not exist.
+    /// - [`EscrowError::DualControlTimeoutNotConfigured`] when no deadline is set.
+    /// - [`EscrowError::InvalidStatus`] when the escrow is not `Funded`.
+    /// - [`EscrowError::DualControlAlreadyApproved`] when the approver already signed.
+    /// - [`EscrowError::ApproverDeadlineNotReached`] before the deadline.
+    /// - [`EscrowError::InvalidFallbackAction`] for a corrupt fallback action.
+    pub fn handle_dual_control_timeout(
+        env: Env,
+        escrow_id: u64,
+        caller: Address,
+    ) -> Result<bool, EscrowError> {
+        caller.require_auth();
+
+        let timeout: DualControlTimeout = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DualControlTimeout(escrow_id))
+            .ok_or(EscrowError::DualControlTimeoutNotConfigured)?;
+        let key = DataKey::Escrow(escrow_id);
+        let mut record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+        check_not_terminal(&record)?;
+        if record.status != EscrowStatus::Funded {
+            return Err(EscrowError::InvalidStatus);
+        }
+
+        let config: DualControlConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DualControlConfig(escrow_id))
+            .ok_or(EscrowError::DualControlNotConfigured)?;
+        if config.is_secondary_approved {
+            return Err(EscrowError::DualControlAlreadyApproved);
+        }
+        if env.ledger().sequence() < timeout.approver_deadline_ledger {
+            return Err(EscrowError::ApproverDeadlineNotReached);
+        }
+        if !DualControlTimeout::is_valid_fallback(&timeout.fallback_action) {
+            return Err(EscrowError::InvalidFallbackAction);
+        }
+
+        let remaining = record.amount - record.released_amount - record.refunded_amount;
+        let refunded_amount = match timeout.fallback_action {
+            EscrowStatus::Refunded => {
+                let token_client = soroban_sdk::token::Client::new(&env, &record.token);
+                token_client.transfer(&env.current_contract_address(), &record.buyer, &remaining);
+                record.refunded_amount += remaining;
+                record.status = EscrowStatus::Refunded;
+                record.updated_at = env.ledger().timestamp();
+                env.storage().persistent().set(&key, &record);
+
+                env.events().publish(
+                    (
+                        symbol_short!("escrow"),
+                        symbol_short!("refunded"),
+                        escrow_id,
+                    ),
+                    EscrowRefundedEvent {
+                        escrow_id,
+                        buyer: record.buyer.clone(),
+                        amount: remaining,
+                        remaining: 0,
+                        refunded_by: caller.clone(),
+                    },
+                );
+                remaining
+            }
+            EscrowStatus::Disputed => {
+                record.status = EscrowStatus::Disputed;
+                record.updated_at = env.ledger().timestamp();
+                env.storage().persistent().set(&key, &record);
+
+                env.events().publish(
+                    (
+                        symbol_short!("escrow"),
+                        symbol_short!("disputed"),
+                        escrow_id,
+                    ),
+                    EscrowDisputedEvent {
+                        escrow_id,
+                        disputed_by: caller.clone(),
+                    },
+                );
+                0
+            }
+            _ => return Err(EscrowError::InvalidFallbackAction),
+        };
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("dcfb"), escrow_id),
+            DualControlTimeoutFallbackEvent {
+                escrow_id,
+                approver_deadline_ledger: timeout.approver_deadline_ledger,
+                fallback_action: timeout.fallback_action,
+                refunded_amount,
+                executed_by: caller,
+            },
+        );
+
         Ok(true)
     }
 
@@ -3869,7 +4194,7 @@ impl EscrowContract {
     /// compatibility but never releases funds; use
     /// `verify_delivery_and_release` with an oracle signature instead.
     pub fn evaluate_and_release(
-        env: Env,
+        _env: Env,
         _escrow_id: u64,
         caller: Address,
     ) -> Result<PartialReleaseResult, EscrowError> {
@@ -4673,7 +4998,7 @@ impl EscrowContract {
         let result = env.try_invoke_contract::<u64, EscrowError>(
             &registry,
             &Symbol::new(env, "get_merchant_id_by_owner"),
-            soroban_sdk::vec![env, seller.to_val()],
+            soroban_sdk::vec![env, seller.into_val(env)],
         );
 
         let merchant_id = match result {
@@ -4682,7 +5007,11 @@ impl EscrowContract {
         };
 
         // Now validate the category
-        let args = soroban_sdk::vec![env, merchant_id.to_val(), authorized_categories.to_val()];
+        let args = soroban_sdk::vec![
+            env,
+            merchant_id.into_val(env),
+            authorized_categories.into_val(env)
+        ];
         let validation_result = env.try_invoke_contract::<(), EscrowError>(
             &registry,
             &Symbol::new(env, "validate_merchant_category"),
@@ -6105,6 +6434,500 @@ mod metadata_tests {
 mod integration_tests;
 #[cfg(all(test, feature = "full_suite"))]
 mod test;
+
+#[cfg(test)]
+mod dual_control_timeout_tests {
+    use super::*;
+    use ed25519_dalek::Signer;
+    use soroban_sdk::{
+        testutils::{Address as _, Events, Ledger},
+        token::StellarAssetClient,
+        xdr::ToXdr,
+        TryIntoVal,
+    };
+
+    /// Amount above `DUAL_CONTROL_THRESHOLD`, so dual control applies.
+    const HIGH_VALUE: i128 = 20_000;
+    /// Refund window long enough that the approver deadline, not the escrow
+    /// timeout, is the clock under test.
+    const ESCROW_TIMEOUT: u32 = 10_000;
+
+    struct Fx<'a> {
+        env: Env,
+        client: EscrowContractClient<'a>,
+        admin: Address,
+        buyer: Address,
+        seller: Address,
+        finance: Address,
+        token: Address,
+        contract_id: Address,
+    }
+
+    fn setup(env: &Env) -> Fx<'_> {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let buyer = Address::generate(env);
+        let seller = Address::generate(env);
+        let finance = Address::generate(env);
+        let token = env
+            .register_stellar_asset_contract_v2(Address::generate(env))
+            .address();
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 250,
+            treasury,
+            min_amount: 100,
+            max_amount: 1_000_000,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(env, &contract_id);
+        StellarAssetClient::new(env, &token).mint(&buyer, &100_000);
+        client.add_token(&admin, &token);
+        Fx {
+            env: env.clone(),
+            client,
+            admin,
+            buyer,
+            seller,
+            finance,
+            token,
+            contract_id,
+        }
+    }
+
+    impl Fx<'_> {
+        /// Fund a high-value escrow with dual control and a secondary-approver
+        /// deadline of `timeout_ledgers`.
+        fn funded_with_timeout(&self, timeout_ledgers: u32, fallback: EscrowStatus) -> u64 {
+            let order_id = BytesN::from_array(&self.env, &[7u8; 32]);
+            let escrow_id = self.client.deposit(
+                &self.buyer,
+                &self.seller,
+                &self.token,
+                &HIGH_VALUE,
+                &order_id,
+                &ESCROW_TIMEOUT,
+                &None,
+                &None,
+            );
+            self.client
+                .set_dual_control_config(&self.admin, &escrow_id, &self.finance);
+            self.client.set_dual_control_timeout(
+                &self.admin,
+                &escrow_id,
+                &timeout_ledgers,
+                &fallback,
+            );
+            escrow_id
+        }
+
+        fn balance(&self, address: &Address) -> i128 {
+            self.env.as_contract(&self.contract_id, || {
+                soroban_sdk::token::Client::new(&self.env, &self.token).balance(address)
+            })
+        }
+
+        /// Oracle-signed delivery attestation for `escrow_id`, as required by
+        /// `verify_delivery_and_release`.
+        fn delivery_proof(&self, escrow_id: u64) -> SignedDeliveryProof {
+            let key = ed25519_dalek::SigningKey::from_bytes(&[31u8; 32]);
+            let oracle_pubkey = BytesN::from_array(&self.env, &key.verifying_key().to_bytes());
+            self.client
+                .set_oracle_public_key(&self.admin, &oracle_pubkey);
+            let delivery_timestamp = self.env.ledger().timestamp();
+            let tracking_hash = BytesN::from_array(&self.env, &[93u8; 32]);
+            let payload = SignedDeliveryPayload {
+                escrow_id,
+                carrier_code: symbol_short!("ups"),
+                tracking_hash: tracking_hash.clone(),
+                delivery_timestamp,
+            }
+            .to_xdr(&self.env);
+            let mut payload_bytes = vec![0u8; payload.len() as usize];
+            payload.copy_into_slice(&mut payload_bytes);
+            SignedDeliveryProof {
+                escrow_id,
+                carrier_code: symbol_short!("ups"),
+                tracking_hash,
+                delivery_timestamp,
+                oracle_pubkey,
+                signature: BytesN::from_array(&self.env, &key.sign(&payload_bytes).to_bytes()),
+            }
+        }
+    }
+
+    #[test]
+    fn approval_before_the_deadline_authorizes_the_release() {
+        let env = Env::default();
+        let fx = setup(&env);
+        let escrow_id = fx.funded_with_timeout(500, EscrowStatus::Refunded);
+        let proof = fx.delivery_proof(escrow_id);
+
+        // A second deadline is not reached yet, so the release stays blocked.
+        assert_eq!(
+            fx.client
+                .try_verify_delivery_and_release(&escrow_id, &fx.buyer, &proof),
+            Err(Ok(EscrowError::SecondaryApprovalRequired))
+        );
+
+        assert!(fx.client.approve_release(&escrow_id, &fx.finance));
+
+        let result = fx
+            .client
+            .verify_delivery_and_release(&escrow_id, &fx.buyer, &proof);
+        assert!(result.fully_released);
+        assert_eq!(
+            fx.client.get_escrow(&escrow_id).status,
+            EscrowStatus::Released
+        );
+    }
+
+    #[test]
+    fn approval_after_the_deadline_is_rejected() {
+        let env = Env::default();
+        let fx = setup(&env);
+        let escrow_id = fx.funded_with_timeout(100, EscrowStatus::Refunded);
+        fx.env.ledger().set_sequence_number(100);
+
+        assert!(fx.client.is_approver_deadline_passed(&escrow_id));
+        assert_eq!(
+            fx.client.try_approve_release(&escrow_id, &fx.finance),
+            Err(Ok(EscrowError::ApproverDeadlineExpired))
+        );
+        // The late signature must not have been recorded.
+        assert_eq!(
+            fx.client.try_verify_delivery_and_release(
+                &escrow_id,
+                &fx.buyer,
+                &fx.delivery_proof(escrow_id)
+            ),
+            Err(Ok(EscrowError::SecondaryApprovalRequired))
+        );
+        assert_eq!(
+            fx.client.get_escrow(&escrow_id).status,
+            EscrowStatus::Funded
+        );
+    }
+
+    #[test]
+    fn refund_fallback_returns_the_balance_to_the_buyer() {
+        let env = Env::default();
+        let fx = setup(&env);
+        let escrow_id = fx.funded_with_timeout(100, EscrowStatus::Refunded);
+        let keeper = Address::generate(&env);
+
+        // Still inside the approval window: the fallback is premature.
+        assert_eq!(
+            fx.client
+                .try_handle_dual_control_timeout(&escrow_id, &keeper),
+            Err(Ok(EscrowError::ApproverDeadlineNotReached))
+        );
+
+        // The escrow's own refund timeout has not elapsed either, so the buyer
+        // could not have self-served here.
+        fx.env.ledger().set_sequence_number(100);
+        assert!(fx.client.handle_dual_control_timeout(&escrow_id, &keeper));
+
+        // The buyer is made whole without waiting for the escrow timeout.
+        assert_eq!(fx.balance(&fx.buyer), 100_000);
+        assert_eq!(fx.balance(&fx.contract_id), 0);
+        let record = fx.client.get_escrow(&escrow_id);
+        assert_eq!(record.status, EscrowStatus::Refunded);
+        assert_eq!(record.refunded_amount, HIGH_VALUE);
+        assert_eq!(record.released_amount, 0);
+    }
+
+    #[test]
+    fn dispute_fallback_escalates_instead_of_moving_funds() {
+        let env = Env::default();
+        let fx = setup(&env);
+        let escrow_id = fx.funded_with_timeout(100, EscrowStatus::Disputed);
+        fx.env.ledger().set_sequence_number(100);
+
+        assert!(fx
+            .client
+            .handle_dual_control_timeout(&escrow_id, &fx.seller));
+
+        let record = fx.client.get_escrow(&escrow_id);
+        assert_eq!(record.status, EscrowStatus::Disputed);
+        assert_eq!(record.refunded_amount, 0);
+        assert_eq!(fx.balance(&fx.contract_id), HIGH_VALUE);
+        assert_eq!(fx.balance(&fx.buyer), 100_000 - HIGH_VALUE);
+
+        // A second pass has nothing left to do.
+        assert_eq!(
+            fx.client
+                .try_handle_dual_control_timeout(&escrow_id, &fx.seller),
+            Err(Ok(EscrowError::InvalidStatus))
+        );
+    }
+
+    #[test]
+    fn refund_fallback_settles_the_remaining_balance_after_a_partial_refund() {
+        let env = Env::default();
+        let fx = setup(&env);
+        let escrow_id = fx.funded_with_timeout(100, EscrowStatus::Refunded);
+        // An admin settlement before the deadline leaves a partial balance.
+        fx.client.partial_refund(&escrow_id, &fx.admin, &5_000);
+        assert_eq!(fx.balance(&fx.contract_id), HIGH_VALUE - 5_000);
+
+        fx.env.ledger().set_sequence_number(100);
+        assert!(fx.client.handle_dual_control_timeout(&escrow_id, &fx.buyer));
+
+        let record = fx.client.get_escrow(&escrow_id);
+        assert_eq!(record.status, EscrowStatus::Refunded);
+        assert_eq!(record.released_amount, 0);
+        assert_eq!(record.refunded_amount, HIGH_VALUE);
+        assert_eq!(fx.balance(&fx.contract_id), 0);
+    }
+
+    #[test]
+    fn fallback_is_refused_once_the_approver_has_signed() {
+        let env = Env::default();
+        let fx = setup(&env);
+        let escrow_id = fx.funded_with_timeout(100, EscrowStatus::Refunded);
+        assert!(fx.client.approve_release(&escrow_id, &fx.finance));
+
+        fx.env.ledger().set_sequence_number(100);
+        assert_eq!(
+            fx.client
+                .try_handle_dual_control_timeout(&escrow_id, &fx.buyer),
+            Err(Ok(EscrowError::DualControlAlreadyApproved))
+        );
+        assert_eq!(
+            fx.client.get_escrow(&escrow_id).status,
+            EscrowStatus::Funded
+        );
+    }
+
+    #[test]
+    fn fallback_reports_a_missing_deadline() {
+        let env = Env::default();
+        let fx = setup(&env);
+        let order_id = BytesN::from_array(&env, &[17u8; 32]);
+        let escrow_id = fx.client.deposit(
+            &fx.buyer,
+            &fx.seller,
+            &fx.token,
+            &HIGH_VALUE,
+            &order_id,
+            &ESCROW_TIMEOUT,
+            &None,
+            &None,
+        );
+
+        assert_eq!(
+            fx.client.try_get_dual_control_timeout(&escrow_id),
+            Err(Ok(EscrowError::DualControlTimeoutNotConfigured))
+        );
+        assert!(!fx.client.is_approver_deadline_passed(&escrow_id));
+        assert_eq!(
+            fx.client
+                .try_handle_dual_control_timeout(&escrow_id, &fx.buyer),
+            Err(Ok(EscrowError::DualControlTimeoutNotConfigured))
+        );
+        // Without a deadline, the approval window never closes — but the
+        // escrow still needs a configured secondary approver.
+        fx.client
+            .set_dual_control_config(&fx.admin, &escrow_id, &fx.finance);
+        assert!(fx.client.approve_release(&escrow_id, &fx.finance));
+    }
+
+    #[test]
+    fn deadline_configuration_is_validated() {
+        let env = Env::default();
+        let fx = setup(&env);
+        let order_id = BytesN::from_array(&env, &[23u8; 32]);
+        let unconfigured = fx.client.deposit(
+            &fx.buyer,
+            &fx.seller,
+            &fx.token,
+            &HIGH_VALUE,
+            &order_id,
+            &ESCROW_TIMEOUT,
+            &None,
+            &None,
+        );
+        let escrow_id = fx.funded_with_timeout(100, EscrowStatus::Refunded);
+        let stranger = Address::generate(&env);
+
+        assert_eq!(
+            fx.client.try_set_dual_control_timeout(
+                &stranger,
+                &escrow_id,
+                &100,
+                &EscrowStatus::Refunded
+            ),
+            Err(Ok(EscrowError::Unauthorized))
+        );
+        assert_eq!(
+            fx.client.try_set_dual_control_timeout(
+                &fx.admin,
+                &unconfigured,
+                &100,
+                &EscrowStatus::Refunded
+            ),
+            Err(Ok(EscrowError::DualControlNotConfigured))
+        );
+        assert_eq!(
+            fx.client.try_set_dual_control_timeout(
+                &fx.admin,
+                &escrow_id,
+                &0,
+                &EscrowStatus::Refunded
+            ),
+            Err(Ok(EscrowError::InvalidExtension))
+        );
+        // A fallback may only divert funds away from the seller.
+        for action in [
+            EscrowStatus::Created,
+            EscrowStatus::Released,
+            EscrowStatus::Cancelled,
+        ] {
+            assert_eq!(
+                fx.client
+                    .try_set_dual_control_timeout(&fx.admin, &escrow_id, &100, &action),
+                Err(Ok(EscrowError::InvalidFallbackAction))
+            );
+        }
+
+        // The rejected attempts left the original deadline untouched.
+        let stored = fx.client.get_dual_control_timeout(&escrow_id);
+        assert_eq!(stored.fallback_action, EscrowStatus::Refunded);
+        assert_eq!(stored.approver_deadline_ledger, 100);
+    }
+
+    #[test]
+    fn only_high_value_escrows_take_a_dual_control_deadline() {
+        let env = Env::default();
+        let fx = setup(&env);
+        let order_id = BytesN::from_array(&env, &[29u8; 32]);
+        let escrow_id = fx.client.deposit(
+            &fx.buyer,
+            &fx.seller,
+            &fx.token,
+            &1_000,
+            &order_id,
+            &ESCROW_TIMEOUT,
+            &None,
+            &None,
+        );
+
+        assert_eq!(
+            fx.client
+                .try_set_dual_control_config(&fx.admin, &escrow_id, &fx.finance),
+            Err(Ok(EscrowError::InvalidAmount))
+        );
+        assert_eq!(
+            fx.client.try_set_dual_control_timeout(
+                &fx.admin,
+                &escrow_id,
+                &100,
+                &EscrowStatus::Refunded
+            ),
+            Err(Ok(EscrowError::DualControlNotConfigured))
+        );
+    }
+
+    #[test]
+    fn a_later_deadline_can_replace_an_earlier_one() {
+        let env = Env::default();
+        let fx = setup(&env);
+        let escrow_id = fx.funded_with_timeout(100, EscrowStatus::Refunded);
+
+        fx.env.ledger().set_sequence_number(50);
+        let stored = fx.client.set_dual_control_timeout(
+            &fx.admin,
+            &escrow_id,
+            &100,
+            &EscrowStatus::Disputed,
+        );
+        assert_eq!(stored.approver_deadline_ledger, 150);
+        assert_eq!(stored.fallback_action, EscrowStatus::Disputed);
+
+        // The original deadline is gone, so the order stays approvable.
+        assert!(!fx.client.is_approver_deadline_passed(&escrow_id));
+        assert!(fx.client.approve_release(&escrow_id, &fx.finance));
+    }
+
+    #[test]
+    fn fallback_publishes_its_own_event_alongside_the_settlement_one() {
+        let env = Env::default();
+        let fx = setup(&env);
+        let escrow_id = fx.funded_with_timeout(100, EscrowStatus::Refunded);
+        let keeper = Address::generate(&env);
+        fx.env.ledger().set_sequence_number(100);
+
+        assert!(fx.client.handle_dual_control_timeout(&escrow_id, &keeper));
+
+        let mut fallback_event = None;
+        let mut refund_event = None;
+        for (event_contract, topics, data) in env.events().all().iter() {
+            if event_contract != fx.contract_id || topics.len() != 3 {
+                continue;
+            }
+            let topic: Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            if topic == symbol_short!("dcfb") {
+                let event: DualControlTimeoutFallbackEvent = data.try_into_val(&env).unwrap();
+                fallback_event = Some(event);
+            } else if topic == symbol_short!("refunded") {
+                let event: EscrowRefundedEvent = data.try_into_val(&env).unwrap();
+                refund_event = Some(event);
+            }
+        }
+
+        let fallback_event = fallback_event.expect("fallback event not published");
+        assert_eq!(fallback_event.escrow_id, escrow_id);
+        assert_eq!(fallback_event.approver_deadline_ledger, 100);
+        assert_eq!(fallback_event.fallback_action, EscrowStatus::Refunded);
+        assert_eq!(fallback_event.refunded_amount, HIGH_VALUE);
+        assert_eq!(fallback_event.executed_by, keeper);
+
+        let refund_event = refund_event.expect("refund event not published");
+        assert_eq!(refund_event.amount, HIGH_VALUE);
+        assert_eq!(refund_event.remaining, 0);
+        assert_eq!(refund_event.refunded_by, keeper);
+    }
+
+    #[test]
+    fn deadline_setting_publishes_a_configuration_event() {
+        let env = Env::default();
+        let fx = setup(&env);
+        let order_id = BytesN::from_array(&env, &[37u8; 32]);
+        let escrow_id = fx.client.deposit(
+            &fx.buyer,
+            &fx.seller,
+            &fx.token,
+            &HIGH_VALUE,
+            &order_id,
+            &ESCROW_TIMEOUT,
+            &None,
+            &None,
+        );
+        fx.client
+            .set_dual_control_config(&fx.admin, &escrow_id, &fx.finance);
+        fx.client
+            .set_dual_control_timeout(&fx.admin, &escrow_id, &100, &EscrowStatus::Disputed);
+
+        let mut found = false;
+        for (event_contract, topics, data) in env.events().all().iter() {
+            if event_contract != fx.contract_id || topics.len() != 3 {
+                continue;
+            }
+            let topic: Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            if topic == symbol_short!("dctmo") {
+                let event: DualControlTimeoutSetEvent = data.try_into_val(&env).unwrap();
+                assert_eq!(event.escrow_id, escrow_id);
+                assert_eq!(event.approver_deadline_ledger, 100);
+                assert_eq!(event.fallback_action, EscrowStatus::Disputed);
+                found = true;
+            }
+        }
+        assert!(found);
+    }
+}
+
 #[cfg(test)]
 mod quorum_cleanup_tests {
     use super::*;
@@ -6180,7 +7003,7 @@ mod error_code_allocation_tests {
         (3_000, 3_999),
         (4_000, 4_999),
     ];
-    fn escrow_error_codes() -> [u32; 45] {
+    fn escrow_error_codes() -> [u32; 50] {
         [
             EscrowError::AlreadyInitialized as u32,
             EscrowError::NotFound as u32,
@@ -6227,6 +7050,11 @@ mod error_code_allocation_tests {
             EscrowError::SignedProofRequired as u32,
             EscrowError::InvalidSignedDeliveryProof as u32,
             EscrowError::OraclePublicKeyNotSet as u32,
+            EscrowError::ApproverDeadlineExpired as u32,
+            EscrowError::ApproverDeadlineNotReached as u32,
+            EscrowError::InvalidFallbackAction as u32,
+            EscrowError::DualControlTimeoutNotConfigured as u32,
+            EscrowError::DualControlAlreadyApproved as u32,
         ]
     }
     #[test]
