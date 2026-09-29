@@ -7,6 +7,7 @@
 // enabled during testing so dev-dependencies and test assertions operate normally.
 // This exact conditional form must be consistent across all workspace contract crates.
 #![cfg_attr(not(test), no_std)]
+#![no_std]
 #![warn(missing_docs)]
 // Several entry points mirror escrow/permissions call shapes and exceed
 // clippy's default 7-argument limit; restructuring them would break the
@@ -17,9 +18,6 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String,
     Symbol, Vec,
 };
-
-/// Topic 0 for every event emitted by this contract.
-const EVENT_TOPIC_CONTRACT: Symbol = symbol_short!("reput");
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -551,11 +549,7 @@ impl ReputationContract {
         };
 
         env.events().publish(
-            (
-                EVENT_TOPIC_CONTRACT,
-                symbol_short!("tx_rec"),
-                entity.clone(),
-            ),
+            (symbol_short!("reput"), symbol_short!("tx_rec"), escrow_id),
             TransactionRecordedEvent {
                 escrow_id,
                 entity,
@@ -616,11 +610,7 @@ impl ReputationContract {
         Self::recompute_score(&env, &entity)?;
 
         env.events().publish(
-            (
-                EVENT_TOPIC_CONTRACT,
-                symbol_short!("rated"),
-                entity.clone(),
-            ),
+            (symbol_short!("reput"), symbol_short!("rated"), escrow_id),
             EntityRatedEvent {
                 rater,
                 entity,
@@ -807,11 +797,7 @@ impl ReputationContract {
         let active_count = flags.iter().filter(|f| !f.resolved).count() as u32;
 
         env.events().publish(
-            (
-                EVENT_TOPIC_CONTRACT,
-                symbol_short!("flagged"),
-                entity.clone(),
-            ),
+            (symbol_short!("reput"), symbol_short!("flagged"), entity.clone()),
             EntityFlaggedEvent {
                 reporter,
                 entity: entity.clone(),
@@ -827,11 +813,7 @@ impl ReputationContract {
                 .persistent()
                 .set(&DataKey::FrozenStatus(entity.clone()), &true);
             env.events().publish(
-                (
-                    EVENT_TOPIC_CONTRACT,
-                    symbol_short!("frozen"),
-                    entity.clone(),
-                ),
+                (symbol_short!("reput"), symbol_short!("frozen"), entity.clone()),
                 EntityFrozenEvent {
                     entity,
                     frozen_by: env.current_contract_address(),
@@ -893,11 +875,7 @@ impl ReputationContract {
             .persistent()
             .set(&DataKey::FrozenStatus(entity.clone()), &true);
         env.events().publish(
-            (
-                EVENT_TOPIC_CONTRACT,
-                symbol_short!("frozen"),
-                entity.clone(),
-            ),
+            (symbol_short!("reput"), symbol_short!("frozen"), entity.clone()),
             EntityFrozenEvent {
                 entity,
                 frozen_by: admin,
@@ -918,11 +896,7 @@ impl ReputationContract {
             .persistent()
             .set(&DataKey::FrozenStatus(entity.clone()), &false);
         env.events().publish(
-            (
-                EVENT_TOPIC_CONTRACT,
-                symbol_short!("unfrozn"),
-                entity.clone(),
-            ),
+            (symbol_short!("reput"), symbol_short!("unfrozn"), entity.clone()),
             EntityUnfrozenEvent {
                 entity,
                 unfrozen_by: admin,
@@ -978,11 +952,7 @@ impl ReputationContract {
 
         if pruned_count > 0 {
             env.events().publish(
-                (
-                    EVENT_TOPIC_CONTRACT,
-                    symbol_short!("pruned"),
-                    entity.clone(),
-                ),
+                (symbol_short!("reput"), symbol_short!("pruned"), entity.clone()),
                 EntityHistoryPrunedEvent {
                     entity,
                     pruned_count,
@@ -1020,11 +990,7 @@ impl ReputationContract {
             .instance()
             .set(&DataKey::PendingAdmin, &new_admin);
         env.events().publish(
-            (
-                EVENT_TOPIC_CONTRACT,
-                soroban_sdk::Symbol::new(&env, "admin_prop"),
-                new_admin.clone(),
-            ),
+            (symbol_short!("reput"), soroban_sdk::Symbol::new(&env, "admin_prop"), new_admin.clone()),
             AdminProposedEvent {
                 current_admin,
                 new_admin,
@@ -1048,11 +1014,7 @@ impl ReputationContract {
         env.storage().instance().set(&DataKey::Admin, &caller);
         env.storage().instance().remove(&DataKey::PendingAdmin);
         env.events().publish(
-            (
-                EVENT_TOPIC_CONTRACT,
-                symbol_short!("admin_acc"),
-                caller.clone(),
-            ),
+            (symbol_short!("reput"), symbol_short!("admin_acc"), caller.clone()),
             AdminAcceptedEvent { new_admin: caller },
         );
         Ok(())
@@ -1534,11 +1496,7 @@ impl ReputationContract {
         );
 
         env.events().publish(
-            (
-                EVENT_TOPIC_CONTRACT,
-                symbol_short!("score_dec"),
-                entity.clone(),
-            ),
+            (symbol_short!("reput"), symbol_short!("score_dec"), entity.clone()),
             decomposition,
         );
         Ok(rep)
@@ -1573,5 +1531,88 @@ mod config_parity_test {
         );
 
         assert_eq!(stored, config);
+    }
+}
+
+#[cfg(test)]
+mod event_topic_test {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Events as _};
+
+    fn setup(env: &Env) -> (Address, Address, ReputationConfig) {
+        let admin = Address::generate(env);
+        let config = ReputationConfig {
+            decay_window_seconds: 86_400,
+            min_transactions_threshold: 1,
+            dispute_penalty_bps: 250,
+            freeze_threshold_flags: 3,
+        };
+        let contract_id = env.register(ReputationContract, (admin.clone(), config.clone()));
+        (contract_id, admin, config)
+    }
+
+    #[test]
+    fn record_transaction_emits_three_topic_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, admin, _) = setup(&env);
+        let entity = Address::generate(&env);
+        let counterparty = Address::generate(&env);
+
+        env.invoke_contract::<()>(
+            &contract_id,
+            &Symbol::new(&env, "record_transaction"),
+            soroban_sdk::vec![
+                &env,
+                admin.to_val(),
+                1u64.into_val(&env),
+                entity.to_val(),
+                counterparty.to_val(),
+                100i128.into_val(&env),
+                TransactionOutcome::Released.into_val(&env),
+            ],
+        );
+
+        let events = env.events().all();
+        let mut found = false;
+        for (_, topics, _) in events.iter() {
+            if topics.len() == 3 {
+                let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+                let t1: Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+                let t2: u64 = topics.get(2).unwrap().try_into_val(&env).unwrap();
+                if t0 == symbol_short!("reput") && t1 == symbol_short!("tx_rec") {
+                    assert_eq!(t2, 1u64);
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "expected 3-topic tx_rec event");
+    }
+
+    #[test]
+    fn freeze_entity_emits_three_topic_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, admin, _) = setup(&env);
+        let entity = Address::generate(&env);
+
+        env.invoke_contract::<()>(
+            &contract_id,
+            &Symbol::new(&env, "freeze_entity"),
+            soroban_sdk::vec![&env, admin.to_val(), entity.to_val()],
+        );
+
+        let events = env.events().all();
+        let mut found = false;
+        for (_, topics, _) in events.iter() {
+            if topics.len() == 3 {
+                let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+                let t1: Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+                if t0 == symbol_short!("reput") && t1 == symbol_short!("frozen") {
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "expected 3-topic frozen event");
     }
 }

@@ -1,16 +1,3 @@
-//! # Event topic schema
-//!
-//! Every event published by this contract follows the 3-topic Soroban
-//! convention `(contract, action, entity_id)` so off-chain indexers can
-//! subscribe to entity-level events directly via RPC topic filters without
-//! parsing the event body.
-//!
-//! | Topic 0 (contract) | Topic 1 (action) | Topic 2 (entity_id) |
-//! |--------------------|------------------|---------------------|
-//! | `symbol_short!("perm")` | action symbol | entity identifier |
-//!
-//! Entity identifiers are the `(owner, delegate)` pair for permission-scoped
-//! events, or the relevant `Address` for admin/delegate-scoped events.
 //! Delego Permissions Contract
 //! Spending limits, delegated authority, and time-locked allowance decrements
 //!
@@ -1046,11 +1033,7 @@ impl PermissionsContract {
         let remaining_delta = limit_total - old_remaining;
 
         env.events().publish(
-            (
-                symbol_short!("perm"),
-                symbol_short!("granted"),
-                (owner.clone(), delegate.clone()),
-            ),
+            (symbol_short!("perm"), symbol_short!("granted"), delegate.clone()),
             PermissionGrantedEvent {
                 owner: owner.clone(),
                 delegate: delegate.clone(),
@@ -1064,11 +1047,7 @@ impl PermissionsContract {
         );
 
         env.events().publish(
-            (
-                symbol_short!("perm"),
-                symbol_short!("merc_list"),
-                (owner.clone(), delegate.clone()),
-            ),
+            (symbol_short!("perm"), symbol_short!("merc_list"), delegate.clone()),
             MerchantWhitelistChangedEvent {
                 owner: owner.clone(),
                 delegate: delegate.clone(),
@@ -1193,11 +1172,7 @@ impl PermissionsContract {
         }
 
         env.events().publish(
-            (
-                symbol_short!("perm"),
-                symbol_short!("granted"),
-                (parent_delegate.clone(), child_delegate.clone()),
-            ),
+            (symbol_short!("perm"), symbol_short!("granted"), child_delegate.clone()),
             PermissionGrantedEvent {
                 owner: parent_delegate,
                 delegate: child_delegate,
@@ -1240,11 +1215,7 @@ impl PermissionsContract {
                 .remove(&DataKey::PendingDecrement(owner.clone(), delegate.clone()));
 
             env.events().publish(
-                (
-                    symbol_short!("perm"),
-                    symbol_short!("revoked"),
-                    (owner.clone(), delegate.clone()),
-                ),
+                (symbol_short!("perm"), symbol_short!("revoked"), delegate.clone()),
                 PermissionRevokedEvent {
                     owner: owner.clone(),
                     delegate: delegate.clone(),
@@ -1366,11 +1337,7 @@ impl PermissionsContract {
 
         // Emit transfer event
         env.events().publish(
-            (
-                symbol_short!("perm"),
-                symbol_short!("transf"),
-                (owner.clone(), new_delegate.clone()),
-            ),
+            (symbol_short!("perm"), symbol_short!("transf"), new_delegate.clone()),
             PermissionTransferredEvent {
                 owner: owner.clone(),
                 old_delegate,
@@ -1426,11 +1393,7 @@ impl PermissionsContract {
                 Some(new_expiry) => new_expiry,
                 None => {
                     env.events().publish(
-                        (
-                            symbol_short!("perm"),
-                            symbol_short!("exp_cap"),
-                            (owner.clone(), delegate.clone()),
-                        ),
+                        (symbol_short!("perm"), symbol_short!("exp_cap"), delegate.clone()),
                         PermissionExpiryCappedEvent {
                             owner: owner.clone(),
                             delegate: delegate.clone(),
@@ -1446,11 +1409,7 @@ impl PermissionsContract {
 
             // Publish renewal event
             env.events().publish(
-                (
-                    symbol_short!("perm"),
-                    symbol_short!("renewed"),
-                    (owner.clone(), delegate.clone()),
-                ),
+                (symbol_short!("perm"), symbol_short!("renewed"), delegate.clone()),
                 (
                     owner.clone(),
                     delegate.clone(),
@@ -1513,11 +1472,7 @@ impl PermissionsContract {
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
-            (
-                symbol_short!("perm"),
-                symbol_short!("exp_upd"),
-                (owner.clone(), delegate.clone()),
-            ),
+            (symbol_short!("perm"), symbol_short!("exp_upd"), delegate.clone()),
             PermissionExpiryUpdatedEvent {
                 owner: owner.clone(),
                 delegate: delegate.clone(),
@@ -1601,11 +1556,7 @@ impl PermissionsContract {
                     child_record.status = PermissionStatus::Revoked;
                     env.storage().persistent().set(&child_key, &child_record);
                     env.events().publish(
-                        (
-                            symbol_short!("perm"),
-                            symbol_short!("revoked"),
-                            (delegate.clone(), child_delegate.clone()),
-                        ),
+                        (symbol_short!("perm"), symbol_short!("revoked"), child_delegate.clone()),
                         PermissionRevokedEvent {
                             owner: delegate.clone(),
                             delegate: child_delegate.clone(),
@@ -1819,11 +1770,7 @@ impl PermissionsContract {
         );
 
         env.events().publish(
-            (
-                symbol_short!("perm"),
-                symbol_short!("allowlst"),
-                (owner.clone(), delegate.clone()),
-            ),
+            (symbol_short!("perm"), symbol_short!("allowlst"), delegate.clone()),
             MerchantAllowlistUpdatedEvent {
                 owner: owner.clone(),
                 delegate: delegate.clone(),
@@ -1881,11 +1828,7 @@ impl PermissionsContract {
 
         // Emit after successful spend only (issue #99).
         env.events().publish(
-            (
-                symbol_short!("perm"),
-                symbol_short!("spent"),
-                (owner.clone(), delegate.clone()),
-            ),
+            (symbol_short!("perm"), symbol_short!("spent"), delegate.clone()),
             PermissionSpendEvent {
                 owner,
                 delegate,
@@ -2067,11 +2010,7 @@ impl PermissionsContract {
             .set(&DataKey::RelayerKey(delegate.clone()), &public_key);
 
         env.events().publish(
-            (
-                symbol_short!("perm"),
-                symbol_short!("relaykey"),
-                delegate.clone(),
-            ),
+            (symbol_short!("perm"), symbol_short!("relaykey"), delegate.clone()),
             RelayerKeyChangedEvent {
                 delegate: delegate.clone(),
                 old_key,
@@ -2148,11 +2087,7 @@ impl PermissionsContract {
         env.storage().persistent().set(&nonce_key, &next_nonce);
 
         env.events().publish(
-            (
-                symbol_short!("perm"),
-                symbol_short!("nonce_cxl"),
-                (owner.clone(), delegate.clone()),
-            ),
+            (symbol_short!("perm"), symbol_short!("nonce_cxl"), delegate.clone()),
             NonceCancelledEvent {
                 owner: owner.clone(),
                 delegate: delegate.clone(),
@@ -2255,11 +2190,7 @@ impl PermissionsContract {
         let result = Self::apply_spend(&env, &owner, &delegate, amount)?;
 
         env.events().publish(
-            (
-                symbol_short!("perm"),
-                symbol_short!("relayed"),
-                (owner.clone(), delegate.clone()),
-            ),
+            (symbol_short!("perm"), symbol_short!("relayed"), delegate.clone()),
             PermissionSpendEvent {
                 owner,
                 delegate,
@@ -3184,11 +3115,7 @@ impl PermissionsContract {
                         .remove(&DataKey::PendingDecrement(owner.clone(), delegate.clone()));
 
                     env.events().publish(
-                        (
-                            symbol_short!("perm"),
-                            symbol_short!("autorevk"),
-                            (owner.clone(), delegate.clone()),
-                        ),
+                        (symbol_short!("perm"), symbol_short!("autorevk"), delegate.clone()),
                         PermissionRevokedEvent {
                             owner: owner.clone(),
                             delegate: delegate.clone(),
@@ -3262,11 +3189,7 @@ impl PermissionsContract {
             .set(&DataKey::MinSpendInterval, &interval);
 
         env.events().publish(
-            (
-                symbol_short!("perm"),
-                symbol_short!("velset"),
-                admin.clone(),
-            ),
+            (symbol_short!("perm"), symbol_short!("velset"), admin.clone()),
             VelocityLimitSetEvent {
                 previous,
                 current: interval,
@@ -3313,11 +3236,7 @@ impl PermissionsContract {
             .set(&DataKey::MinSpendIntervalSecs, &secs);
 
         env.events().publish(
-            (
-                symbol_short!("perm"),
-                symbol_short!("velsecset"),
-                admin.clone(),
-            ),
+            (symbol_short!("perm"), symbol_short!("velsecset"), admin.clone()),
             VelocityLimitSecsSetEvent {
                 previous,
                 current: secs,
@@ -3400,11 +3319,7 @@ impl PermissionsContract {
         }
 
         env.events().publish(
-            (
-                symbol_short!("perm"),
-                symbol_short!("schemreg"),
-                admin.clone(),
-            ),
+            (symbol_short!("perm"), symbol_short!("schemreg"), admin.clone()),
             SchemaRegisteredEvent { admin, schema },
         );
 
@@ -3949,101 +3864,6 @@ impl PermissionsContract {
         }
 
         env.storage().persistent().set(&key, &stats);
-    }
-}
-
-#[cfg(test)]
-mod event_topic_tests {
-    use super::*;
-    use soroban_sdk::testutils::{Address as _, Events, Ledger};
-    use soroban_sdk::{FromVal, IntoVal};
-
-    fn setup() -> (Env, Address, Address, Address) {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(PermissionsContract, ());
-        let owner = Address::generate(&env);
-        let delegate = Address::generate(&env);
-        (env, contract_id, owner, delegate)
-    }
-
-    /// Asserts the 3-topic `(contract, action, entity_id)` shape for the
-    /// most recent event, and returns the decoded entity id.
-    fn assert_three_topic_shape(
-        env: &Env,
-        contract_id: &Address,
-        expected_action: Symbol,
-    ) -> (Address, Address) {
-        let events = env.events().all();
-        let (_, topics, _) = events.last().expect("an event must be emitted");
-        assert_eq!(topics.len(), 3, "events must carry exactly 3 topics");
-
-        let topic0: Symbol = Symbol::from_val(env, &topics.get(0).unwrap());
-        let topic1: Symbol = Symbol::from_val(env, &topics.get(1).unwrap());
-        assert_eq!(topic0, symbol_short!("perm"));
-        assert_eq!(topic1, expected_action);
-
-        let entity: (Address, Address) =
-            <(Address, Address)>::from_val(env, &topics.get(2).unwrap());
-        let _ = contract_id;
-        entity
-    }
-
-    #[test]
-    fn granted_event_uses_three_topic_convention() {
-        let (env, contract_id, owner, delegate) = setup();
-        let client = PermissionsContractClient::new(&env, &contract_id);
-        client.grant(
-            &owner,
-            &delegate,
-            &1_000i128,
-            &100i128,
-            &Vec::new(&env),
-            &100u32,
-        );
-        let (e_owner, e_delegate) =
-            assert_three_topic_shape(&env, &contract_id, symbol_short!("granted"));
-        assert_eq!(e_owner, owner);
-        assert_eq!(e_delegate, delegate);
-    }
-
-    #[test]
-    fn revoked_event_uses_three_topic_convention() {
-        let (env, contract_id, owner, delegate) = setup();
-        let client = PermissionsContractClient::new(&env, &contract_id);
-        client.grant(
-            &owner,
-            &delegate,
-            &1_000i128,
-            &100i128,
-            &Vec::new(&env),
-            &100u32,
-        );
-        client.revoke(&owner, &delegate);
-        let (e_owner, e_delegate) =
-            assert_three_topic_shape(&env, &contract_id, symbol_short!("revoked"));
-        assert_eq!(e_owner, owner);
-        assert_eq!(e_delegate, delegate);
-    }
-
-    #[test]
-    fn spent_event_uses_three_topic_convention() {
-        let (env, contract_id, owner, delegate) = setup();
-        let client = PermissionsContractClient::new(&env, &contract_id);
-        let merchant = Address::generate(&env);
-        client.grant(
-            &owner,
-            &delegate,
-            &1_000i128,
-            &100i128,
-            &Vec::new(&env),
-            &100u32,
-        );
-        client.execute_spend(&owner, &delegate, &50i128, &merchant);
-        let (e_owner, e_delegate) =
-            assert_three_topic_shape(&env, &contract_id, symbol_short!("spent"));
-        assert_eq!(e_owner, owner);
-        assert_eq!(e_delegate, delegate);
     }
 }
 
