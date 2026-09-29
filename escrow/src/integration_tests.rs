@@ -1,8 +1,8 @@
 #![cfg(test)]
 
 use crate::{
-    BatchDepositParams, BatchRefundParams, BatchReleaseParams, EscrowConfig, EscrowContract,
-    EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState, TreasuryShare,
+    AffiliateConfig, BatchDepositParams, BatchRefundParams, BatchReleaseParams, EscrowConfig,
+    EscrowContract, EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState, TreasuryShare,
     MAX_TREASURIES,
 };
 use soroban_sdk::{
@@ -2507,4 +2507,153 @@ fn test_split_release_multi_treasury() {
     assert_eq!(token_client.balance(&recipient2), 5700);
     assert_eq!(token_client.balance(&treasury1), 200);
     assert_eq!(token_client.balance(&treasury2), 300);
+}
+
+// ── Affiliate referral fee split tests ────────────────────────────────────
+
+fn deposit_escrow_with_affiliate(
+    t: &TestEnv,
+    amount: i128,
+    timeout_ledgers: u32,
+    affiliate: Option<AffiliateConfig>,
+) -> u64 {
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    escrow_client.deposit(
+        &t.buyer,
+        &t.seller,
+        &t.token_contract_id,
+        &amount,
+        &t.order_id(),
+        &timeout_ledgers,
+        &None,
+        &affiliate,
+    )
+}
+
+#[test]
+fn test_affiliate_three_way_split_on_release() {
+    let t = TestEnv::setup_with_fee_bps(500);
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    let referrer = Address::generate(&t.env);
+    let affiliate = AffiliateConfig {
+        referrer_address: referrer.clone(),
+        referral_share_bps: 2000, // 20% of platform fee
+        expires_at_ledger: t.env.ledger().sequence() + 1000,
+    };
+
+    let escrow_id = deposit_escrow_with_affiliate(&t, 10000, 100, Some(affiliate));
+
+    assert!(escrow_client.release(&escrow_id, &t.buyer, &t.seller));
+
+    // Platform fee = 10000 * 500 / 10000 = 500
+    // Referrer share = 500 * 2000 / 10000 = 100
+    // Platform keeps 400, seller receives 9500.
+    assert_eq!(token_client.balance(&t.seller), 9500);
+    assert_eq!(token_client.balance(&referrer), 100);
+    assert_eq!(token_client.balance(&t.escrow_contract_id), 0);
+}
+
+#[test]
+fn test_affiliate_split_with_multi_treasury() {
+    let t = TestEnv::setup_with_fee_bps(500);
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    let treasury1 = Address::generate(&t.env);
+    let treasury2 = Address::generate(&t.env);
+    let mut shares = soroban_sdk::Vec::new(&t.env);
+    shares.push_back(crate::TreasuryShare { treasury: treasury1.clone(), bps: 200 });
+    shares.push_back(crate::TreasuryShare { treasury: treasury2.clone(), bps: 300 });
+    assert!(escrow_client.set_fee_distribution(&t.admin, &shares));
+
+    let referrer = Address::generate(&t.env);
+    let affiliate = AffiliateConfig {
+        referrer_address: referrer.clone(),
+        referral_share_bps: 2000,
+        expires_at_ledger: t.env.ledger().sequence() + 1000,
+    };
+
+    let escrow_id = deposit_escrow_with_affiliate(&t, 10000, 100, Some(affiliate));
+    assert!(escrow_client.release(&escrow_id, &t.buyer, &t.seller));
+
+    // Total fee = 500. Referrer = 100. Remaining 400 split 40/60.
+    assert_eq!(token_client.balance(&t.seller), 9500);
+    assert_eq!(token_client.balance(&referrer), 100);
+    assert_eq!(token_client.balance(&treasury1), 160);
+    assert_eq!(token_client.balance(&treasury2), 240);
+    assert_eq!(token_client.balance(&t.escrow_contract_id), 0);
+}
+
+#[test]
+fn test_affiliate_expired_config_pays_no_referrer() {
+    let t = TestEnv::setup_with_fee_bps(500);
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    let referrer = Address::generate(&t.env);
+    let affiliate = AffiliateConfig {
+        referrer_address: referrer.clone(),
+        referral_share_bps: 2000,
+        expires_at_ledger: t.env.ledger().sequence() + 1,
+    };
+
+    let escrow_id = deposit_escrow_with_affiliate(&t, 10000, 100, Some(affiliate));
+
+    // Advance past the affiliate expiry before settling.
+    let record = escrow_client.get_escrow(&escrow_id);
+    t.env.ledger().set_sequence_number(record.timeout_ledger - 1);
+
+    assert!(escrow_client.release(&escrow_id, &t.admin, &t.seller));
+
+    // Expired affiliate: platform keeps the full fee.
+    assert_eq!(token_client.balance(&t.seller), 9500);
+    assert_eq!(token_client.balance(&referrer), 0);
+    assert_eq!(token_client.balance(&t.escrow_contract_id), 0);
+}
+
+#[test]
+fn test_affiliate_accounting_invariant_holds() {
+    let t = TestEnv::setup_with_fee_bps(500);
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    let referrer = Address::generate(&t.env);
+    let affiliate = AffiliateConfig {
+        referrer_address: referrer.clone(),
+        referral_share_bps: 2000,
+        expires_at_ledger: t.env.ledger().sequence() + 1000,
+    };
+
+    let amount = 10000i128;
+    let escrow_id = deposit_escrow_with_affiliate(&t, amount, 100, Some(affiliate));
+    assert!(escrow_client.release(&escrow_id, &t.buyer, &t.seller));
+
+    // Conservation: seller + referrer + treasury == amount.
+    let seller_bal = token_client.balance(&t.seller);
+    let referrer_bal = token_client.balance(&referrer);
+    let treasury_bal = token_client.balance(&t.treasury_addr());
+    assert_eq!(seller_bal + referrer_bal + treasury_bal, amount);
+    assert_eq!(token_client.balance(&t.escrow_contract_id), 0);
+}
+
+#[test]
+fn test_affiliate_zero_share_bps_pays_no_referrer() {
+    let t = TestEnv::setup_with_fee_bps(500);
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    let referrer = Address::generate(&t.env);
+    let affiliate = AffiliateConfig {
+        referrer_address: referrer.clone(),
+        referral_share_bps: 0,
+        expires_at_ledger: t.env.ledger().sequence() + 1000,
+    };
+
+    let escrow_id = deposit_escrow_with_affiliate(&t, 10000, 100, Some(affiliate));
+    assert!(escrow_client.release(&escrow_id, &t.buyer, &t.seller));
+
+    assert_eq!(token_client.balance(&t.seller), 9500);
+    assert_eq!(token_client.balance(&referrer), 0);
 }
