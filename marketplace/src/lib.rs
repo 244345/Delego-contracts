@@ -2593,7 +2593,7 @@ mod overflow_tests {
             required_verifications: 1,
         };
 
-        let merchant_id = client.register_merchant(&owner, ¶ms).unwrap();
+        let merchant_id = client.register_merchant(&owner, &params).unwrap();
 
         env.as_contract(&contract_id, || {
             env.storage()
@@ -2618,12 +2618,19 @@ mod overflow_tests {
     #[test]
     fn verification_count_overflow_error_payload() {
         assert_eq!(MarketplaceError::VerificationCountOverflow as u32, 16);
+    }
+}
+
+#[cfg(test)]
 mod error_code_uniqueness_tests {
+    use super::*;
+
     const PERMISSION_ERROR_RANGE: (u32, u32) = (1, 999);
     const ESCROW_ERROR_RANGE: (u32, u32) = (1000, 1999);
     const REPUTATION_ERROR_RANGE: (u32, u32) = (2000, 2999);
     const DELEGATION_ERROR_RANGE: (u32, u32) = (3000, 3999);
     const MARKETPLACE_ERROR_RANGE: (u32, u32) = (4000, 4999);
+
     fn marketplace_error_codes() -> [u32; 19] {
         [
             MarketplaceError::AlreadyInitialized as u32,
@@ -2646,6 +2653,9 @@ mod error_code_uniqueness_tests {
             MarketplaceError::DuplicateMerchantOwner as u32,
             MarketplaceError::MerchantBanned as u32,
         ]
+    }
+
+    #[test]
     fn marketplace_error_codes_are_unique() {
         let codes = marketplace_error_codes();
         for (i, code) in codes.iter().enumerate() {
@@ -2657,6 +2667,9 @@ mod error_code_uniqueness_tests {
                 );
             }
         }
+    }
+
+    #[test]
     fn marketplace_error_codes_are_in_allocated_range() {
         for code in marketplace_error_codes() {
             assert!(
@@ -2664,6 +2677,10 @@ mod error_code_uniqueness_tests {
                 "MarketplaceError code {} outside allocated range",
                 code
             );
+        }
+    }
+
+    #[test]
     fn marketplace_error_codes_do_not_collide_with_other_contracts() {
         let other_ranges = [
             PERMISSION_ERROR_RANGE,
@@ -2671,12 +2688,17 @@ mod error_code_uniqueness_tests {
             REPUTATION_ERROR_RANGE,
             DELEGATION_ERROR_RANGE,
         ];
+        for code in marketplace_error_codes() {
             for &(start, end) in &other_ranges {
+                assert!(
                     !(start..=end).contains(&code),
                     "MarketplaceError code {} collides with reserved range {}-{}",
                     code,
                     start,
                     end
+                );
+            }
+        }
     }
 }
 

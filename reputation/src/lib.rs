@@ -7,7 +7,6 @@
 // enabled during testing so dev-dependencies and test assertions operate normally.
 // This exact conditional form must be consistent across all workspace contract crates.
 #![cfg_attr(not(test), no_std)]
-#![no_std]
 #![warn(missing_docs)]
 // Several entry points mirror escrow/permissions call shapes and exceed
 // clippy's default 7-argument limit; restructuring them would break the
@@ -266,6 +265,15 @@ pub struct EntityHistoryPrunedEvent {
     pub entity: Address,
     pub pruned_count: u32,
     pub pruned_by: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReputationScoreUpdatedEvent {
+    pub entity: Address,
+    pub old_score_bps: u32,
+    pub new_score_bps: u32,
+    pub total_reviews: u64,
 }
 
 #[contracttype]
@@ -1472,6 +1480,7 @@ impl ReputationContract {
     /// and [`Self::apply_outcome_change_counts`] — so they are left as-is here.
     fn recompute_score(env: &Env, entity: &Address) -> Result<ReputationScore, ReputationError> {
         let mut rep = Self::load_or_default_reputation(env, entity);
+        let old_score_bps = rep.score;
         let (decomposition, avg_rating, now, accumulator) =
             Self::compute_score_components(env, entity, rep.total_transactions)?;
         rep.score = decomposition.final_score;
@@ -1498,6 +1507,19 @@ impl ReputationContract {
         env.events().publish(
             (symbol_short!("reput"), symbol_short!("score_dec")),
             decomposition,
+        );
+        env.events().publish(
+            (
+                symbol_short!("reput"),
+                symbol_short!("updated"),
+                entity.clone(),
+            ),
+            ReputationScoreUpdatedEvent {
+                entity: entity.clone(),
+                old_score_bps,
+                new_score_bps: rep.score,
+                total_reviews: rep.total_transactions,
+            },
         );
         Ok(rep)
     }
