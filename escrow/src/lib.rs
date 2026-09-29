@@ -268,6 +268,23 @@ pub struct EscrowRefundedEvent {
     pub refunded_by: Address,
 }
 
+/// Emitted when a buyer reclaims escrowed funds immediately because the
+/// seller has been banned by marketplace governance (fraud restitution).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EscrowFraudRestitutionRefundedEvent {
+    /// Unique identifier for the escrow.
+    pub escrow_id: u64,
+    /// Buyer receiving the refund.
+    pub buyer: Address,
+    /// Banned seller whose escrow is being unwound.
+    pub seller: Address,
+    /// Amount refunded to the buyer.
+    pub amount: i128,
+    /// Marketplace contract that reported the ban.
+    pub marketplace_contract: Address,
+}
+
 /// Emitted when a release condition is attached to an escrow.
 #[contracttype]
 #[derive(Clone, Debug)]

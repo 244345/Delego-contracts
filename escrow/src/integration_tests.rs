@@ -5,6 +5,47 @@ use crate::{
     EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState, TreasuryShare,
     MAX_TREASURIES,
 };
+
+#[test]
+fn test_claim_fraud_restitution_for_banned_merchant() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+
+    assert_eq!(token_client.balance(&t.buyer), 9000);
+    assert_eq!(token_client.balance(&t.escrow_contract_id), 1000);
+
+    let marketplace_contract = Address::generate(&t.env);
+    let refunded = escrow_client.claim_fraud_restitution(&escrow_id, &marketplace_contract);
+    assert_eq!(refunded, 1000);
+
+    assert_eq!(token_client.balance(&t.buyer), 10000);
+    assert_eq!(token_client.balance(&t.escrow_contract_id), 0);
+
+    let record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(record.status, EscrowStatus::Refunded);
+}
+
+#[test]
+fn test_claim_fraud_restitution_rejects_honest_merchant() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+
+    let marketplace_contract = Address::generate(&t.env);
+    assert_eq!(
+        escrow_client.try_claim_fraud_restitution(&escrow_id, &marketplace_contract),
+        Err(Ok(EscrowError::MerchantNotBanned))
+    );
+
+    assert_eq!(
+        escrow_client.get_escrow(&escrow_id).status,
+        EscrowStatus::Funded
+    );
+}
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
