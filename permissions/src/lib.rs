@@ -1363,7 +1363,7 @@ impl PermissionsContract {
             &env,
             &delegate,
             &delegate.clone(),
-            delegate,
+            delegate.clone(),
             symbol_short!("relaykey"),
         );
 
@@ -1931,7 +1931,7 @@ impl PermissionsContract {
             &DataKey::PauseMetadata(owner.clone(), delegate.clone()),
             &PauseMetadata {
                 paused_by: owner.clone(),
-                reason_code,
+                reason_code: reason_code.clone(),
                 paused_at_ledger: env.ledger().sequence(),
             },
         );
