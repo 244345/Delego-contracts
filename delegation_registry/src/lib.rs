@@ -308,52 +308,52 @@ pub enum DataKey {
 /// # Error code allocation
 ///
 /// Error codes are surfaced over bridges and must be unique across contracts.
-/// The following ranges are allocated protocol-wide and must not overlap:
-/// | Contract | Reserved codes |
-/// | --- | --- |
-/// | `EscrowError` | 1..=100 |
-/// | `PermissionError` | 101..=200 |
-/// | `ReputationError` | 201..=300 |
-/// | `DelegationError` | 301..=400 |
-/// | `MarketplaceError` | 401..=500 |
-/// `DelegationError` currently occupies codes 301..=315.
-/// New variants must use the next unused code within 301..=400.
+/// The following ranges are allocated protocol-wide and must not overlap (issue #269):
+/// | Contract            | Reserved codes  |
+/// | ------------------- | --------------- |
+/// | `EscrowError`       | 1_000..=1_999   |
+/// | `PermissionError`   | 2_000..=2_999   |
+/// | `ReputationError`   | 3_000..=3_999   |
+/// | `DelegationError`   | 4_000..=4_999   |
+/// | `MarketplaceError`  | 5_000..=5_999   |
+/// `DelegationError` currently occupies codes 4_001..=4_016.
+/// New variants must use the next unused code within 4_000..=4_999.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum DelegationError {
     /// The delegation was not found.
-    NotFound = 301,
+    NotFound = 4001,
     /// The delegation is not active.
-    NotActive = 302,
+    NotActive = 4002,
     /// The delegation is not paused.
-    NotPaused = 303,
+    NotPaused = 4003,
     /// The delegation has expired.
-    Expired = 304,
+    Expired = 4004,
     /// The registry has already been initialized.
-    AlreadyInitialized = 305,
+    AlreadyInitialized = 4005,
     /// The provided version is invalid.
-    InvalidVersion = 306,
+    InvalidVersion = 4006,
     /// The target version is not lower than the current version.
-    VersionNotLower = 307,
+    VersionNotLower = 4007,
     /// The requested snapshot was not found.
-    SnapshotNotFound = 308,
+    SnapshotNotFound = 4008,
     /// The provided agent id is invalid.
-    InvalidAgentId = 309,
+    InvalidAgentId = 4009,
     /// No more delegation ids are available.
-    IdExhausted = 310,
+    IdExhausted = 4010,
     /// No admin transfer has been proposed.
-    NoPendingAdmin = 311,
+    NoPendingAdmin = 4011,
     /// The registry has not been initialized yet.
-    NotInitialized = 312,
+    NotInitialized = 4012,
     /// The provided TTL is invalid (must be greater than 0).
-    InvalidTtl = 313,
+    InvalidTtl = 4013,
     /// The caller is not authorized to perform admin operations.
-    NotAuthorized = 314,
+    NotAuthorized = 4014,
     /// The supplied permission flag is not a single known capability bit.
-    InvalidPermissionFlag = 315,
+    InvalidPermissionFlag = 4015,
     /// The sweep batch is empty or exceeds the maximum supported size.
-    InvalidBatchSize = 316,
+    InvalidBatchSize = 4016,
 }
 
 /// The delegation registry contract.
@@ -1502,21 +1502,22 @@ mod error_code_uniqueness_tests {
     #[test]
     fn delegation_error_codes_are_unique_and_allocated() {
         let codes = [
-            (DelegationError::NotFound, 301u32),
-            (DelegationError::NotActive, 302u32),
-            (DelegationError::NotPaused, 303u32),
-            (DelegationError::Expired, 304u32),
-            (DelegationError::AlreadyInitialized, 305u32),
-            (DelegationError::InvalidVersion, 306u32),
-            (DelegationError::VersionNotLower, 307u32),
-            (DelegationError::SnapshotNotFound, 308u32),
-            (DelegationError::InvalidAgentId, 309u32),
-            (DelegationError::IdExhausted, 310u32),
-            (DelegationError::NoPendingAdmin, 311u32),
-            (DelegationError::NotInitialized, 312u32),
-            (DelegationError::InvalidTtl, 313u32),
-            (DelegationError::NotAuthorized, 314u32),
-            (DelegationError::InvalidPermissionFlag, 315u32),
+            (DelegationError::NotFound, 4001u32),
+            (DelegationError::NotActive, 4002u32),
+            (DelegationError::NotPaused, 4003u32),
+            (DelegationError::Expired, 4004u32),
+            (DelegationError::AlreadyInitialized, 4005u32),
+            (DelegationError::InvalidVersion, 4006u32),
+            (DelegationError::VersionNotLower, 4007u32),
+            (DelegationError::SnapshotNotFound, 4008u32),
+            (DelegationError::InvalidAgentId, 4009u32),
+            (DelegationError::IdExhausted, 4010u32),
+            (DelegationError::NoPendingAdmin, 4011u32),
+            (DelegationError::NotInitialized, 4012u32),
+            (DelegationError::InvalidTtl, 4013u32),
+            (DelegationError::NotAuthorized, 4014u32),
+            (DelegationError::InvalidPermissionFlag, 4015u32),
+            (DelegationError::InvalidBatchSize, 4016u32),
         ];
 
         for (variant, expected) in codes {
@@ -1539,6 +1540,7 @@ mod error_code_uniqueness_tests {
             DelegationError::InvalidTtl as u32,
             DelegationError::NotAuthorized as u32,
             DelegationError::InvalidPermissionFlag as u32,
+            DelegationError::InvalidBatchSize as u32,
         ];
         seen.sort_unstable();
         for pair in seen.windows(2) {
@@ -1546,7 +1548,7 @@ mod error_code_uniqueness_tests {
         }
         for code in seen {
             assert!(
-                (301..=400).contains(&code),
+                (4000..=4999).contains(&code),
                 "DelegationError code {code} is outside the reserved range"
             );
         }

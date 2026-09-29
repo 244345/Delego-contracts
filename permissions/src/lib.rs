@@ -183,7 +183,7 @@ mod error_code_tests {
 
     #[test]
     fn permission_error_codes_are_unique_and_in_reserved_range() {
-        assert_eq!(PERMISSION_ERROR_CODES.len(), 29);
+        assert_eq!(PERMISSION_ERROR_CODES.len(), 30);
 
         let permission_range = ERROR_CODE_RANGES
             .iter()
@@ -974,7 +974,6 @@ impl PermissionsContract {
             _ => {}
         }
 
-        let expires_at_ledger = env.ledger().sequence() + ttl_ledgers;
         let expires_at_ledger = Self::grant_expiry_ledger(&env, ttl_ledgers)?;
 
         let user_perms_key = DataKey::UserPermissions(owner.clone());
@@ -2621,7 +2620,6 @@ impl PermissionsContract {
             return Err(PermissionError::LimitBelowSpent);
         }
 
-        let execution_time = env.ledger().timestamp() + 86400;
         let execution_time = env.ledger().timestamp() + Self::get_decrease_timelock_secs(env.clone());
 
         let pending = PendingAllowanceDecrement {

@@ -746,35 +746,38 @@ fn test_multi_owner_spend_enforces_quorum() {
 
 /// Cross-contract error-code allocation.
 ///
-/// The bridge-facing error space is a single numeric `u32` code space. To make
-/// numeric codes unambiguous, every code belongs to at most one contract's
-/// error enum.
+/// The bridge-facing error space is a single numeric `u32` code space. Each
+/// contract owns a disjoint numeric range:
 ///
-/// | Contract      | Error enum          |
-/// |---------------|---------------------|
-/// | Escrow        | `EscrowError`       |
-/// | Permissions   | `PermissionError`   |
-/// | Reputation    | `ReputationError`   |
-/// | Delegation    | `DelegationError`   |
-/// | Marketplace   | `MarketplaceError`  |
+/// | Contract      | Error enum          | Range          |
+/// |---------------|---------------------|----------------|
+/// | Escrow        | `EscrowError`       | 1_000..=1_999  |
+/// | Permissions   | `PermissionError`   | 2_000..=2_999  |
+/// | Reputation    | `ReputationError`   | 3_000..=3_999  |
+/// | Delegation    | `DelegationError`   | 4_000..=4_999  |
+/// | Marketplace   | `MarketplaceError`  | 5_000..=5_999  |
 ///
-/// The test below verifies this uniqueness property for all codes accepted by
-/// each contract's `TryFrom<InvokeError>` implementation.
+/// The tests below verify: (1) each contract's codes fall strictly within its
+/// allocated range, and (2) no code appears in more than one contract's enum.
 fn collect_error_codes<T>() -> std::vec::Vec<u32>
 where
     T: TryFrom<InvokeError>,
 {
-    // Scan wide enough to cover all current error code allocations:
-    // - EscrowError:      1..=999        (legacy)
-    // - PermissionError:  1_000..=2_999
-    // - ReputationError:  0x0003_0001..=0x0003_FFFF  (~196K)
-    // - DelegationError:  3_000..=3_999
-    // - MarketplaceError: 4_000..=4_999
-    // We scan to 0x000F_FFFF (1_048_575) to cover all current and near-future allocations.
-    (0..=0x000F_FFFFu32)
+    // Scan the full allocated space: 1_000..=5_999 covers all five contracts.
+    // We also include 0..=999 for any legacy codes still present.
+    (0..=9_999u32)
         .filter(|&code| T::try_from(InvokeError::Contract(code)).is_ok())
         .collect()
 }
+
+/// Canonical disjoint ranges per contract (issue #269).
+const ERROR_CODE_RANGES: &[(&str, u32, u32)] = &[
+    ("escrow",          1, 1_999),
+    ("permissions", 2_000, 2_999),
+    ("reputation",  3_000, 3_999),
+    ("delegation",  4_000, 4_999),
+    ("marketplace", 5_000, 5_999),
+];
 
 #[test]
 fn test_error_codes_are_unique_across_contracts() {
@@ -787,16 +790,56 @@ fn test_error_codes_are_unique_across_contracts() {
     ];
 
     let mut seen = std::collections::BTreeSet::new();
-    for (contract_name, codes) in error_codes {
+    for (contract_name, codes) in &error_codes {
         assert!(
             !codes.is_empty(),
             "{contract_name} must expose at least one error code"
         );
-        for code in codes {
+        for &code in codes {
             assert!(
                 seen.insert(code),
-                "error code {code} is shared with another contract"
+                "error code {code} is shared between contracts (found duplicate in {contract_name})"
             );
         }
+    }
+}
+
+#[test]
+fn test_error_codes_are_in_allocated_ranges() {
+    // Each contract's codes must fall strictly within its assigned range.
+    let contract_codes: &[(&str, std::vec::Vec<u32>, u32, u32)] = &[
+        ("escrow",      collect_error_codes::<EscrowError>(),          1, 1_999),
+        ("permissions", collect_error_codes::<PermissionError>(),  2_000, 2_999),
+        ("reputation",  collect_error_codes::<ReputationError>(),  3_000, 3_999),
+        ("delegation",  collect_error_codes::<DelegationError>(),  4_000, 4_999),
+        ("marketplace", collect_error_codes::<MarketplaceError>(), 5_000, 5_999),
+    ];
+
+    for (name, codes, lo, hi) in contract_codes {
+        assert!(
+            !codes.is_empty(),
+            "{name} must expose at least one error code"
+        );
+        for &code in codes {
+            assert!(
+                (*lo..=*hi).contains(&code),
+                "{name} error code {code} is outside its allocated range {lo}..={hi}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_error_code_ranges_are_pairwise_disjoint() {
+    // Verify the ALLOCATED ranges themselves do not overlap.
+    let mut sorted = ERROR_CODE_RANGES.to_vec();
+    sorted.sort_by_key(|&(_, lo, _)| lo);
+    for pair in sorted.windows(2) {
+        let (name_a, _lo_a, hi_a) = pair[0];
+        let (name_b, lo_b, _hi_b) = pair[1];
+        assert!(
+            hi_a < lo_b,
+            "error ranges overlap: {name_a} ends at {hi_a}, but {name_b} starts at {lo_b}"
+        );
     }
 }

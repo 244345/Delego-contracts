@@ -7,7 +7,6 @@
 // enabled during testing so dev-dependencies and test assertions operate normally.
 // This exact conditional form must be consistent across all workspace contract crates.
 #![cfg_attr(not(test), no_std)]
-#![no_std]
 #![warn(missing_docs)]
 // Several entry points mirror escrow/permissions call shapes and exceed
 // clippy's default 7-argument limit; restructuring them would break the
@@ -116,22 +115,17 @@ pub struct ContractVersion {
 
 /// # Cross-contract error-code allocation
 ///
-/// Soroban error codes surface as raw `u32` values over a bridge, so each
-/// contract must keep its numeric error space disjoint. Every contract error
-/// enum uses a 16-bit contract prefix plus a contract-local code:
+/// Soroban error codes surface as raw `u32` values over a bridge. Each contract
+/// owns a disjoint contiguous numeric range (issue #269):
 ///
-/// | Contract | Error enum | Base |
-/// |----------|------------|------------|
-/// | escrow | `EscrowError` | `0x0001_0000` |
-/// | permissions | `PermissionError` | `0x0002_0000` |
-/// | reputation | `ReputationError` | `0x0003_0000` |
-/// | delegation_registry | `DelegationError` | `0x0004_0000` |
-/// | marketplace | `MarketplaceError` | `0x0005_0000` |
+/// | Contract            | Error enum          | Range         |
+/// |---------------------|---------------------|---------------|
+/// | escrow              | `EscrowError`       | 1_000..=1_999 |
+/// | permissions         | `PermissionError`   | 2_000..=2_999 |
+/// | reputation          | `ReputationError`   | 3_000..=3_999 |
+/// | delegation_registry | `DelegationError`   | 4_000..=4_999 |
+/// | marketplace         | `MarketplaceError`  | 5_000..=5_999 |
 ///
-/// A numeric code is `base + local_code`; the high 16 bits identify the
-/// originating contract and the low 16 bits identify the variant inside that
-/// contract. Keep this table in sync with the contract sources and keep the
-/// allocation tests green.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -141,43 +135,30 @@ pub enum ReputationError {
     /// `__constructor` (see [`ReputationContract::__constructor`]), which
     /// the host guarantees can run at most once, atomically with
     /// deployment — there is no second call for this to guard against.
-    AlreadyInitialized = 0x0003_0001,
-    NotInitialized = 0x0003_0002,
-    Unauthorized = 0x0003_0003,
-    EntityNotFound = 0x0003_0004,
+    AlreadyInitialized = 3001,
+    NotInitialized = 3002,
+    Unauthorized = 3003,
+    EntityNotFound = 3004,
     /// Same escrow_id already rated.
-    DuplicateRating = 0x0003_0005,
+    DuplicateRating = 3005,
     /// Rating out of range.
-    InvalidRating = 0x0003_0006,
-    EntityFrozen = 0x0003_0007,
+    InvalidRating = 3006,
+    EntityFrozen = 3007,
     /// Same reporter already flagged.
-    AlreadyFlagged = 0x0003_0008,
+    AlreadyFlagged = 3008,
     /// Invalid input parameter.
-    InvalidParam = 0x0003_0009,
+    InvalidParam = 3009,
     /// No active (unresolved) flag from reporter.
-    NoActiveFlag = 0x0003_000A,
+    NoActiveFlag = 3010,
     /// Reporter did not flag the entity.
-    NotFlagReporter = 0x0003_000B,
+    NotFlagReporter = 3011,
 }
 
 #[cfg(test)]
 mod error_code_allocation {
     use super::*;
-    const CONTRACT_SPACES: &[(&str, u32)] = &[
-        ("EscrowError", 0x0001_0000),
-        ("PermissionError", 0x0002_0000),
-        ("ReputationError", 0x0003_0000),
-        ("DelegationError", 0x0004_0000),
-        ("MarketplaceError", 0x0005_0000),
-    ];
-    #[test]
-    fn contract_spaces_are_disjoint() {
-        for (i, &(_, base_a)) in CONTRACT_SPACES.iter().enumerate() {
-            for &(_, base_b) in CONTRACT_SPACES.iter().skip(i + 1) {
-                assert_ne!(base_a, base_b, "contract error-code spaces must be disjoint");
-            }
-        }
-    }
+    // Canonical flat ranges (issue #269).
+    const REPUTATION_RANGE: (u32, u32) = (3_000, 3_999);
     #[test]
     fn reputation_error_codes_are_unique_and_in_allocated_space() {
         let mut codes = [
@@ -195,8 +176,10 @@ mod error_code_allocation {
         ];
         for code in codes {
             assert!(
-                (0x0003_0001..=0x0003_ffff).contains(&code),
-                "ReputationError code {code:#x} escaped its allocated contract space"
+                (REPUTATION_RANGE.0..=REPUTATION_RANGE.1).contains(&code),
+                "ReputationError code {code} escaped its allocated range {}..={}",
+                REPUTATION_RANGE.0,
+                REPUTATION_RANGE.1
             );
         }
         codes.sort_unstable();
@@ -793,6 +776,11 @@ impl ReputationContract {
             resolved: false,
         });
         env.storage().persistent().set(&key, &flags);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         let active_count = flags.iter().filter(|f| !f.resolved).count() as u32;
 
