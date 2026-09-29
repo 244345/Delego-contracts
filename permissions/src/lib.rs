@@ -134,6 +134,13 @@ pub enum PermissionError {
     /// Nonce cancellation targets a nonce that was already consumed or
     /// would overflow the nonce counter (issue #297)
     NonceAlreadyUsed = 2413,
+    /// Merchant has not yet acquired the attestations required by the
+    /// currently active verification policy, and the grace period for
+    /// pre-existing merchants has elapsed.
+    VerificationPolicyNotMet = 2414,
+    /// Revalidation was attempted before the grace period for a policy
+    /// transition has elapsed.
+    GracePeriodActive = 2415,
 }
 
 #[cfg(test)]
@@ -179,11 +186,13 @@ mod error_code_tests {
         PermissionError::InvalidExpiry as u32,
         PermissionError::NotInitialized as u32,
         PermissionError::NonceAlreadyUsed as u32,
+        PermissionError::VerificationPolicyNotMet as u32,
+        PermissionError::GracePeriodActive as u32,
     ];
 
     #[test]
     fn permission_error_codes_are_unique_and_in_reserved_range() {
-        assert_eq!(PERMISSION_ERROR_CODES.len(), 29);
+        assert_eq!(PERMISSION_ERROR_CODES.len(), 31);
 
         let permission_range = ERROR_CODE_RANGES
             .iter()
@@ -782,6 +791,53 @@ pub struct ChildPermission {
     pub created_at: u64,
 }
 
+/// Verification policy governing how many attestations a merchant must hold
+/// before it is considered verified (issue: handle verification policy
+/// threshold increases for pre-existing merchants).
+///
+/// `required` is the minimum number of attestations a merchant must have
+/// accumulated. `grace_period_secs` is the window granted to merchants that
+/// were already verified under a previous, lower threshold so they can
+/// acquire the additional attestations before their status is downgraded.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub struct VerificationPolicy {
+    pub required: u32,
+    pub grace_period_secs: u64,
+}
+
+/// Per-merchant verification state. Verification is *derived* from the
+/// current policy and the merchant's attestation count rather than stored
+/// as a static boolean, so a policy threshold increase automatically
+/// applies to pre-existing merchants.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub struct MerchantVerification {
+    pub merchant_id: u64,
+    pub attestations: u32,
+    /// Ledger timestamp at which the merchant first became verified under
+    /// the policy that was active at that time. Used to anchor the grace
+    /// period when the policy threshold later increases.
+    pub verified_since: u64,
+    /// Policy threshold in force when `verified_since` was recorded.
+    pub verified_under_required: u32,
+}
+
+/// Emitted when a merchant's verification status is re-evaluated against
+/// the current policy.
+#[contracttype]
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct MerchantRevalidatedEvent {
+    pub merchant_id: u64,
+    pub verified: bool,
+    pub attestations: u32,
+    pub required: u32,
+    pub grace_period_ends_at: u64,
+}
+
 #[contracttype]
 pub enum DataKey {
     Permission(Address, Address),
@@ -830,6 +886,12 @@ pub enum DataKey {
     UserPermissions(Address),
     /// Seller-specific allowlist for a sensitive (owner, delegate) delegation.
     MerchantAllowlist(Address, Address),
+    /// Instance-level active verification policy.
+    VerificationPolicy,
+    /// Per-merchant verification state (attestation count and verification anchor).
+    MerchantVerification(u64),
+    /// Ledger timestamp at which the current verification policy took effect.
+    VerificationPolicyEffectiveAt,
 }
 
 #[contract]

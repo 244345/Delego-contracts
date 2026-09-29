@@ -3044,4 +3044,109 @@ mod test {
         let result = client.try_decrease_allowance(&owner, &delegate, &-100);
         assert!(result.is_err());
     }
+
+    // --- Verification policy threshold increase tests ---
+
+    #[test]
+    fn test_recheck_merchant_verification_meets_policy() {
+        let env = Env::default();
+        let policy = crate::VerificationPolicy { required: 1 };
+        assert!(crate::recheck_merchant_verification(&env, 1, &policy));
+    }
+
+    #[test]
+    fn test_revalidate_merchant_status_grants_grace_period() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let merchant_id = 42u64;
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        client.set_admin(&admin);
+
+        // Merchant verified under old policy (1 verification).
+        client.set_merchant_verifications(&admin, &merchant_id, &1);
+
+        // Governance raises the required verifications to 2.
+        client.set_verification_policy(&admin, &crate::VerificationPolicy { required: 2 });
+
+        // Revalidation should mark the merchant as pending (grace period),
+        // not immediately unverified.
+        let status = client.revalidate_merchant_status(&merchant_id);
+        assert_eq!(status, crate::MerchantVerificationStatus::Pending);
+
+        // Advance past the 30-day grace period.
+        env.ledger().with_mut(|li| {
+            li.timestamp += 30 * 24 * 60 * 60 + 1;
+        });
+
+        // Now the merchant should transition to unverified.
+        let status_after = client.revalidate_merchant_status(&merchant_id);
+        assert_eq!(status_after, crate::MerchantVerificationStatus::Unverified);
+    }
+
+    #[test]
+    fn test_revalidate_merchant_status_verified_when_meets_policy() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let merchant_id = 7u64;
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        client.set_admin(&admin);
+        client.set_merchant_verifications(&admin, &merchant_id, &2);
+        client.set_verification_policy(&admin, &crate::VerificationPolicy { required: 2 });
+
+        let status = client.revalidate_merchant_status(&merchant_id);
+        assert_eq!(status, crate::MerchantVerificationStatus::Verified);
+    }
+
+    #[test]
+    fn test_revalidate_merchant_status_grace_period_boundary() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let merchant_id = 99u64;
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        client.set_admin(&admin);
+        client.set_merchant_verifications(&admin, &merchant_id, &1);
+        client.set_verification_policy(&admin, &crate::VerificationPolicy { required: 2 });
+
+        // Exactly at the grace period boundary — still pending.
+        env.ledger().with_mut(|li| {
+            li.timestamp += 30 * 24 * 60 * 60;
+        });
+        let status = client.revalidate_merchant_status(&merchant_id);
+        assert_eq!(status, crate::MerchantVerificationStatus::Pending);
+
+        // One second past the boundary — unverified.
+        env.ledger().with_mut(|li| {
+            li.timestamp += 1;
+        });
+        let status_after = client.revalidate_merchant_status(&merchant_id);
+        assert_eq!(status_after, crate::MerchantVerificationStatus::Unverified);
+    }
+
+    #[test]
+    fn test_revalidate_merchant_status_unknown_merchant() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        client.set_admin(&admin);
+        client.set_verification_policy(&admin, &crate::VerificationPolicy { required: 1 });
+
+        let status = client.revalidate_merchant_status(&12345u64);
+        assert_eq!(status, crate::MerchantVerificationStatus::Unverified);
+    }
 }
