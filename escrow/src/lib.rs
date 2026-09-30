@@ -176,6 +176,11 @@ pub struct EscrowRecord {
     pub updated_at: u64,
     /// Ledger sequence at which the escrow can be refunded or disputed.
     pub timeout_ledger: u32,
+    /// Token id of the NFT proof-of-purchase receipt minted for the buyer
+    /// upon release, if any (issue #320). `None` until a full release
+    /// successfully mints one (or when no receipt minter is configured, or
+    /// minting failed — minting failures never block fund settlement).
+    pub receipt_token_id: Option<u64>,
 }
 
 /// Token-unit threshold above which escrow releases require finance approval.
@@ -697,6 +702,34 @@ pub struct EscrowMetadata {
     pub schema: Symbol,
 }
 
+/// Payload passed to the external receipt-minting contract on full release
+/// (issue #320), matching the schema requested for the NFT proof-of-purchase
+/// receipt.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PurchaseReceiptData {
+    pub order_id: BytesN<32>,
+    pub buyer: Address,
+    pub seller: Address,
+    pub amount: i128,
+    pub completed_at: u64,
+    /// Item SKU for the purchase. This contract does not otherwise track a
+    /// SKU per escrow, so this is populated from the escrow's registered
+    /// metadata schema symbol (`EscrowMetadataSchema`) when one was set at
+    /// creation, or a generic placeholder symbol when it was not.
+    pub item_sku: Symbol,
+}
+
+/// Emitted when a purchase receipt is successfully minted for a fully
+/// released escrow (issue #320).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PurchaseReceiptMintedEvent {
+    pub escrow_id: u64,
+    pub token_id: u64,
+    pub buyer: Address,
+}
+
 /// Maps an escrow to its held token.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -990,6 +1023,10 @@ pub enum DataKey {
     OraclePublicKey,
     /// Marketplace contract used to check whether escrow sellers may trade.
     MerchantRegistry,
+    /// External contract invoked to mint an NFT proof-of-purchase receipt
+    /// on full release (issue #320). Optional — when unset, release
+    /// settlement proceeds exactly as before with no minting attempted.
+    ReceiptMinterContract,
     /// Authorized merchant categories for spend validation (MCC codes).
     AuthorizedCategories,
     /// Admin flag: when `true`, buyer-originated releases on the escrow must
@@ -2101,6 +2138,7 @@ impl EscrowContract {
                 &payout.seller_net,
             );
             record.status = EscrowStatus::Released;
+            Self::try_mint_purchase_receipt(&env, &mut record);
         } else {
             token_client.transfer(
                 &env.current_contract_address(),
@@ -2980,6 +3018,7 @@ impl EscrowContract {
 
         record.released_amount += remaining;
         record.status = EscrowStatus::Released;
+        Self::try_mint_purchase_receipt(&env, &mut record);
         record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
@@ -3288,6 +3327,7 @@ impl EscrowContract {
             created_at: env.ledger().timestamp(),
             updated_at: env.ledger().timestamp(),
             timeout_ledger,
+            receipt_token_id: None,
         };
 
         env.storage()
@@ -3871,6 +3911,7 @@ impl EscrowContract {
         let fully_released = new_remaining == 0;
         if fully_released {
             record.status = EscrowStatus::Released;
+            Self::try_mint_purchase_receipt(env, &mut record);
         }
 
         record.updated_at = env.ledger().timestamp();
@@ -4592,6 +4633,7 @@ impl EscrowContract {
                 &payout.seller_net,
             );
             record.status = EscrowStatus::Released;
+            Self::try_mint_purchase_receipt(&env, &mut record);
         } else {
             token_client.transfer(
                 &env.current_contract_address(),
@@ -5193,6 +5235,107 @@ impl EscrowContract {
         Ok(true)
     }
 
+    /// Configure the external contract invoked to mint an NFT
+    /// proof-of-purchase receipt when an escrow is fully released
+    /// (issue #320). Admin-only. Passing the zero address is rejected;
+    /// there is no supported way to *unset* it once configured other than
+    /// pointing it at a no-op contract, matching how other optional
+    /// cross-contract integrations (e.g. `set_merchant_registry`) work in
+    /// this contract.
+    pub fn set_receipt_minter_contract(
+        env: Env,
+        admin: Address,
+        minter: Address,
+    ) -> Result<bool, EscrowError> {
+        admin.require_auth();
+        if !Self::is_admin(env.clone(), admin) {
+            return Err(EscrowError::Unauthorized);
+        }
+        if is_zero_address(&env, &minter) {
+            return Err(EscrowError::InvalidAddress);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::ReceiptMinterContract, &minter);
+        Ok(true)
+    }
+
+    /// Returns the NFT receipt token id minted for `escrow_id`, if any
+    /// (issue #320). `Ok(None)` covers both "not released yet" and "no
+    /// receipt minter configured" / "minting failed" — none of these are
+    /// error conditions since minting is best-effort by design.
+    pub fn get_purchase_receipt_token_id(
+        env: Env,
+        escrow_id: u64,
+    ) -> Result<Option<u64>, EscrowError> {
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+        Ok(record.receipt_token_id)
+    }
+
+    /// Best-effort call to the configured receipt-minting contract on full
+    /// release (issue #320). Mutates `record.receipt_token_id` in place on
+    /// success; on any failure (no minter configured, the cross-contract
+    /// call trapping, or it returning an error) this silently leaves
+    /// `receipt_token_id` as `None` and does not propagate an error —
+    /// minting failures must never block fund settlement, which by this
+    /// point has already happened.
+    ///
+    /// The external contract is expected to expose a
+    /// `mint_receipt(receipt: PurchaseReceiptData) -> u64` entry point that
+    /// mints (and transfers to `receipt.buyer`) a soulbound receipt token
+    /// and returns its token id.
+    fn try_mint_purchase_receipt(env: &Env, record: &mut EscrowRecord) {
+        let minter: Address = match env
+            .storage()
+            .instance()
+            .get(&DataKey::ReceiptMinterContract)
+        {
+            Some(addr) => addr,
+            None => return,
+        };
+
+        let item_sku: Symbol = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowMetadataSchema(record.escrow_id))
+            .unwrap_or_else(|| symbol_short!("generic"));
+
+        let receipt = PurchaseReceiptData {
+            order_id: record.order_id.clone(),
+            buyer: record.buyer.clone(),
+            seller: record.seller.clone(),
+            amount: record.amount,
+            completed_at: env.ledger().timestamp(),
+            item_sku,
+        };
+
+        let args = soroban_sdk::vec![env, receipt.into_val(env)];
+        let result = env.try_invoke_contract::<u64, InvokeError>(
+            &minter,
+            &Symbol::new(env, "mint_receipt"),
+            args,
+        );
+
+        if let Ok(Ok(token_id)) = result {
+            record.receipt_token_id = Some(token_id);
+            env.events().publish(
+                (symbol_short!("escrow"), symbol_short!("receipt")),
+                PurchaseReceiptMintedEvent {
+                    escrow_id: record.escrow_id,
+                    token_id,
+                    buyer: record.buyer.clone(),
+                },
+            );
+        }
+        // Any other outcome (no such contract, it trapped, it returned an
+        // application error, or a decode failure) is swallowed on purpose:
+        // fund settlement must not be blocked by a receipt-minting failure.
+    }
+
     /// Set authorized merchant categories (MCC codes) for spend validation.
     ///
     /// When set, the escrow contract will validate that the seller's merchant
@@ -5467,6 +5610,87 @@ impl EscrowContract {
         Ok(())
     }
 
+    /// Verifies that `raw_json_bytes` — the canonical off-chain order
+    /// payload — hashes (SHA-256) to exactly `expected_hash` (issue #321).
+    ///
+    /// This is a pure, standalone digest check with no storage access, so it
+    /// can validate a payload against *any* hash (not only one already
+    /// stored for an escrow) — e.g. before calling `create`/`deposit`, to
+    /// confirm the `order_hash` about to be submitted matches the payload a
+    /// client just canonicalized.
+    ///
+    /// A stable client-side digest requires a canonical, deterministic JSON
+    /// encoding (fixed key order, no incidental whitespace) before hashing;
+    /// see [`Self::verify_escrow_order_metadata`] for the on-chain
+    /// counterpart that reads an escrow's *stored* `order_hash`.
+    ///
+    /// ```text
+    /// // Sample off-chain (TypeScript) client SDK code computing the same
+    /// // digest, so a buyer's canonical order JSON is guaranteed
+    /// // bit-for-bit identical to what `verify_order_metadata_digest`
+    /// // recomputes on-chain:
+    /// //
+    /// //   import { createHash } from "node:crypto";
+    /// //
+    /// //   // `order` fields MUST be serialized in a fixed, sorted key
+    /// //   // order with no extra whitespace — any deviation changes the
+    /// //   // digest.
+    /// //   function canonicalOrderJson(order: Record<string, unknown>): Buffer {
+    /// //     const sortedKeys = Object.keys(order).sort();
+    /// //     const canonical: Record<string, unknown> = {};
+    /// //     for (const key of sortedKeys) canonical[key] = order[key];
+    /// //     return Buffer.from(JSON.stringify(canonical), "utf-8");
+    /// //   }
+    /// //
+    /// //   function computeOrderHash(order: Record<string, unknown>): Buffer {
+    /// //     return createHash("sha256").update(canonicalOrderJson(order)).digest();
+    /// //   }
+    /// //
+    /// //   // `computeOrderHash(order)` is the exact 32 bytes to pass as
+    /// //   // `order_hash` to `create`/`deposit`, and as `expected_hash` to
+    /// //   // `verify_order_metadata_digest`.
+    /// ```
+    pub fn verify_order_metadata_digest(
+        env: Env,
+        raw_json_bytes: Bytes,
+        expected_hash: BytesN<32>,
+    ) -> bool {
+        let computed: BytesN<32> = env.crypto().sha256(&raw_json_bytes).into();
+        computed == expected_hash
+    }
+
+    /// Verifies `raw_json_bytes` against the `order_hash` already stored for
+    /// `escrow_id` (issue #321), so a relying party can confirm the
+    /// off-chain order payload it holds is exactly the one the buyer
+    /// committed to at deposit time — an unvalidated `order_hash` alone
+    /// cannot be tampered with post-deposit, but nothing previously checked
+    /// that a *given* payload actually produces it.
+    ///
+    /// # Errors
+    /// Returns [`EscrowError::NotFound`] when no escrow exists for
+    /// `escrow_id`, or [`EscrowError::MetadataNotSet`] when the escrow
+    /// exists but has no stored `order_hash`.
+    pub fn verify_escrow_order_metadata(
+        env: Env,
+        escrow_id: u64,
+        raw_json_bytes: Bytes,
+    ) -> Result<bool, EscrowError> {
+        if !env.storage().persistent().has(&DataKey::Escrow(escrow_id)) {
+            return Err(EscrowError::NotFound);
+        }
+        let expected_hash: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowMetadataHash(escrow_id))
+            .ok_or(EscrowError::MetadataNotSet)?;
+
+        Ok(Self::verify_order_metadata_digest(
+            env,
+            raw_json_bytes,
+            expected_hash,
+        ))
+    }
+
     /// Returns true if the address is the primary admin or a co-admin.
     /// Read-only check: returns whether the given caller is eligible to refund
     /// the specified escrow, and a machine-readable reason symbol (issue #173).
@@ -5718,6 +5942,7 @@ impl EscrowContract {
         let new_remaining = record.amount - record.released_amount - record.refunded_amount;
         if new_remaining == 0 {
             record.status = EscrowStatus::Released;
+            Self::try_mint_purchase_receipt(&env, &mut record);
         }
         record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
@@ -6853,5 +7078,322 @@ mod error_code_allocation_tests {
                 }
             }
         }
+    }
+}
+
+// ─── Issue #321: SHA-256 order metadata digest verification ──────────────
+//
+// Added as a fresh, self-contained `#[cfg(test)]` module (like
+// `quorum_cleanup_tests` / `error_code_allocation_tests` above) rather than
+// in `escrow/src/test.rs`: that file (and `integration_tests.rs`) is
+// pre-existing, gated behind the non-default `full_suite` feature, and its
+// own top-of-file comment in `escrow/Cargo.toml` states it is "under active
+// repair" and "does not currently compile" — confirmed while reading the
+// file for this change (e.g. `test_initialize_rejects_zero_treasury` around
+// line 245 is missing its own `#[test]`/signature and is accidentally
+// nested inside the previous test function's body, referencing that
+// function's locals). That breakage is pre-existing, unrelated to issues
+// #315/#320/#321/#323, and out of scope for this change, so it was left
+// untouched; new tests were placed here instead so they actually compile
+// and run under a plain `cargo test`.
+#[cfg(test)]
+mod order_metadata_digest_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn setup(env: &Env) -> (EscrowContractClient<'_>, Address) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 0u32,
+            treasury,
+            min_amount: 1i128,
+            max_amount: 1_000_000i128,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(env, &contract_id);
+        (client, admin)
+    }
+
+    #[test]
+    fn digest_matches_the_exact_canonical_payload() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        let payload = Bytes::from_array(&env, b"{\"item\":\"widget\",\"qty\":1}");
+        let expected: BytesN<32> = env.crypto().sha256(&payload).into();
+
+        assert!(client.verify_order_metadata_digest(&payload, &expected));
+    }
+
+    #[test]
+    fn digest_rejects_a_tampered_payload() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        let original = Bytes::from_array(&env, b"{\"item\":\"widget\",\"qty\":1}");
+        let tampered = Bytes::from_array(&env, b"{\"item\":\"widget\",\"qty\":9}");
+        let expected: BytesN<32> = env.crypto().sha256(&original).into();
+
+        assert!(!client.verify_order_metadata_digest(&tampered, &expected));
+    }
+
+    #[test]
+    fn verify_escrow_order_metadata_checks_against_the_stored_hash() {
+        let env = Env::default();
+        let (client, admin) = setup(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token = env.register_stellar_asset_contract(admin.clone());
+        soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&buyer, &1000i128);
+        client.add_token(&admin, &token);
+
+        let payload = Bytes::from_array(&env, b"{\"order\":\"abc123\"}");
+        let order_hash: BytesN<32> = env.crypto().sha256(&payload).into();
+        let schema = symbol_short!("order_v1");
+        let order_id = BytesN::from_array(&env, &[5u8; 32]);
+
+        let escrow_id = client.deposit(
+            &buyer,
+            &seller,
+            &token,
+            &100i128,
+            &order_id,
+            &1000u32,
+            &Some(order_hash),
+            &Some(schema),
+        );
+
+        assert!(client.verify_escrow_order_metadata(&escrow_id, &payload));
+
+        let tampered = Bytes::from_array(&env, b"{\"order\":\"tampered\"}");
+        assert!(!client.verify_escrow_order_metadata(&escrow_id, &tampered));
+    }
+
+    #[test]
+    fn verify_escrow_order_metadata_not_found() {
+        let env = Env::default();
+        let (client, _admin) = setup(&env);
+        let bogus_payload = Bytes::from_array(&env, b"{}");
+        assert_eq!(
+            client.try_verify_escrow_order_metadata(&999u64, &bogus_payload),
+            Err(Ok(EscrowError::NotFound))
+        );
+    }
+
+    #[test]
+    fn verify_escrow_order_metadata_metadata_not_set() {
+        let env = Env::default();
+        let (client, admin) = setup(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token = env.register_stellar_asset_contract(admin.clone());
+        soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&buyer, &1000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[6u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer,
+            &seller,
+            &token,
+            &100i128,
+            &order_id,
+            &1000u32,
+            &None::<BytesN<32>>,
+            &None::<Symbol>,
+        );
+
+        let payload = Bytes::from_array(&env, b"{}");
+        assert_eq!(
+            client.try_verify_escrow_order_metadata(&escrow_id, &payload),
+            Err(Ok(EscrowError::MetadataNotSet))
+        );
+    }
+}
+
+// ─── Issue #320: NFT proof-of-purchase receipt minting on release ────────
+#[cfg(test)]
+mod purchase_receipt_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    /// Minimal external contract standing in for a real NFT/receipt-minting
+    /// contract, so this suite can exercise the escrow contract's real
+    /// cross-contract call path without depending on one existing anywhere
+    /// else in this workspace. Mints monotonically increasing token ids.
+    #[contract]
+    struct MockReceiptMinter;
+
+    #[contractimpl]
+    impl MockReceiptMinter {
+        pub fn mint_receipt(env: Env, receipt: PurchaseReceiptData) -> u64 {
+            let next_id: u64 = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("next_id"))
+                .unwrap_or(1);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("next_id"), &(next_id + 1));
+            env.storage()
+                .persistent()
+                .set(&symbol_short!("lastrcpt"), &receipt);
+            next_id
+        }
+    }
+
+    struct Fixture {
+        client_id: Address,
+        admin: Address,
+        buyer: Address,
+        seller: Address,
+        token: Address,
+    }
+
+    fn setup(env: &Env) -> Fixture {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let buyer = Address::generate(env);
+        let seller = Address::generate(env);
+        let treasury = Address::generate(env);
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 0u32,
+            treasury,
+            min_amount: 1i128,
+            max_amount: 1_000_000i128,
+        };
+        let client_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(env, &client_id);
+
+        let token = env.register_stellar_asset_contract(admin.clone());
+        soroban_sdk::token::StellarAssetClient::new(env, &token).mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+
+        Fixture {
+            client_id,
+            admin,
+            buyer,
+            seller,
+            token,
+        }
+    }
+
+    fn deposit_escrow(env: &Env, client: &EscrowContractClient, fx: &Fixture, seed: u8) -> u64 {
+        let order_id = BytesN::from_array(env, &[seed; 32]);
+        client.deposit(
+            &fx.buyer,
+            &fx.seller,
+            &fx.token,
+            &1000i128,
+            &order_id,
+            &1000u32,
+            &None::<BytesN<32>>,
+            &None::<Symbol>,
+        )
+    }
+
+    #[test]
+    fn full_release_mints_a_receipt_when_a_minter_is_configured() {
+        let env = Env::default();
+        let fx = setup(&env);
+        let client = EscrowContractClient::new(&env, &fx.client_id);
+
+        let minter_id = env.register(MockReceiptMinter, ());
+        client.set_receipt_minter_contract(&fx.admin, &minter_id);
+
+        let escrow_id = deposit_escrow(&env, &client, &fx, 1);
+        // Buyer-initiated release of the full remaining amount (<= the
+        // dual-control threshold, so no signed delivery proof is required).
+        client.release(&escrow_id, &fx.buyer, &fx.seller);
+
+        let escrow = client.get_escrow(&escrow_id);
+        assert_eq!(escrow.status, EscrowStatus::Released);
+        assert!(
+            escrow.receipt_token_id.is_some(),
+            "a fully released escrow with a configured minter must record a receipt token id"
+        );
+
+        let token_id = client.get_purchase_receipt_token_id(&escrow_id);
+        assert_eq!(token_id, escrow.receipt_token_id);
+    }
+
+    #[test]
+    fn minting_failure_never_blocks_fund_settlement() {
+        let env = Env::default();
+        let fx = setup(&env);
+        let client = EscrowContractClient::new(&env, &fx.client_id);
+
+        // Point the minter at an address with no deployed contract at all —
+        // the cross-contract call must fail cleanly (caught by
+        // `try_invoke_contract`), not trap the whole transaction.
+        let bogus_minter = Address::generate(&env);
+        client.set_receipt_minter_contract(&fx.admin, &bogus_minter);
+
+        let escrow_id = deposit_escrow(&env, &client, &fx, 2);
+        let released = client.release(&escrow_id, &fx.buyer, &fx.seller);
+        assert!(released, "release must still succeed when minting fails");
+
+        let escrow = client.get_escrow(&escrow_id);
+        assert_eq!(escrow.status, EscrowStatus::Released);
+        assert_eq!(
+            escrow.receipt_token_id, None,
+            "a failed mint must leave receipt_token_id unset rather than erroring"
+        );
+    }
+
+    #[test]
+    fn no_receipt_is_attempted_when_no_minter_is_configured() {
+        let env = Env::default();
+        let fx = setup(&env);
+        let client = EscrowContractClient::new(&env, &fx.client_id);
+
+        let escrow_id = deposit_escrow(&env, &client, &fx, 3);
+        client.release(&escrow_id, &fx.buyer, &fx.seller);
+
+        let escrow = client.get_escrow(&escrow_id);
+        assert_eq!(escrow.status, EscrowStatus::Released);
+        assert_eq!(escrow.receipt_token_id, None);
+    }
+
+    #[test]
+    fn get_purchase_receipt_token_id_not_found() {
+        let env = Env::default();
+        let fx = setup(&env);
+        let client = EscrowContractClient::new(&env, &fx.client_id);
+
+        assert_eq!(
+            client.try_get_purchase_receipt_token_id(&999u64),
+            Err(Ok(EscrowError::NotFound))
+        );
+    }
+
+    #[test]
+    fn set_receipt_minter_contract_requires_admin() {
+        let env = Env::default();
+        let fx = setup(&env);
+        let client = EscrowContractClient::new(&env, &fx.client_id);
+
+        let not_admin = Address::generate(&env);
+        let minter = Address::generate(&env);
+        assert_eq!(
+            client.try_set_receipt_minter_contract(&not_admin, &minter),
+            Err(Ok(EscrowError::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn set_receipt_minter_contract_rejects_zero_address() {
+        let env = Env::default();
+        let fx = setup(&env);
+        let client = EscrowContractClient::new(&env, &fx.client_id);
+
+        let zero = Address::from_str(&env, ZERO_CONTRACT_STRKEY);
+        assert_eq!(
+            client.try_set_receipt_minter_contract(&fx.admin, &zero),
+            Err(Ok(EscrowError::InvalidAddress))
+        );
     }
 }
