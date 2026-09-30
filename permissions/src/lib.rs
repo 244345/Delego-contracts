@@ -1958,12 +1958,12 @@ impl PermissionsContract {
     /// `set_admin` has not yet been called, and `Unauthorized` if `caller`
     /// is not the stored admin.
     fn require_admin(env: &Env, caller: &Address) -> Result<Address, PermissionError> {
-        caller.require_auth();
         let stored_admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
             .ok_or(PermissionError::NotInitialized)?;
+        caller.require_auth();
         if *caller != stored_admin {
             return Err(PermissionError::Unauthorized);
         }
