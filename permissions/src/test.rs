@@ -2,8 +2,9 @@
 #[allow(clippy::module_inception)]
 mod test {
     use crate::{
-        DataKey, PermissionError, PermissionRecord, PermissionStatus, PermissionsContract,
-        PermissionsContractClient,
+        validate_relayer_fee, DataKey, PermissionError, PermissionRecord, PermissionStatus,
+        PermissionsContract, PermissionsContractClient, MAX_ABSOLUTE_RELAYER_STROOPS,
+        MAX_RELAYER_FEE_BPS,
     };
     use soroban_sdk::{
         testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
@@ -3140,7 +3141,7 @@ mod test {
         let delegate = Address::generate(&env);
         let contract_id = env.register(PermissionsContract, ());
         let client = PermissionsContractClient::new(&env, &contract_id);
-        
+
         let result = client.try_decrease_allowance(&owner, &delegate, &-100);
         assert!(result.is_err());
     }
@@ -3188,6 +3189,116 @@ mod test {
         assert_ne!(
             sep_v1, sep_v2,
             "V1-bound signature hash must not match the V2 domain separator"
+        );
+    }
+
+    #[test]
+    fn test_validate_relayer_fee_within_safety_boundaries() {
+        assert_eq!(MAX_RELAYER_FEE_BPS, 100);
+        assert_eq!(MAX_ABSOLUTE_RELAYER_STROOPS, 10_000_000);
+
+        // Zero fee is always accepted on valid spend
+        assert_eq!(validate_relayer_fee(10_000_000, 0), Ok(()));
+
+        // Exactly at 1% proportional boundary (100_000 stroops on 10_000_000 stroops / 1 XLM)
+        let max_proportional_1xlm = (10_000_000 * MAX_RELAYER_FEE_BPS as i128) / 10_000;
+        assert_eq!(
+            validate_relayer_fee(10_000_000, max_proportional_1xlm),
+            Ok(())
+        );
+
+        // Well within proportional boundary (0.5%)
+        assert_eq!(validate_relayer_fee(10_000_000, 50_000), Ok(()));
+
+        // At exactly 100 XLM spend (1_000_000_000 stroops), 1% is exactly 1 XLM (10_000_000 stroops)
+        assert_eq!(
+            validate_relayer_fee(1_000_000_000, MAX_ABSOLUTE_RELAYER_STROOPS),
+            Ok(())
+        );
+
+        // For large spends (e.g. 500 XLM), fee at absolute 1 XLM cap is accepted
+        assert_eq!(
+            validate_relayer_fee(5_000_000_000, MAX_ABSOLUTE_RELAYER_STROOPS),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_validate_relayer_fee_rejects_negative_fee() {
+        assert_eq!(
+            validate_relayer_fee(10_000_000, -1),
+            Err(PermissionError::InvalidParam)
+        );
+        assert_eq!(
+            validate_relayer_fee(10_000_000, -10_000_000),
+            Err(PermissionError::InvalidParam)
+        );
+    }
+
+    #[test]
+    fn test_validate_relayer_fee_enforces_proportional_cap() {
+        // 1% of 10_000_000 stroops is 100_000 stroops; 100_001 must be rejected
+        assert_eq!(
+            validate_relayer_fee(10_000_000, 100_001),
+            Err(PermissionError::InvalidParam)
+        );
+
+        // 1% of 1_000_000 stroops is 10_000 stroops; 10_001 must be rejected
+        assert_eq!(
+            validate_relayer_fee(1_000_000, 10_000),
+            Err(PermissionError::InvalidParam)
+        );
+
+        // 5% fee on 1_000_000 stroops (50_000) must be rejected
+        assert_eq!(
+            validate_relayer_fee(1_000_000, 50_000),
+            Err(PermissionError::InvalidParam)
+        );
+    }
+
+    #[test]
+    fn test_validate_relayer_fee_enforces_absolute_cap() {
+        // For a 200 XLM spend (2_000_000_000 stroops), 1% is 20_000_000 stroops (2 XLM).
+        // A fee exceeding 1 XLM (10_000_000 stroops) must be rejected even though it is < 1%.
+        assert_eq!(
+            validate_relayer_fee(2_000_000_000, MAX_ABSOLUTE_RELAYER_STROOPS + 1),
+            Err(PermissionError::InvalidParam)
+        );
+
+        // 2 XLM fee must be rejected
+        assert_eq!(
+            validate_relayer_fee(2_000_000_000, 20_000_000),
+            Err(PermissionError::InvalidParam)
+        );
+    }
+
+    #[test]
+    fn test_validate_relayer_fee_edge_cases() {
+        // Zero spend: zero fee is allowed, non-zero fee is rejected
+        assert_eq!(validate_relayer_fee(0, 0), Ok(()));
+        assert_eq!(
+            validate_relayer_fee(0, 1),
+            Err(PermissionError::InvalidParam)
+        );
+
+        // Sub-100 stroop spend (integer division makes max proportional 0 stroops)
+        assert_eq!(validate_relayer_fee(99, 0), Ok(()));
+        assert_eq!(
+            validate_relayer_fee(99, 1),
+            Err(PermissionError::InvalidParam)
+        );
+
+        // Exact 100 stroops: 1% is 1 stroop
+        assert_eq!(validate_relayer_fee(100, 1), Ok(()));
+        assert_eq!(
+            validate_relayer_fee(100, 2),
+            Err(PermissionError::InvalidParam)
+        );
+
+        // Negative spend: rejects any non-negative fee because max_proportional is negative
+        assert_eq!(
+            validate_relayer_fee(-100, 0),
+            Err(PermissionError::InvalidParam)
         );
     }
 }

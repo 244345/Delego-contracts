@@ -92,6 +92,10 @@ pub const DEFAULT_DECREASE_TIMELOCK_SECS: u64 = 86_400;
 pub const MAX_DECREASE_TIMELOCK_SECS: u64 = 2_592_000;
 pub const MAX_SWEEP_BATCH_SIZE: u32 = 50;
 pub const MAX_SWEEP_BATCH: u32 = MAX_SWEEP_BATCH_SIZE;
+/// Maximum relayer fee in basis points (100 bps = 1.00% maximum tip, issue #370).
+pub const MAX_RELAYER_FEE_BPS: u32 = 100;
+/// Maximum absolute relayer fee in stroops (10_000_000 stroops = 1 XLM, issue #370).
+pub const MAX_ABSOLUTE_RELAYER_STROOPS: i128 = 10_000_000;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -255,6 +259,25 @@ mod error_code_tests {
             }
         }
     }
+}
+
+/// Validates that a relayer fee does not exceed both the absolute cap (1 XLM)
+/// and proportional cap (1% / 100 BPS of the spend amount), preventing rogue
+/// relayers from draining a delegator's allowance via excessive tip manipulation (issue #370).
+///
+/// Returns `Ok(())` if the fee is within safety boundaries, or
+/// `Err(PermissionError::InvalidParam)` if `relayer_fee` is negative,
+/// exceeds `MAX_ABSOLUTE_RELAYER_STROOPS`, or exceeds `MAX_RELAYER_FEE_BPS`
+/// proportion of `spend_amount`.
+pub fn validate_relayer_fee(spend_amount: i128, relayer_fee: i128) -> Result<(), PermissionError> {
+    if relayer_fee < 0 || relayer_fee > MAX_ABSOLUTE_RELAYER_STROOPS {
+        return Err(PermissionError::InvalidParam);
+    }
+    let max_proportional = (spend_amount * MAX_RELAYER_FEE_BPS as i128) / 10_000;
+    if relayer_fee > max_proportional {
+        return Err(PermissionError::InvalidParam);
+    }
+    Ok(())
 }
 
 #[contracttype]
