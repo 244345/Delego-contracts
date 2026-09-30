@@ -1035,6 +1035,8 @@ pub enum DataKey {
     /// Function scope restricting a (owner, delegate) delegation to specific
     /// contract entrypoints (issue #369). Absent means unscoped.
     PermissionScope(Address, Address),
+    /// Index of owner addresses that have granted permissions to a given delegate.
+    DelegatePermissions(Address),
 }
 
 #[contract]
@@ -1338,6 +1340,12 @@ impl PermissionsContract {
         let scope_changed = previous_scope != scope;
         Self::store_scope(&env, &owner, &delegate, scope.clone());
 
+        Self::add_to_address_index(
+            &env,
+            &DataKey::DelegatePermissions(delegate.clone()),
+            &owner,
+        );
+
         // Change in usable allowance caused by this (re-)grant. For a first
         // grant `old_remaining` is 0 so this equals the new total limit; for a
         // re-grant it reflects how much more (or less) the delegate can spend
@@ -1500,6 +1508,10 @@ impl PermissionsContract {
                 current_epoch: 0,
                 epoch_started_ledger: env.ledger().sequence(),
             },
+        Self::add_to_address_index(
+            &env,
+            &DataKey::DelegatePermissions(child_delegate.clone()),
+            &parent_delegate,
         );
 
         let children_key = DataKey::Children(parent_owner, parent_delegate.clone());
@@ -1549,6 +1561,11 @@ impl PermissionsContract {
                 delegates.remove(index);
                 env.storage().persistent().set(&user_perms_key, &delegates);
             }
+            Self::remove_from_address_index(
+                &env,
+                &DataKey::DelegatePermissions(delegate.clone()),
+                &owner,
+            );
 
             record.status = PermissionStatus::Revoked;
             env.storage().persistent().set(&key, &record);
@@ -1681,6 +1698,16 @@ impl PermissionsContract {
             delegates.push_back(new_delegate.clone());
         }
         env.storage().persistent().set(&user_perms_key, &delegates);
+        Self::remove_from_address_index(
+            &env,
+            &DataKey::DelegatePermissions(old_delegate.clone()),
+            &owner,
+        );
+        Self::add_to_address_index(
+            &env,
+            &DataKey::DelegatePermissions(new_delegate.clone()),
+            &owner,
+        );
 
         // Store the new permission
         env.storage().persistent().set(&new_key, &new_record);
@@ -1879,6 +1906,30 @@ impl PermissionsContract {
             .ok_or(PermissionError::InvalidExpiry)
     }
 
+    fn add_to_address_index(env: &Env, key: &DataKey, address: &Address) {
+        let mut addresses: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(key)
+            .unwrap_or_else(|| Vec::new(env));
+        if !addresses.contains(address) {
+            addresses.push_back(address.clone());
+            env.storage().persistent().set(key, &addresses);
+        }
+    }
+
+    fn remove_from_address_index(env: &Env, key: &DataKey, address: &Address) {
+        let mut addresses: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(key)
+            .unwrap_or_else(|| Vec::new(env));
+        if let Some(index) = addresses.first_index_of(address) {
+            addresses.remove(index);
+            env.storage().persistent().set(key, &addresses);
+        }
+    }
+
     /// Validates the merchant whitelist:
     /// - Must not exceed `MAX_MERCHANTS_PER_PERMISSION` entries.
     /// - Must not contain duplicate addresses.
@@ -1948,6 +1999,11 @@ impl PermissionsContract {
                         },
                     );
                 }
+                Self::remove_from_address_index(
+                    env,
+                    &DataKey::DelegatePermissions(child_delegate.clone()),
+                    delegate,
+                );
                 Self::revoke_children(env, delegate, &child_delegate);
             }
         }
@@ -3433,6 +3489,28 @@ impl PermissionsContract {
         owner: Address,
         delegate: Address,
     ) -> Result<PermissionRecord, PermissionError> {
+    /// Returns stored permissions granted to `delegate` by every indexed owner.
+    pub fn get_permissions_by_delegate(env: Env, delegate: Address) -> Vec<PermissionRecord> {
+        let owners: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegatePermissions(delegate.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut records = Vec::new(&env);
+        for owner in owners.iter() {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Permission(owner, delegate.clone()))
+            {
+                records.push_back(record);
+            }
+        }
+        records
+    }
+
+    pub fn get_permission(env: Env, owner: Address, delegate: Address) -> Result<PermissionRecord, PermissionError> {
         let key = DataKey::Permission(owner, delegate);
         env.storage()
             .persistent()
@@ -3933,6 +4011,11 @@ impl PermissionsContract {
 
         record.status = PermissionStatus::Revoked;
         env.storage().persistent().set(&key, &record);
+        Self::remove_from_address_index(
+            &env,
+            &DataKey::DelegatePermissions(delegate.clone()),
+            &owner,
+        );
         env.storage()
             .persistent()
             .remove(&DataKey::PendingDecrement(owner.clone(), delegate.clone()));
@@ -4064,6 +4147,11 @@ impl PermissionsContract {
                 {
                     record.status = PermissionStatus::Revoked;
                     env.storage().persistent().set(&key, &record);
+                    Self::remove_from_address_index(
+                        &env,
+                        &DataKey::DelegatePermissions(delegate.clone()),
+                        &owner,
+                    );
                     env.storage()
                         .persistent()
                         .remove(&DataKey::PendingDecrement(owner.clone(), delegate.clone()));
