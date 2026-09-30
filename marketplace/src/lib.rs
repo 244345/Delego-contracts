@@ -140,6 +140,16 @@ pub struct CategoryEntry {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
+pub struct CategoryProposal {
+    pub proposed_symbol: Symbol,
+    pub proposed_by: Address,
+    pub vote_count: u32,
+    pub voting_deadline: u64,
+    pub is_approved: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
 pub struct RegisterParams {
     pub name: String,
     pub description: String,
@@ -325,6 +335,10 @@ pub struct MerchantAppealResolvedEvent {
     /// Address that received the bond (merchant owner on reinstatement,
     /// treasury on slash).
     pub recipient: Address,
+    CategoryProposalNotFound = 4022,
+    CategoryProposalExpired = 4023,
+    CategoryAlreadyVoted = 4024,
+    MerchantNotVerified = 4025,
 }
 
 // --- Events ---
@@ -550,6 +564,8 @@ pub enum DataKey {
     MerchantVerifier(u64, Address),
     MerchantVerifierList(u64),
     VerificationPolicy(u64),
+    CategoryProposal(Symbol),
+    CategoryVote(Symbol, Address, u64),
     LastMetadataUpdate(u64),
     GlobalReputationContract,
     Categories,
@@ -585,6 +601,8 @@ const DEFAULT_METADATA_COOLDOWN_SECS: u64 = 86_400; // 24 hours
 const MIN_METADATA_COOLDOWN_SECS: u64 = 60;
 const MAX_METADATA_COOLDOWN_SECS: u64 = 30 * 24 * 60 * 60;
 const MAX_PAGE_LIMIT: u32 = 50;
+const CATEGORY_VOTE_THRESHOLD: u32 = 3;
+const CATEGORY_VOTING_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280; // ~1 day of ledgers (5s/ledger)
 const PERSISTENT_BUMP_AMOUNT: u32 = 518_400; // ~30 days of ledgers
 
@@ -1154,6 +1172,111 @@ impl MarketplaceContract {
 
     // --- Category Management ---
 
+    pub fn propose_category(env: Env, merchant: Address, symbol: Symbol) -> Result<(), MarketplaceError> {
+        merchant.require_auth();
+        Self::get_verified_merchant_id(env.clone(), &merchant)?;
+
+        let normalized = normalize_symbol(&env, &symbol);
+        if normalized.is_empty() {
+            return Err(MarketplaceError::InvalidCategory);
+        }
+
+        for category in Self::get_categories(env.clone()).iter() {
+            if category.normalized == normalized || category.key == symbol {
+                return Err(MarketplaceError::InvalidCategory);
+            }
+        }
+
+        let now = env.ledger().timestamp();
+        let key = DataKey::CategoryProposal(normalized.clone());
+        if let Some(existing) = env.storage().instance().get::<_, CategoryProposal>(&key) {
+            if existing.is_approved || now < existing.voting_deadline {
+                return Err(MarketplaceError::InvalidCategory);
+            }
+        }
+
+        let proposal = CategoryProposal {
+            proposed_symbol: symbol,
+            proposed_by: merchant,
+            vote_count: 0,
+            voting_deadline: now.saturating_add(CATEGORY_VOTING_PERIOD_SECS),
+            is_approved: false,
+        };
+        env.storage().instance().set(&key, &proposal);
+        Ok(())
+    }
+
+    pub fn vote_category(env: Env, merchant: Address, symbol: Symbol) -> Result<(), MarketplaceError> {
+        merchant.require_auth();
+        Self::get_verified_merchant_id(env.clone(), &merchant)?;
+        let normalized = normalize_symbol(&env, &symbol);
+        let key = DataKey::CategoryProposal(normalized.clone());
+        let mut proposal: CategoryProposal = env
+            .storage()
+            .instance()
+            .get(&key)
+            .ok_or(MarketplaceError::CategoryProposalNotFound)?;
+
+        if proposal.is_approved {
+            return Err(MarketplaceError::InvalidCategory);
+        }
+        if env.ledger().timestamp() >= proposal.voting_deadline {
+            return Err(MarketplaceError::CategoryProposalExpired);
+        }
+
+        let vote_key = DataKey::CategoryVote(
+            normalized.clone(),
+            merchant.clone(),
+            proposal.voting_deadline,
+        );
+        if env.storage().persistent().has(&vote_key) {
+            return Err(MarketplaceError::CategoryAlreadyVoted);
+        }
+
+        proposal.vote_count = proposal
+            .vote_count
+            .checked_add(1)
+            .ok_or(MarketplaceError::InvalidParam)?;
+        env.storage().persistent().set(&vote_key, &true);
+
+        if proposal.vote_count >= CATEGORY_VOTE_THRESHOLD {
+            let categories = Self::get_categories(env.clone());
+            for category in categories.iter() {
+                if category.normalized == normalized || category.key == proposal.proposed_symbol {
+                    return Err(MarketplaceError::InvalidCategory);
+                }
+            }
+
+            let mut categories = categories;
+            categories.push_back(CategoryEntry {
+                key: proposal.proposed_symbol.clone(),
+                normalized: normalized.clone(),
+                display: String::from_str(&env, "Community approved category"),
+                added_at: env.ledger().timestamp(),
+            });
+            env.storage().instance().set(&DataKey::Categories, &categories);
+            proposal.is_approved = true;
+            env.events().publish(
+                (symbol_short!("mkplc"), symbol_short!("cat_add")),
+                CategoryAddedEvent {
+                    key: proposal.proposed_symbol.clone(),
+                    normalized,
+                    added_by: proposal.proposed_by.clone(),
+                },
+            );
+        }
+
+        env.storage().instance().set(&key, &proposal);
+        Ok(())
+    }
+
+    pub fn get_category_proposal(env: Env, symbol: Symbol) -> Option<CategoryProposal> {
+        let normalized = normalize_symbol(&env, &symbol);
+        env.storage()
+            .instance()
+            .get(&DataKey::CategoryProposal(normalized))
+    }
+
     pub fn add_category(
         env: Env,
         admin: Address,
@@ -1250,6 +1373,26 @@ impl MarketplaceContract {
             .instance()
             .get(&DataKey::Categories)
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    fn get_verified_merchant_id(
+        env: Env,
+        merchant: &Address,
+    ) -> Result<u64, MarketplaceError> {
+        let merchant_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantOwner(merchant.clone()))
+            .ok_or(MarketplaceError::MerchantNotFound)?;
+        let record: Merchant = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Merchant(merchant_id))
+            .ok_or(MarketplaceError::MerchantNotFound)?;
+        if !record.verified || record.status != MerchantStatus::Verified {
+            return Err(MarketplaceError::MerchantNotVerified);
+        }
+        Ok(merchant_id)
     }
 
     // --- Verification ---

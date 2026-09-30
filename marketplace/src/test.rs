@@ -21,6 +21,9 @@ use crate::{
     Verifier,
     MerchantStats, MerchantStatus, RegisterParams, Verifier,
     MerchantStatus, RegisterParams, Verifier, MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN,
+    CategoryChange, CategoryEntry, DataKey, Merchant, MerchantCategoryChangedEvent,
+    MerchantCursor, MerchantOperationalView, MerchantStats, MerchantValidationError,
+    VerificationPolicy, normalize_symbol, MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN,
     MAX_METADATA_LEN, MAX_NAME_LEN,
     CommissionTier, MerchantVolumeRecord,
     ReputationCursor, RankedMerchantPage,
@@ -34,6 +37,7 @@ use soroban_sdk::{
     Address, Env, IntoVal, String, Symbol, TryFromVal, Val,
     Address, Env, String, Symbol, TryIntoVal,
     Address, Env, String, Symbol, TryIntoVal,
+    TryIntoVal,
 };
 
 const MAX_DISCOVERY_CPU_INSTRUCTIONS: u64 = 2_000_000;
@@ -82,6 +86,67 @@ fn store_name(env: &Env, i: u32) -> String {
     buf[7] = b'0' + ((i / 10) % 10) as u8;
     buf[8] = b'0' + (i % 10) as u8;
     String::from_str(env, core::str::from_utf8(&buf).unwrap())
+}
+
+#[test]
+fn test_community_category_proposal_requires_verified_merchant_quorum() {
+    let f = TestFixture::setup();
+    let verifier = Address::generate(&f.env);
+    f.client.add_verifier(
+        &f.admin,
+        &Verifier {
+            address: verifier.clone(),
+            label: symbol_short!("kyc"),
+            registered_at: 1,
+        },
+    );
+
+    let owners = [
+        Address::generate(&f.env),
+        Address::generate(&f.env),
+        Address::generate(&f.env),
+    ];
+    for (index, owner) in owners.iter().enumerate() {
+        let merchant_id = f.client.register_merchant(
+            owner,
+            &RegisterParams {
+                name: store_name(&f.env, index as u32 + 1),
+                description: String::from_str(&f.env, "Verified community merchant"),
+                category: symbol_short!("retail"),
+                image_url: String::from_str(&f.env, "https://example.com/store.png"),
+                metadata: None,
+                metadata_uri: None,
+                required_verifications: 1,
+            },
+        );
+        f.client.verify_merchant(&merchant_id, &verifier);
+    }
+
+    let proposed = symbol_short!("crafts");
+    f.client.propose_category(&owners[0], &proposed);
+    let pending = f.client.get_category_proposal(&proposed).unwrap();
+    assert_eq!(pending.proposed_symbol, proposed);
+    assert_eq!(pending.proposed_by, owners[0]);
+    assert_eq!(pending.vote_count, 0);
+    assert!(!pending.is_approved);
+
+    f.client.vote_category(&owners[0], &proposed);
+    let duplicate_vote = f.client.try_vote_category(&owners[0], &proposed);
+    assert_eq!(
+        duplicate_vote,
+        Err(Ok(MarketplaceError::CategoryAlreadyVoted))
+    );
+    f.client.vote_category(&owners[1], &proposed);
+    assert!(f.client.get_categories().is_empty());
+    f.client.vote_category(&owners[2], &proposed);
+
+    let approved = f.client.get_category_proposal(&proposed).unwrap();
+    assert_eq!(approved.vote_count, 3);
+    assert!(approved.is_approved);
+    let categories = f.client.get_categories();
+    assert_eq!(categories.len(), 1);
+    assert_eq!(categories.get(0).unwrap().key, proposed);
+    assert_eq!(categories.get(0).unwrap().normalized, proposed);
 }
 
 #[test]
