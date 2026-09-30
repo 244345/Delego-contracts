@@ -161,15 +161,18 @@ pub enum PermissionError {
     /// computation would overflow `u32`, so no valid expiry ledger can be
     /// represented. Returned instead of an arithmetic overflow panic.
     InvalidExpiry = 2412,
-    /// Admin-gated call made before `set_admin` has ever been called
-    NotInitialized = 2500,
     /// Nonce cancellation targets a nonce that was already consumed or
     /// would overflow the nonce counter (issue #297)
+    NonceAlreadyUsed = 2413,
     /// Spend attempted before the grant's `not_before_ledger` activation ledger
     GrantNotYetActive = 2414,
     /// Spend attempted outside the delegation's configured business-hour /
     /// day-of-week `TimeWindowRestriction` (issue #315)
     OutsideAuthorizedWindow = 2415,
+    /// Relayer-submitted signature was created for an earlier execution epoch
+    StaleEpoch = 2416,
+    /// Admin-gated call made before `set_admin` has ever been called
+    NotInitialized = 2500,
 }
 
 #[cfg(test)]
@@ -213,15 +216,16 @@ mod error_code_tests {
         PermissionError::LimitBelowSpent as u32,
         PermissionError::ExceedsAllowance as u32,
         PermissionError::InvalidExpiry as u32,
-        PermissionError::NotInitialized as u32,
         PermissionError::NonceAlreadyUsed as u32,
         PermissionError::GrantNotYetActive as u32,
         PermissionError::OutsideAuthorizedWindow as u32,
+        PermissionError::StaleEpoch as u32,
+        PermissionError::NotInitialized as u32,
     ];
 
     #[test]
     fn permission_error_codes_are_unique_and_in_reserved_range() {
-        assert_eq!(PERMISSION_ERROR_CODES.len(), 32);
+        assert_eq!(PERMISSION_ERROR_CODES.len(), 33);
 
         let permission_range = ERROR_CODE_RANGES
             .iter()
@@ -333,6 +337,15 @@ pub struct PermissionRecord {
     /// grants. Together with `parent_owner`, this forms the reference the
     /// issue describes as `parent_permission`.
     pub parent_delegate: Option<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+/// Version of the execution context for relayed spends on a permission.
+pub struct EpochConfig {
+    pub current_epoch: u32,
+    pub epoch_started_ledger: u32,
 }
 
 /// A delegation permission jointly controlled by multiple owners (issue #326).
@@ -465,6 +478,7 @@ pub struct RelayedSpendMessage {
     pub amount: i128,
     pub nonce: u64,
     pub expiration_ledger: u32,
+    pub epoch: u32,
 }
 
 /// Owner-controlled, seller-specific allowlist enforced on every spend for a
@@ -907,6 +921,8 @@ pub enum DataKey {
     RelayerKey(Address),
     /// Next expected nonce for a (owner, delegate) pair's relayed spends.
     RelayerNonce(Address, Address),
+    /// Execution epoch for a (owner, delegate) pair's relayed spends.
+    ExecutionEpoch(Address, Address),
     /// On-chain usage analytics for a (owner, delegate) pair.
     UsageStats(Address, Address),
     /// Multi-owner permission, keyed by (owners[0], delegate).
@@ -1138,6 +1154,19 @@ impl PermissionsContract {
         };
 
         env.storage().persistent().set(&key, &record);
+        let epoch_key = DataKey::ExecutionEpoch(owner.clone(), delegate.clone());
+        let epoch_config = env
+            .storage()
+            .persistent()
+            .get(&epoch_key)
+            .unwrap_or(EpochConfig {
+                current_epoch: 0,
+                epoch_started_ledger: env.ledger().sequence(),
+            });
+        env.storage().persistent().set(
+            &epoch_key,
+            &epoch_config,
+        );
 
         // Change in usable allowance caused by this (re-)grant. For a first
         // grant `old_remaining` is 0 so this equals the new total limit; for a
@@ -1272,6 +1301,13 @@ impl PermissionsContract {
 
         let child_key = DataKey::Permission(parent_delegate.clone(), child_delegate.clone());
         env.storage().persistent().set(&child_key, &record);
+        env.storage().persistent().set(
+            &DataKey::ExecutionEpoch(parent_delegate.clone(), child_delegate.clone()),
+            &EpochConfig {
+                current_epoch: 0,
+                epoch_started_ledger: env.ledger().sequence(),
+            },
+        );
 
         let children_key = DataKey::Children(parent_owner, parent_delegate.clone());
         let mut children: Vec<Address> = env
@@ -2316,6 +2352,17 @@ impl PermissionsContract {
             .unwrap_or(0)
     }
 
+    /// Returns the current execution epoch for relayed spends.
+    pub fn get_execution_epoch(env: Env, owner: Address, delegate: Address) -> EpochConfig {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ExecutionEpoch(owner, delegate))
+            .unwrap_or(EpochConfig {
+                current_epoch: 0,
+                epoch_started_ledger: 0,
+            })
+    }
+
     /// Invalidates a stalled relayer nonce (and every nonce below it) for the
     /// `(owner, delegate)` pair so later signed spends are no longer blocked
     /// behind a dropped or censored submission (issue #297).
@@ -2385,11 +2432,9 @@ impl PermissionsContract {
     /// off-chain with the key registered via `set_relayer_key`; any relayer
     /// can then submit that message and signature here. The signature is
     /// verified with Soroban's ed25519 crypto primitive against the
-    /// delegate's registered public key, the `nonce` must match the
-    /// delegate's next expected nonce (preventing replay), and
+    /// delegate's registered public key, the `nonce` and `epoch` must match
+    /// the current execution context (preventing replay), and
     /// `expiration_ledger` must not yet have been reached.
-    // Reason: Soroban ABI entry point — signature is part of the published
-    // on-chain ABI and cannot be restructured without a breaking change.
     #[allow(clippy::too_many_arguments)]
     pub fn execute_spend_via_relayer(
         env: Env,
@@ -2400,12 +2445,19 @@ impl PermissionsContract {
         merchant: Address,
         nonce: u64,
         expiration_ledger: u32,
+        epoch: u32,
         signature: BytesN<64>,
     ) -> Result<(), PermissionError> {
         relayer.require_auth();
 
         if env.ledger().sequence() >= expiration_ledger {
             return Err(PermissionError::SignatureExpired);
+        }
+
+        let epoch_config =
+            Self::get_execution_epoch(env.clone(), owner.clone(), delegate.clone());
+        if epoch != epoch_config.current_epoch {
+            return Err(PermissionError::StaleEpoch);
         }
 
         let nonce_key = DataKey::RelayerNonce(owner.clone(), delegate.clone());
@@ -2427,6 +2479,7 @@ impl PermissionsContract {
             amount,
             nonce,
             expiration_ledger,
+            epoch,
         };
         let message_bytes = message.to_xdr(&env);
         env.crypto()
@@ -2951,6 +3004,27 @@ impl PermissionsContract {
         Ok(())
     }
 
+    fn bump_execution_epoch(
+        env: &Env,
+        owner: &Address,
+        delegate: &Address,
+    ) -> Result<(), PermissionError> {
+        let current = Self::get_execution_epoch(env.clone(), owner.clone(), delegate.clone());
+        let next_epoch = current
+            .current_epoch
+            .checked_add(1)
+            .ok_or(PermissionError::InvalidParam)?;
+        let updated = EpochConfig {
+            current_epoch: next_epoch,
+            epoch_started_ledger: env.ledger().sequence(),
+        };
+        env.storage().persistent().set(
+            &DataKey::ExecutionEpoch(owner.clone(), delegate.clone()),
+            &updated,
+        );
+        Ok(())
+    }
+
     pub fn pause(env: Env, owner: Address, delegate: Address) -> Result<(), PermissionError> {
         owner.require_auth();
 
@@ -2964,6 +3038,7 @@ impl PermissionsContract {
             return Err(PermissionError::AlreadyPaused);
         }
 
+        Self::bump_execution_epoch(&env, &owner, &delegate)?;
         record.status = PermissionStatus::Paused;
         env.storage().persistent().set(&perm_key, &record);
 
@@ -3011,6 +3086,7 @@ impl PermissionsContract {
             return Err(PermissionError::AlreadyActive);
         }
 
+        Self::bump_execution_epoch(&env, &owner, &delegate)?;
         record.status = PermissionStatus::Active;
         env.storage().persistent().set(&perm_key, &record);
         env.storage()

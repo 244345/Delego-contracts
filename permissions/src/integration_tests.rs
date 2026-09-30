@@ -626,6 +626,7 @@ fn test_execute_spend_via_relayer_succeeds() {
         amount: 40,
         nonce: 0,
         expiration_ledger,
+        epoch: 0,
     };
     let signature = sign_relayed_spend(&t.env, &signing_key, message);
 
@@ -637,6 +638,7 @@ fn test_execute_spend_via_relayer_succeeds() {
         &t.seller,
         &0u64,
         &expiration_ledger,
+        &0u32,
         &signature,
     );
 
@@ -674,6 +676,7 @@ fn test_execute_spend_via_relayer_enforces_velocity_limit() {
         amount: 20,
         nonce: 0,
         expiration_ledger,
+        epoch: 0,
     };
     let signature = sign_relayed_spend(&t.env, &signing_key, message);
     client.execute_spend_via_relayer(
@@ -684,6 +687,7 @@ fn test_execute_spend_via_relayer_enforces_velocity_limit() {
         &t.seller,
         &0u64,
         &expiration_ledger,
+        &0u32,
         &signature,
     );
 
@@ -695,6 +699,7 @@ fn test_execute_spend_via_relayer_enforces_velocity_limit() {
         amount: 20,
         nonce: 1,
         expiration_ledger,
+        epoch: 0,
     };
     let signature = sign_relayed_spend(&t.env, &signing_key, message);
     assert_eq!(
@@ -706,6 +711,7 @@ fn test_execute_spend_via_relayer_enforces_velocity_limit() {
             &t.seller,
             &1u64,
             &expiration_ledger,
+        &0u32,
             &signature,
         ),
         Err(Ok(PermissionError::VelocityLimitExceeded))
@@ -723,6 +729,7 @@ fn test_execute_spend_via_relayer_enforces_velocity_limit() {
         amount: 20,
         nonce: 1,
         expiration_ledger,
+        epoch: 0,
     };
     let signature = sign_relayed_spend(&t.env, &signing_key, message);
     client.execute_spend_via_relayer(
@@ -733,6 +740,7 @@ fn test_execute_spend_via_relayer_enforces_velocity_limit() {
         &t.seller,
         &1u64,
         &expiration_ledger,
+        &0u32,
         &signature,
     );
     // Only the first and third relayed spends succeeded (40 total spent).
@@ -760,6 +768,7 @@ fn test_execute_spend_via_relayer_rejects_replayed_nonce() {
         amount: 20,
         nonce: 0,
         expiration_ledger,
+        epoch: 0,
     };
     let signature = sign_relayed_spend(&t.env, &signing_key, message);
 
@@ -771,6 +780,7 @@ fn test_execute_spend_via_relayer_rejects_replayed_nonce() {
         &t.seller,
         &0u64,
         &expiration_ledger,
+        &0u32,
         &signature,
     );
 
@@ -784,10 +794,56 @@ fn test_execute_spend_via_relayer_rejects_replayed_nonce() {
             &t.seller,
             &0u64,
             &expiration_ledger,
+        &0u32,
             &signature,
         ),
         Err(Ok(PermissionError::InvalidNonce))
     );
+}
+
+#[test]
+fn test_execute_spend_via_relayer_rejects_stale_epoch_after_pause_resume() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+
+    let merchants = Vec::<Address>::new(&t.env);
+    client.grant(&t.buyer, &t.agent, &100, &50, &merchants, &3600u32);
+
+    let (signing_key, public_key) = test_keypair(&t.env, 23);
+    client.set_relayer_key(&t.agent, &public_key);
+    let expiration_ledger = t.env.ledger().sequence() + 100;
+    let message = RelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 20,
+        nonce: 0,
+        expiration_ledger,
+        epoch: 0,
+    };
+    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+
+    client.pause(&t.buyer, &t.agent);
+    client.resume(&t.buyer, &t.agent);
+
+    let epoch = client.get_execution_epoch(&t.buyer, &t.agent);
+    assert_eq!(epoch.current_epoch, 2);
+    assert_eq!(
+        client.try_execute_spend_via_relayer(
+            &relayer,
+            &t.buyer,
+            &t.agent,
+            &20,
+            &t.seller,
+            &0u64,
+            &expiration_ledger,
+            &0u32,
+            &signature,
+        ),
+        Err(Ok(PermissionError::StaleEpoch))
+    );
+    assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 0);
 }
 
 #[test]
@@ -814,6 +870,7 @@ fn test_execute_spend_via_relayer_rejects_invalid_signature() {
         amount: 20,
         nonce: 0,
         expiration_ledger,
+        epoch: 0,
     };
     let signature = sign_relayed_spend(&t.env, &wrong_key, message);
 
@@ -825,6 +882,7 @@ fn test_execute_spend_via_relayer_rejects_invalid_signature() {
         &t.seller,
         &0u64,
         &expiration_ledger,
+        &0u32,
         &signature,
     );
 }
@@ -851,6 +909,7 @@ fn test_execute_spend_via_relayer_rejects_expired_signature() {
         amount: 20,
         nonce: 0,
         expiration_ledger,
+        epoch: 0,
     };
     let signature = sign_relayed_spend(&t.env, &signing_key, message);
 
@@ -863,6 +922,7 @@ fn test_execute_spend_via_relayer_rejects_expired_signature() {
             &t.seller,
             &0u64,
             &expiration_ledger,
+        &0u32,
             &signature,
         ),
         Err(Ok(PermissionError::SignatureExpired))
@@ -888,6 +948,7 @@ fn test_execute_spend_via_relayer_without_registered_key_fails() {
         amount: 20,
         nonce: 0,
         expiration_ledger,
+        epoch: 0,
     };
     let signature = sign_relayed_spend(&t.env, &signing_key, message);
 
@@ -900,6 +961,7 @@ fn test_execute_spend_via_relayer_without_registered_key_fails() {
             &t.seller,
             &0u64,
             &expiration_ledger,
+        &0u32,
             &signature,
         ),
         Err(Ok(PermissionError::RelayerKeyNotSet))
@@ -927,6 +989,7 @@ fn test_execute_spend_via_relayer_enforces_per_tx_limit() {
         amount: 999,
         nonce: 0,
         expiration_ledger,
+        epoch: 0,
     };
     let signature = sign_relayed_spend(&t.env, &signing_key, message);
 
@@ -939,6 +1002,7 @@ fn test_execute_spend_via_relayer_enforces_per_tx_limit() {
             &t.seller,
             &0u64,
             &expiration_ledger,
+        &0u32,
             &signature,
         ),
         Err(Ok(PermissionError::ExceedsPerTxLimit))
@@ -1057,6 +1121,7 @@ fn test_usage_stats_include_relayed_spends() {
         amount: 250,
         nonce: 0,
         expiration_ledger,
+        epoch: 0,
     };
     let signature = sign_relayed_spend(&t.env, &signing_key, message);
     client.execute_spend_via_relayer(
@@ -1067,6 +1132,7 @@ fn test_usage_stats_include_relayed_spends() {
         &t.seller,
         &0u64,
         &expiration_ledger,
+        &0u32,
         &signature,
     );
 
@@ -1346,6 +1412,7 @@ fn test_relayed_child_spend_decrements_parent_budget() {
         amount: 75,
         nonce: 0,
         expiration_ledger,
+        epoch: 0,
     };
     let signature = sign_relayed_spend(&t.env, &signing_key, message);
 
@@ -1357,6 +1424,7 @@ fn test_relayed_child_spend_decrements_parent_budget() {
         &t.seller,
         &0u64,
         &expiration_ledger,
+        &0u32,
         &signature,
     );
 
@@ -1421,6 +1489,7 @@ fn test_relayed_spend_respects_parent_budget_cap() {
         amount: 20,
         nonce: 0,
         expiration_ledger,
+        epoch: 0,
     };
     let signature = sign_relayed_spend(&t.env, &signing_key, message);
 
@@ -1436,6 +1505,7 @@ fn test_relayed_spend_respects_parent_budget_cap() {
             &t.seller,
             &0u64,
             &expiration_ledger,
+        &0u32,
             &signature,
         ),
         Err(Ok(PermissionError::ExceedsTotalLimit))
@@ -1559,6 +1629,7 @@ fn test_merchant_allowlist_enforced_on_relayed_spend() {
             amount: 20,
             nonce: 0,
             expiration_ledger,
+            epoch: 0,
         },
     );
 
@@ -1571,6 +1642,7 @@ fn test_merchant_allowlist_enforced_on_relayed_spend() {
             &rogue,
             &0u64,
             &expiration_ledger,
+        &0u32,
             &signature,
         ),
         Err(Ok(PermissionError::MerchantNotAllowed))
@@ -1644,6 +1716,7 @@ fn test_cancel_nonce_unblocks_subsequent_relayed_spends() {
                 amount: 20,
                 nonce,
                 expiration_ledger,
+                epoch: 0,
             },
         )
     };
@@ -1660,6 +1733,7 @@ fn test_cancel_nonce_unblocks_subsequent_relayed_spends() {
             &t.seller,
             &1u64,
             &expiration_ledger,
+        &0u32,
             &next,
         ),
         Err(Ok(PermissionError::InvalidNonce))
@@ -1678,6 +1752,7 @@ fn test_cancel_nonce_unblocks_subsequent_relayed_spends() {
             &t.seller,
             &0u64,
             &expiration_ledger,
+        &0u32,
             &stalled,
         ),
         Err(Ok(PermissionError::InvalidNonce))
@@ -1691,6 +1766,7 @@ fn test_cancel_nonce_unblocks_subsequent_relayed_spends() {
         &t.seller,
         &1u64,
         &expiration_ledger,
+        &0u32,
         &next,
     );
     assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 2);
