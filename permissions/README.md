@@ -19,6 +19,9 @@ pause/resume, and permission transfers.
 | `update_expiry` | owner | Change a grant's expiry ledger |
 | `can_spend` | — | Check whether a spend is allowed (limits + expiry) |
 | `execute_spend` | delegate | Spend within the grant limits; emits `PermissionSpendEvent` |
+| `grant_scoped` / `re_grant_scoped` | owner | Grant/replace a permission restricted to specific contract entrypoints |
+| `set_permission_scope` / `get_permission_scope` | owner | Set, replace or clear a permission's function scope |
+| `can_spend_scoped` / `execute_spend_scoped` | delegate | Spend checks/execution that state the invoked contract entrypoint |
 | `set_relayer_key` / `get_relayer_key` | delegate | Configure the key used for relayer-signed spends |
 | `execute_spend_via_relayer` | relayer signature | Gasless spend using a relayer signature + nonce |
 | `grant_multi_owner` | owners | Multi-owner grant (quorum-based authorization) |
@@ -48,6 +51,51 @@ Events are emitted with the topic prefix `("perm", …)`:
 | `"spent"` / `"mspent"` / `"relayed"` | `PermissionSpendEvent` | `execute_spend` / `execute_spend_multi` / `execute_spend_via_relayer` |
 | `"allowinc"` / `"allowdec"` | — | `increase_allowance` / `decrease_allowance` |
 | `"paused"` / `"resumed"` / `"gpaused"` | `PermissionPausedEvent` / `PermissionResumedEvent` | `pause` / `resume` / `pause_grants` |
+| `"scope"` | `PermissionScopeUpdatedEvent` | `grant_scoped` / `re_grant_scoped` / `set_permission_scope` / `transfer_permission` |
+
+## Function-scoped permissions
+
+Limits and merchant lists describe *how much* a delegate may spend, not *what*
+it may invoke. A `ScopedPermissionConfig` narrows a grant to one target
+contract and an explicit list of entrypoints:
+
+```rust
+ScopedPermissionConfig {
+    target_contract: escrow_address,
+    allowed_function_symbols: vec![Symbol::new(&env, "fund")],
+}
+```
+
+Scoping **fails closed**:
+
+- A scoped grant can only be spent through `can_spend_scoped` /
+  `execute_spend_scoped`, which state the invoked contract and function. The
+  unscoped `can_spend` / `execute_spend` entrypoints reject a scoped grant with
+  `PermissionError::UnauthorizedFunction`, so the check cannot be skipped by
+  omitting the invocation.
+- `target_contract` must match the contract named by the invocation, and
+  `invoked_function` must appear in `allowed_function_symbols`; either mismatch
+  is rejected with `PermissionError::UnauthorizedFunction` and no allowance
+  moves.
+- `grant_child` sub-delegations inherit their parent's scope, so a delegate
+  cannot escalate a narrow grant into a wider one for a downstream agent. The
+  effective scope is the intersection across the whole parent chain.
+- `transfer_permission` carries the scope to the incoming delegate.
+- `allowed_function_symbols` must be non-empty, duplicate-free and at most
+  `MAX_FUNCTIONS_PER_PERMISSION` entries.
+- `re_grant` replaces the delegation wholesale and therefore clears the scope;
+  `re_grant_with_metadata` exists to change limits and metadata, so it carries
+  an existing scope over instead. Dropping a scope is always a deliberate act
+  via `re_grant` or `set_permission_scope(owner, delegate, None)`.
+- Because `RelayedSpendMessage` has no entrypoint field, a scoped grant cannot
+  be spent via `execute_spend_via_relayer` — the signature cannot attest which
+  function is being invoked. Relayed agents on a scoped grant submit
+  `execute_spend_scoped` themselves.
+
+The scope is stored under its own key rather than inside `PermissionRecord`, so
+the serialized shape of existing permissions is unchanged and delegations
+granted before this feature keep loading. An absent scope means the delegation
+is unscoped and behaves exactly as before.
 
 ## Development
 

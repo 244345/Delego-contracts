@@ -2,13 +2,15 @@
 #[allow(clippy::module_inception)]
 mod test {
     use crate::{
-        validate_relayer_fee, DataKey, PermissionError, PermissionRecord, PermissionStatus,
-        PermissionsContract, PermissionsContractClient, MAX_ABSOLUTE_RELAYER_STROOPS,
+        validate_relayer_fee, DataKey, PermissionError, PermissionRecord,
+        PermissionScopeUpdatedEvent, PermissionStatus, PermissionsContract,
+        PermissionsContractClient, ScopedPermissionConfig, MAX_ABSOLUTE_RELAYER_STROOPS,
         MAX_RELAYER_FEE_BPS,
     };
     use soroban_sdk::{
+        symbol_short,
         testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
-        Address, Env, IntoVal, TryIntoVal, Vec,
+        Address, Env, IntoVal, Symbol, TryIntoVal, Vec,
     };
 
     const MAX_SPEND_CPU_INSTRUCTIONS: u64 = 2_000_000;
@@ -2953,7 +2955,6 @@ mod test {
         assert!(!found_old);
     }
 
-
     // --- Batch sweep tests ---
 
     #[test]
@@ -3188,6 +3189,351 @@ mod test {
         // Owner can cancel the pending decrease.
         assert_eq!(
             client.try_cancel_pending_decrease(&owner, &delegate),
+            Ok(Ok(()))
+        );
+    }
+    // ---------------------------------------------------------------------
+    // Issue #369 — function-scoped permission grants
+    // ---------------------------------------------------------------------
+
+    /// Builds a scope naming `target_contract` and the given entrypoints.
+    fn scope_for(
+        env: &Env,
+        target_contract: &Address,
+        functions: &[&str],
+    ) -> ScopedPermissionConfig {
+        let mut symbols = Vec::new(env);
+        for f in functions {
+            symbols.push_back(Symbol::new(env, f));
+        }
+        ScopedPermissionConfig {
+            target_contract: target_contract.clone(),
+            allowed_function_symbols: symbols,
+        }
+    }
+
+    /// Owner grants `delegate` a budget that may only invoke `functions` on
+    /// `target_contract`. Returns the client plus the fixture addresses.
+    fn setup_scoped_grant(
+        env: &Env,
+        client: &PermissionsContractClient,
+        target_contract: &Address,
+        functions: &[&str],
+    ) -> (Address, Address, Address) {
+        let owner = Address::generate(env);
+        let delegate = Address::generate(env);
+        let merchant = Address::generate(env);
+
+        let merchants = Vec::<Address>::new(env);
+        client.grant_scoped(
+            &owner,
+            &delegate,
+            &1_000,
+            &500,
+            &merchants,
+            &10_000,
+            &scope_for(env, target_contract, functions),
+        );
+
+        (owner, delegate, merchant)
+    }
+
+    /// The pre-authorized entrypoint is the whole point of the feature: the
+    /// delegate must still be able to spend normally through it.
+    #[test]
+    fn test_scoped_grant_allows_pre_authorized_function() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let escrow = Address::generate(&env);
+        let (owner, delegate, merchant) = setup_scoped_grant(&env, &client, &escrow, &["fund"]);
+
+        assert_eq!(
+            client.try_can_spend_scoped(
+                &owner,
+                &delegate,
+                &100,
+                &merchant,
+                &Some(escrow.clone()),
+                &Some(Symbol::new(&env, "fund"))
+            ),
+            Ok(Ok(()))
+        );
+        assert_eq!(
+            client.try_execute_spend_scoped(
+                &owner,
+                &delegate,
+                &100,
+                &merchant,
+                &Some(escrow.clone()),
+                &Some(Symbol::new(&env, "fund"))
+            ),
+            Ok(Ok(()))
+        );
+        assert_eq!(client.get_remaining_allowance(&owner, &delegate), 900);
+    }
+
+    /// Core acceptance criterion: a delegate scoped to `escrow.fund` is
+    /// refused every other entrypoint of that same contract.
+    #[test]
+    fn test_scoped_grant_rejects_unapproved_function() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let escrow = Address::generate(&env);
+        let (owner, delegate, merchant) = setup_scoped_grant(&env, &client, &escrow, &["fund"]);
+
+        for forbidden in ["withdraw", "refund", "dispute", "admin_bypass"] {
+            assert_eq!(
+                client.try_can_spend_scoped(
+                    &owner,
+                    &delegate,
+                    &100,
+                    &merchant,
+                    &Some(escrow.clone()),
+                    &Some(Symbol::new(&env, forbidden))
+                ),
+                Err(Ok(PermissionError::UnauthorizedFunction)),
+                "entrypoint {forbidden} should not be authorized"
+            );
+        }
+
+        // A rejected invocation must not move any allowance.
+        assert_eq!(
+            client.try_execute_spend_scoped(
+                &owner,
+                &delegate,
+                &100,
+                &merchant,
+                &Some(escrow.clone()),
+                &Some(Symbol::new(&env, "withdraw"))
+            ),
+            Err(Ok(PermissionError::UnauthorizedFunction))
+        );
+        assert_eq!(client.get_remaining_allowance(&owner, &delegate), 1_000);
+    }
+
+    /// Naming an allowed function is not enough: the contract it is invoked on
+    /// must be the scoped one, otherwise the delegate could aim `fund` at a
+    /// contract the owner never vetted.
+    #[test]
+    fn test_scoped_grant_rejects_wrong_target_contract() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let escrow = Address::generate(&env);
+        let attacker_contract = Address::generate(&env);
+        let (owner, delegate, merchant) = setup_scoped_grant(&env, &client, &escrow, &["fund"]);
+
+        assert_eq!(
+            client.try_execute_spend_scoped(
+                &owner,
+                &delegate,
+                &100,
+                &merchant,
+                &Some(attacker_contract.clone()),
+                &Some(Symbol::new(&env, "fund"))
+            ),
+            Err(Ok(PermissionError::UnauthorizedFunction))
+        );
+        assert_eq!(client.get_remaining_allowance(&owner, &delegate), 1_000);
+    }
+
+    /// Scoping fails closed. A scoped grant must not be spendable through the
+    /// pre-existing unscoped entrypoints, otherwise the whole check could be
+    /// bypassed by simply not stating the invocation.
+    #[test]
+    fn test_scoped_grant_rejected_through_unscoped_entrypoints() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let escrow = Address::generate(&env);
+        let (owner, delegate, merchant) = setup_scoped_grant(&env, &client, &escrow, &["fund"]);
+
+        assert_eq!(
+            client.try_can_spend(&owner, &delegate, &100, &merchant),
+            Err(Ok(PermissionError::UnauthorizedFunction))
+        );
+        assert_eq!(
+            client.try_execute_spend(&owner, &delegate, &100, &merchant),
+            Err(Ok(PermissionError::UnauthorizedFunction))
+        );
+        assert_eq!(client.get_remaining_allowance(&owner, &delegate), 1_000);
+    }
+
+    /// Supplying the target but withholding the function (or vice versa) is
+    /// still a rejection — a partial invocation never satisfies a scope.
+    #[test]
+    fn test_scoped_grant_rejects_incomplete_invocation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let escrow = Address::generate(&env);
+        let (owner, delegate, merchant) = setup_scoped_grant(&env, &client, &escrow, &["fund"]);
+
+        // Neither half stated.
+        assert_eq!(
+            client.try_execute_spend_scoped(&owner, &delegate, &100, &merchant, &None, &None),
+            Err(Ok(PermissionError::UnauthorizedFunction))
+        );
+        // Contract stated, function withheld.
+        assert_eq!(
+            client.try_execute_spend_scoped(
+                &owner,
+                &delegate,
+                &100,
+                &merchant,
+                &Some(escrow.clone()),
+                &None
+            ),
+            Err(Ok(PermissionError::UnauthorizedFunction))
+        );
+        // Function stated, contract withheld.
+        assert_eq!(
+            client.try_execute_spend_scoped(
+                &owner,
+                &delegate,
+                &100,
+                &merchant,
+                &None,
+                &Some(Symbol::new(&env, "fund"))
+            ),
+            Err(Ok(PermissionError::UnauthorizedFunction))
+        );
+        assert_eq!(client.get_remaining_allowance(&owner, &delegate), 1_000);
+    }
+
+    /// Backwards compatibility: delegations without a scope behave exactly as
+    /// they did before, through either entrypoint, and report `None`.
+    #[test]
+    fn test_unscoped_grant_unaffected_by_scoped_entrypoint() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let merchant = Address::generate(&env);
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &1_000, &500, &merchants, &10_000);
+
+        assert_eq!(client.get_permission_scope(&owner, &delegate), None);
+
+        // A delegate-supplied invocation is advisory for an unscoped grant.
+        assert_eq!(
+            client.try_execute_spend_scoped(
+                &owner,
+                &delegate,
+                &100,
+                &merchant,
+                &Some(Address::generate(&env)),
+                &Some(Symbol::new(&env, "anything"))
+            ),
+            Ok(Ok(()))
+        );
+        assert_eq!(client.get_remaining_allowance(&owner, &delegate), 900);
+
+        // And the original entrypoint still works for the next spend.
+        assert_eq!(
+            client.try_execute_spend(&owner, &delegate, &100, &merchant),
+            Ok(Ok(()))
+        );
+        assert_eq!(client.get_remaining_allowance(&owner, &delegate), 800);
+    }
+
+    /// An owner can tighten an existing grant after the fact, and the new
+    /// restriction is immediately enforced.
+    #[test]
+    fn test_set_permission_scope_narrows_existing_grant() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let merchant = Address::generate(&env);
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &1_000, &500, &merchants, &10_000);
+
+        let escrow = Address::generate(&env);
+        client.set_permission_scope(
+            &owner,
+            &delegate,
+            &Some(scope_for(&env, &escrow, &["fund", "release"])),
+        );
+
+        let stored = client.get_permission_scope(&owner, &delegate).unwrap();
+        assert_eq!(stored.target_contract, escrow);
+        assert_eq!(stored.allowed_function_symbols.len(), 2);
+
+        assert_eq!(
+            client.try_execute_spend_scoped(
+                &owner,
+                &delegate,
+                &100,
+                &merchant,
+                &Some(escrow.clone()),
+                &Some(Symbol::new(&env, "release"))
+            ),
+            Ok(Ok(()))
+        );
+        assert_eq!(
+            client.try_execute_spend_scoped(
+                &owner,
+                &delegate,
+                &100,
+                &merchant,
+                &Some(escrow.clone()),
+                &Some(Symbol::new(&env, "cancel"))
+            ),
+            Err(Ok(PermissionError::UnauthorizedFunction))
+        );
+        // The unscoped path is now closed too.
+        assert_eq!(
+            client.try_execute_spend(&owner, &delegate, &100, &merchant),
+            Err(Ok(PermissionError::UnauthorizedFunction))
+        );
+        assert_eq!(client.get_remaining_allowance(&owner, &delegate), 900);
+    }
+
+    /// Clearing the scope is how an owner deliberately widens authority again;
+    /// the storage slot is removed rather than left behind holding an empty
+    /// config.
+    #[test]
+    fn test_set_permission_scope_can_be_cleared() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let escrow = Address::generate(&env);
+        let (owner, delegate, merchant) = setup_scoped_grant(&env, &client, &escrow, &["fund"]);
+
+        assert!(client.get_permission_scope(&owner, &delegate).is_some());
+
+        client.set_permission_scope(&owner, &delegate, &None);
+        assert_eq!(client.get_permission_scope(&owner, &delegate), None);
+        env.as_contract(&contract_id, || {
+            assert!(!env
+                .storage()
+                .persistent()
+                .has(&DataKey::PermissionScope(owner.clone(), delegate.clone())));
+        });
+
+        assert_eq!(
+            client.try_execute_spend(&owner, &delegate, &100, &merchant),
             Ok(Ok(()))
         );
     }
@@ -3441,5 +3787,400 @@ mod test {
         );
         let detail = client.get_allowance_detail(&owner, &delegate);
         assert_eq!(detail.limit, 800);
+    }
+    /// A limit bump through the metadata entrypoint must not silently widen
+    /// authority by dropping the owner's function scope. `re_grant` is the
+    /// explicit full-replace path that clears it (issue #369).
+    #[test]
+    fn test_re_grant_with_metadata_preserves_scope() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.set_admin(&admin);
+        client.register_schema(&admin, &symbol_short!("v1"));
+
+        let escrow = Address::generate(&env);
+        let (owner, delegate, merchant) = setup_scoped_grant(&env, &client, &escrow, &["fund"]);
+        let scope_before = client.get_permission_scope(&owner, &delegate);
+        assert!(scope_before.is_some());
+
+        let merchants = Vec::<Address>::new(&env);
+        client.re_grant_with_metadata(&owner, &delegate, &2_000, &200, &merchants, &10_000, &None);
+
+        assert_eq!(
+            client.get_permission_scope(&owner, &delegate),
+            scope_before,
+            "re_grant_with_metadata must carry the function scope over unchanged"
+        );
+
+        // The narrowed scope is still enforced after the limit bump: the
+        // allowed entrypoint works, a different one does not.
+        assert_eq!(
+            client.try_execute_spend_scoped(
+                &owner,
+                &delegate,
+                &100,
+                &merchant,
+                &Some(escrow.clone()),
+                &Some(symbol_short!("fund"))
+            ),
+            Ok(Ok(()))
+        );
+        assert_eq!(
+            client.try_execute_spend_scoped(
+                &owner,
+                &delegate,
+                &100,
+                &merchant,
+                &Some(escrow),
+                &Some(symbol_short!("withdraw"))
+            ),
+            Err(Ok(PermissionError::UnauthorizedFunction))
+        );
+    }
+
+    /// Lateral privilege escalation: a delegate holding `escrow.fund` cannot
+    /// sub-delegate to an agent that reaches a different entrypoint, because
+    /// `grant_child` children inherit the parent's scope.
+    #[test]
+    fn test_child_permission_inherits_parent_scope() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let grandchild = Address::generate(&env);
+        let merchant = Address::generate(&env);
+
+        let escrow = Address::generate(&env);
+        let merchants = Vec::<Address>::new(&env);
+        client.grant_scoped(
+            &owner,
+            &delegate,
+            &1_000,
+            &500,
+            &merchants,
+            &10_000,
+            &scope_for(&env, &escrow, &["fund"]),
+        );
+
+        client.grant_child(
+            &owner,
+            &delegate,
+            &grandchild,
+            &1_000,
+            &500,
+            &merchants,
+            &10_000,
+        );
+
+        // The child carries no scope of its own…
+        assert_eq!(client.get_permission_scope(&delegate, &grandchild), None);
+
+        // …so it cannot widen beyond the parent's allowed entrypoint.
+        assert_eq!(
+            client.try_execute_spend_scoped(
+                &owner,
+                &delegate,
+                &100,
+                &merchant,
+                &Some(escrow.clone()),
+                &Some(Symbol::new(&env, "withdraw"))
+            ),
+            Err(Ok(PermissionError::UnauthorizedFunction))
+        );
+        assert_eq!(
+            client.try_execute_spend_scoped(
+                &owner,
+                &delegate,
+                &100,
+                &merchant,
+                &Some(Address::generate(&env)),
+                &Some(Symbol::new(&env, "fund"))
+            ),
+            Err(Ok(PermissionError::UnauthorizedFunction))
+        );
+        // Nor can it escape the scope by omitting the invocation entirely.
+        assert_eq!(
+            client.try_execute_spend(&owner, &delegate, &100, &merchant),
+            Err(Ok(PermissionError::UnauthorizedFunction))
+        );
+
+        // A grandchild spending under the inherited scope can only reach the
+        // parent's allowed entrypoint too: `grant_child` cannot be used to
+        // launder a wider authority to a downstream agent.
+        assert_eq!(
+            client.try_execute_spend_scoped(
+                &delegate,
+                &grandchild,
+                &100,
+                &merchant,
+                &Some(escrow.clone()),
+                &Some(Symbol::new(&env, "withdraw"))
+            ),
+            Err(Ok(PermissionError::UnauthorizedFunction))
+        );
+        assert_eq!(
+            client.try_execute_spend_scoped(
+                &delegate,
+                &grandchild,
+                &100,
+                &merchant,
+                &Some(Address::generate(&env)),
+                &Some(Symbol::new(&env, "fund"))
+            ),
+            Err(Ok(PermissionError::UnauthorizedFunction))
+        );
+        // Nor by omitting the invocation entirely.
+        assert_eq!(
+            client.try_execute_spend(&delegate, &grandchild, &100, &merchant),
+            Err(Ok(PermissionError::UnauthorizedFunction))
+        );
+
+        // The pre-authorized entrypoint works all the way down, debiting the
+        // grandchild first and then the parent that backs it.
+        assert_eq!(
+            client.try_execute_spend_scoped(
+                &delegate,
+                &grandchild,
+                &100,
+                &merchant,
+                &Some(escrow.clone()),
+                &Some(Symbol::new(&env, "fund"))
+            ),
+            Ok(Ok(()))
+        );
+        assert_eq!(client.get_remaining_allowance(&delegate, &grandchild), 900);
+        // The grandchild's spend is also debited from the parent that backs
+        // it, so the chain stays solvent.
+        assert_eq!(client.get_remaining_allowance(&owner, &delegate), 900);
+    }
+
+    /// `transfer_permission` hands the same authority to a new delegate, so the
+    /// scope must travel with it rather than being silently dropped.
+    #[test]
+    fn test_transfer_permission_preserves_scope() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let escrow = Address::generate(&env);
+        let (owner, old_delegate, merchant) = setup_scoped_grant(&env, &client, &escrow, &["fund"]);
+        let new_delegate = Address::generate(&env);
+
+        client.transfer_permission(&owner, &old_delegate, &new_delegate);
+
+        let stored = client.get_permission_scope(&owner, &new_delegate).unwrap();
+        assert_eq!(stored.target_contract, escrow);
+        assert_eq!(stored.allowed_function_symbols.len(), 1);
+
+        assert_eq!(
+            client.try_execute_spend_scoped(
+                &owner,
+                &new_delegate,
+                &100,
+                &merchant,
+                &Some(escrow.clone()),
+                &Some(Symbol::new(&env, "withdraw"))
+            ),
+            Err(Ok(PermissionError::UnauthorizedFunction))
+        );
+        assert_eq!(
+            client.try_execute_spend_scoped(
+                &owner,
+                &new_delegate,
+                &100,
+                &merchant,
+                &Some(escrow.clone()),
+                &Some(Symbol::new(&env, "fund"))
+            ),
+            Ok(Ok(()))
+        );
+    }
+
+    /// A malformed scope is rejected at write time so no unscannable grant is
+    /// ever recorded.
+    #[test]
+    fn test_scoped_grant_rejects_malformed_scope() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let escrow = Address::generate(&env);
+        let merchants = Vec::<Address>::new(&env);
+
+        // Empty allowlist: unscannable and indistinguishable from "no scope".
+        assert_eq!(
+            client.try_grant_scoped(
+                &owner,
+                &delegate,
+                &1_000,
+                &500,
+                &merchants,
+                &10_000,
+                &scope_for(&env, &escrow, &[])
+            ),
+            Err(Ok(PermissionError::InvalidParam))
+        );
+
+        // Duplicate symbols.
+        assert_eq!(
+            client.try_grant_scoped(
+                &owner,
+                &delegate,
+                &1_000,
+                &500,
+                &merchants,
+                &10_000,
+                &scope_for(&env, &escrow, &["fund", "fund"])
+            ),
+            Err(Ok(PermissionError::InvalidParam))
+        );
+
+        // Over the bound.
+        let mut too_many: soroban_sdk::Vec<Symbol> = Vec::new(&env);
+        for i in 0..=crate::MAX_FUNCTIONS_PER_PERMISSION {
+            too_many.push_back(Symbol::new(&env, &format!("fn_{i}")));
+        }
+        assert_eq!(
+            client.try_grant_scoped(
+                &owner,
+                &delegate,
+                &1_000,
+                &500,
+                &merchants,
+                &10_000,
+                &ScopedPermissionConfig {
+                    target_contract: escrow.clone(),
+                    allowed_function_symbols: too_many,
+                }
+            ),
+            Err(Ok(PermissionError::InvalidParam))
+        );
+
+        // Nothing was written by any of the rejected calls.
+        assert_eq!(
+            client.try_get_permission(&owner, &delegate),
+            Err(Ok(PermissionError::PermissionNotFound))
+        );
+        assert_eq!(client.get_permission_scope(&owner, &delegate), None);
+    }
+
+    /// `set_permission_scope` applies the same bound as the grant path.
+    #[test]
+    fn test_set_permission_scope_rejects_malformed_scope() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let escrow = Address::generate(&env);
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &1_000, &500, &merchants, &10_000);
+
+        assert_eq!(
+            client.try_set_permission_scope(
+                &owner,
+                &delegate,
+                &Some(scope_for(&env, &escrow, &[]))
+            ),
+            Err(Ok(PermissionError::InvalidParam))
+        );
+        assert_eq!(client.get_permission_scope(&owner, &delegate), None);
+    }
+
+    /// `set_permission_scope` on an unknown pair is a no-op error, not a
+    /// silently created scope that nothing would ever consult.
+    #[test]
+    fn test_set_permission_scope_unknown_pair() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let escrow = Address::generate(&env);
+
+        assert_eq!(
+            client.try_set_permission_scope(
+                &owner,
+                &delegate,
+                &Some(scope_for(&env, &escrow, &["fund"]))
+            ),
+            Err(Ok(PermissionError::PermissionNotFound))
+        );
+    }
+
+    /// `preview_spend` surfaces the scoping rejection with its own reason code
+    /// so an off-chain agent can distinguish it from a limit failure.
+    #[test]
+    fn test_preview_spend_reports_unauthorized_function() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let escrow = Address::generate(&env);
+        let (owner, delegate, merchant) = setup_scoped_grant(&env, &client, &escrow, &["fund"]);
+
+        let preview = client.preview_spend(&owner, &delegate, &100, &merchant);
+        assert!(!preview.allowed);
+        assert_eq!(preview.reason, Symbol::new(&env, "bad_function"));
+        assert_eq!(preview.remaining_after, 1_000);
+    }
+
+    /// A scope change is auditable, mirroring every other policy mutation.
+    #[test]
+    fn test_scope_change_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let escrow = Address::generate(&env);
+        let (owner, delegate, _merchant) = setup_scoped_grant(&env, &client, &escrow, &["fund"]);
+
+        // `env.events().all()` only surfaces the most recent invocation, so
+        // each write is inspected right after it happens.
+        let last_scope_event = |env: &Env| -> Option<PermissionScopeUpdatedEvent> {
+            let mut out = None;
+            for (contract, topics, value) in env.events().all().iter() {
+                if contract != contract_id || topics.len() != 2 {
+                    continue;
+                }
+                let t0: Symbol = topics.get(0).unwrap().try_into_val(env).unwrap();
+                let t1: Symbol = topics.get(1).unwrap().try_into_val(env).unwrap();
+                if t0 == symbol_short!("perm") && t1 == symbol_short!("scope") {
+                    out = Some(value.clone().try_into_val(env).unwrap());
+                }
+            }
+            out
+        };
+
+        // The grant itself announces the scope it created.
+        let granted = last_scope_event(&env).expect("grant must announce its scope");
+        assert_eq!(granted.owner, owner);
+        assert_eq!(granted.delegate, delegate);
+        assert_eq!(granted.target_contract, Some(escrow.clone()));
+        assert_eq!(granted.function_count, 1);
+
+        // Clearing it announces the removal too, with a zero function count.
+        client.set_permission_scope(&owner, &delegate, &None);
+
+        let cleared = last_scope_event(&env).expect("clearing must announce itself");
+        assert_eq!(cleared.function_count, 0);
+        assert_eq!(cleared.target_contract, None);
     }
 }

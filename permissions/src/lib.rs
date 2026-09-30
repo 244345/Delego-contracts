@@ -72,6 +72,13 @@ fn relayed_spend_signing_payload(env: &Env, message: &RelayedSpendMessage) -> so
 /// costs unexpectedly.
 pub const MAX_MERCHANTS_PER_PERMISSION: u32 = 25;
 
+/// Maximum number of entrypoint symbols allowed in a single permission's
+/// `ScopedPermissionConfig` (issue #369). Mirrors
+/// [`MAX_MERCHANTS_PER_PERMISSION`]: a scope is a deliberately short list of
+/// pre-authorized function signatures, and the bound keeps the per-spend
+/// membership scan's cost predictable.
+pub const MAX_FUNCTIONS_PER_PERMISSION: u32 = 10;
+
 /// Maximum number of entries retained in a single (owner, delegate) pair's
 /// audit log. Once exceeded, the oldest entry is dropped on each append so
 /// long-lived permissions don't accrue unbounded storage.
@@ -171,6 +178,12 @@ pub enum PermissionError {
     OutsideAuthorizedWindow = 2415,
     /// Relayer-submitted signature was created for an earlier execution epoch
     StaleEpoch = 2416,
+    /// The invoked contract entrypoint is outside the delegation's
+    /// `ScopedPermissionConfig`: either the caller named a target contract
+    /// that is not the scoped one, named a function that is not in
+    /// `allowed_function_symbols`, or (for a scoped grant) did not state the
+    /// invocation at all. Scoping fails closed (issue #369).
+    UnauthorizedFunction = 2417,
     /// Admin-gated call made before `set_admin` has ever been called
     NotInitialized = 2500,
 }
@@ -220,12 +233,13 @@ mod error_code_tests {
         PermissionError::GrantNotYetActive as u32,
         PermissionError::OutsideAuthorizedWindow as u32,
         PermissionError::StaleEpoch as u32,
+        PermissionError::UnauthorizedFunction as u32,
         PermissionError::NotInitialized as u32,
     ];
 
     #[test]
     fn permission_error_codes_are_unique_and_in_reserved_range() {
-        assert_eq!(PERMISSION_ERROR_CODES.len(), 33);
+        assert_eq!(PERMISSION_ERROR_CODES.len(), 34);
 
         let permission_range = ERROR_CODE_RANGES
             .iter()
@@ -346,6 +360,50 @@ pub struct PermissionRecord {
 pub struct EpochConfig {
     pub current_epoch: u32,
     pub epoch_started_ledger: u32,
+}
+
+/// Restricts a delegated permission to a single target contract and an
+/// explicit allowlist of contract entrypoints (issue #369).
+///
+/// Amounts and merchant addresses alone do not describe *what* a delegate is
+/// allowed to do. This config lets an owner say "this agent may only ever call
+/// `fund` on this one escrow contract" and have the permission contract refuse
+/// every other entrypoint, including ones the target contract exposes but the
+/// owner never intended to hand over.
+///
+/// A scope is attached to a `(owner, delegate)` pair and lives in its own
+/// storage slot (`DataKey::PermissionScope`) rather than inside
+/// [`PermissionRecord`]. That keeps `PermissionRecord`'s serialized shape
+/// untouched — permissions granted before this feature keep loading — and
+/// mirrors how [`MerchantAllowlist`] (issue #296) stores the optional
+/// seller-specific allowlist beside the record. The absence of a scope means
+/// the delegation is unscoped and behaves exactly as it did before.
+///
+/// Semantics are enforced by `can_spend_scoped` / `execute_spend_scoped`:
+/// - `target_contract` must equal the contract the invocation names.
+/// - `invoked_function` must appear in `allowed_function_symbols`.
+/// - Both must be supplied; a scoped grant cannot be spent through the
+///   unscoped entrypoints, so the check can never be skipped by omitting it.
+///
+/// `allowed_function_symbols` is bounded by `MAX_FUNCTIONS_PER_PERMISSION` and
+/// must be non-empty and duplicate-free.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScopedPermissionConfig {
+    pub target_contract: Address,
+    pub allowed_function_symbols: Vec<Symbol>,
+}
+
+/// Emitted when a delegation's function scope is set, replaced, or cleared
+/// (issue #369). `target_contract` is `None` when a scope is cleared, since a
+/// cleared scope names no target contract.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PermissionScopeUpdatedEvent {
+    pub owner: Address,
+    pub delegate: Address,
+    pub target_contract: Option<Address>,
+    pub function_count: u32,
 }
 
 /// A delegation permission jointly controlled by multiple owners (issue #326).
@@ -959,6 +1017,9 @@ pub enum DataKey {
     /// Business-hour / day-of-week spend restriction for a (owner, delegate)
     /// delegation (issue #315).
     TimeWindowRestriction(Address, Address),
+    /// Function scope restricting a (owner, delegate) delegation to specific
+    /// contract entrypoints (issue #369). Absent means unscoped.
+    PermissionScope(Address, Address),
 }
 
 #[contract]
@@ -996,6 +1057,7 @@ impl PermissionsContract {
             allowed_merchants,
             ttl_ledgers,
             false,
+            None,
         )
     }
 
@@ -1027,14 +1089,90 @@ impl PermissionsContract {
             allowed_merchants,
             ttl_ledgers,
             true,
+            None,
         )
     }
 
-    /// Shared implementation for `grant` / `re_grant`.
+    /// Records a first grant whose authority is restricted to `scope`
+    /// (issue #369).
+    ///
+    /// Behaves exactly like [`Self::grant`] except that the resulting record
+    /// carries a [`ScopedPermissionConfig`]: the delegate can only ever
+    /// execute the listed entrypoints on `scope.target_contract`, and must
+    /// route every spend through [`Self::execute_spend_scoped`] so the
+    /// invocation is actually checked.
+    ///
+    /// Fails with [`PermissionError::InvalidParam`] if `scope` is malformed
+    /// (empty or duplicate function symbols, or more than
+    /// `MAX_FUNCTIONS_PER_PERMISSION` of them).
+    // Reason: Soroban ABI entry point — signature is part of the published
+    // on-chain ABI and cannot be restructured without a breaking change.
+    #[allow(clippy::too_many_arguments)]
+    pub fn grant_scoped(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        limit_total: i128,
+        limit_per_tx: i128,
+        allowed_merchants: Vec<Address>,
+        ttl_ledgers: u32,
+        scope: ScopedPermissionConfig,
+    ) -> Result<(), PermissionError> {
+        Self::grant_impl(
+            env,
+            owner,
+            delegate,
+            limit_total,
+            limit_per_tx,
+            allowed_merchants,
+            ttl_ledgers,
+            false,
+            Some(scope),
+        )
+    }
+
+    /// Explicitly replaces an existing delegation's terms with a new
+    /// [`ScopedPermissionConfig`] (issue #369).
+    ///
+    /// The mirror of [`Self::grant_scoped`] for a live permission: same
+    /// `AlreadyGranted` / `PermissionNotFound` semantics as
+    /// [`Self::re_grant`], and the scope is replaced wholesale rather than
+    /// merged, so an owner can narrow (or drop, via [`Self::re_grant`]) a
+    /// delegate's authority in one call.
+    // Reason: Soroban ABI entry point — signature is part of the published
+    // on-chain ABI and cannot be restructured without a breaking change.
+    #[allow(clippy::too_many_arguments)]
+    pub fn re_grant_scoped(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        limit_total: i128,
+        limit_per_tx: i128,
+        allowed_merchants: Vec<Address>,
+        ttl_ledgers: u32,
+        scope: ScopedPermissionConfig,
+    ) -> Result<(), PermissionError> {
+        Self::grant_impl(
+            env,
+            owner,
+            delegate,
+            limit_total,
+            limit_per_tx,
+            allowed_merchants,
+            ttl_ledgers,
+            true,
+            Some(scope),
+        )
+    }
+
+    /// Shared implementation for `grant` / `re_grant` and their scoped variants.
     ///
     /// `re_grant` opts the caller into replacing an existing live permission
     /// and reports the previous spent / remaining delta on the event so spend
-    /// accounting is never silently discarded.
+    /// accounting is never silently discarded. `scope` is stored verbatim on
+    /// the new record; a `None` scope therefore clears any scope a previous
+    /// grant carried, mirroring how `store_metadata` drops stale metadata.
+    #[allow(clippy::too_many_arguments)]
     fn grant_impl(
         env: Env,
         owner: Address,
@@ -1044,6 +1182,7 @@ impl PermissionsContract {
         allowed_merchants: Vec<Address>,
         ttl_ledgers: u32,
         re_grant: bool,
+        scope: Option<ScopedPermissionConfig>,
     ) -> Result<(), PermissionError> {
         owner.require_auth();
 
@@ -1076,6 +1215,12 @@ impl PermissionsContract {
 
         // Validate merchant whitelist bounds and uniqueness.
         Self::validate_merchant_list(&env, &allowed_merchants)?;
+
+        // Issue #369: reject a malformed function scope before any state is
+        // touched, so a grant never lands with an unenforceable scope.
+        if let Some(ref scope) = scope {
+            Self::validate_scope_config(&env, scope)?;
+        }
 
         // Issue #51: distinguish a first grant from a re-grant. A plain grant
         // must not silently overwrite a live delegation and reset its spend
@@ -1168,6 +1313,16 @@ impl PermissionsContract {
             &epoch_config,
         );
 
+        // Issue #369: a `None` scope clears any scope a previous grant
+        // carried, so `re_grant` can never leave a stale, unenforced scope
+        // behind. `re_grant_with_metadata` passes the live scope back in, so
+        // comparing against the previous value keeps the scope event to
+        // genuine changes instead of re-announcing an unchanged scope.
+        let previous_scope: Option<ScopedPermissionConfig> =
+            Self::load_scope(&env, &owner, &delegate);
+        let scope_changed = previous_scope != scope;
+        Self::store_scope(&env, &owner, &delegate, scope.clone());
+
         // Change in usable allowance caused by this (re-)grant. For a first
         // grant `old_remaining` is 0 so this equals the new total limit; for a
         // re-grant it reflects how much more (or less) the delegate can spend
@@ -1197,6 +1352,24 @@ impl PermissionsContract {
             },
         );
 
+        // Issue #369: surface the granted function scope as its own event so an
+        // indexer can tell a scoped grant from an unscoped one without reading
+        // the scope back out of storage. Suppressed when the scope is carried
+        // over unchanged (`re_grant_with_metadata`).
+        if scope_changed {
+            if let Some(ref scope) = scope {
+                env.events().publish(
+                    (symbol_short!("perm"), symbol_short!("scope")),
+                    PermissionScopeUpdatedEvent {
+                        owner: owner.clone(),
+                        delegate: delegate.clone(),
+                        target_contract: Some(scope.target_contract.clone()),
+                        function_count: scope.allowed_function_symbols.len(),
+                    },
+                );
+            }
+        }
+
         let action = if re_grant {
             symbol_short!("regranted")
         } else {
@@ -1217,6 +1390,11 @@ impl PermissionsContract {
     /// parent: its `limit_total` cannot exceed the parent's remaining
     /// allowance, its `limit_per_tx` cannot exceed the parent's per-tx
     /// limit, and its expiry is clamped to the parent's expiry.
+    ///
+    /// A child never carries its own [`ScopedPermissionConfig`] (issue #369):
+    /// function scoping is inherited from the parent chain at spend time, so a
+    /// delegate cannot widen the authority its owner granted by handing an
+    /// unscoped sub-delegation to a downstream agent.
     ///
     /// # Errors
     /// - [`PermissionError::ParentNotFound`] if the parent permission
@@ -1454,6 +1632,25 @@ impl PermissionsContract {
             return Err(PermissionError::InvalidParam);
         }
 
+        // Issue #369: a transfer hands the same authority to a new delegate,
+        // so the function scope has to travel with it. Forgetting it here
+        // would silently escalate a scoped grant into an unscoped one.
+        let inherited_scope: Option<ScopedPermissionConfig> =
+            Self::load_scope(&env, &owner, &old_delegate);
+        Self::store_scope(&env, &owner, &new_delegate, inherited_scope.clone());
+
+        if let Some(ref scope) = inherited_scope {
+            env.events().publish(
+                (symbol_short!("perm"), symbol_short!("scope")),
+                PermissionScopeUpdatedEvent {
+                    owner: owner.clone(),
+                    delegate: new_delegate.clone(),
+                    target_contract: Some(scope.target_contract.clone()),
+                    function_count: scope.allowed_function_symbols.len(),
+                },
+            );
+        }
+
         let user_perms_key = DataKey::UserPermissions(owner.clone());
         let mut delegates: Vec<Address> = env
             .storage()
@@ -1684,6 +1881,30 @@ impl PermissionsContract {
         Ok(())
     }
 
+    /// Validates a function scope (issue #369):
+    /// - `allowed_function_symbols` must be non-empty, since an empty list is
+    ///   indistinguishable from "no scope" to a reader and would leave the
+    ///   record fail-closed with no way to ever spend.
+    /// - Must not exceed `MAX_FUNCTIONS_PER_PERMISSION` entries.
+    /// - Must not contain duplicate symbols.
+    fn validate_scope_config(
+        env: &Env,
+        scope: &ScopedPermissionConfig,
+    ) -> Result<(), PermissionError> {
+        let functions = &scope.allowed_function_symbols;
+        if functions.is_empty() || functions.len() > MAX_FUNCTIONS_PER_PERMISSION {
+            return Err(PermissionError::InvalidParam);
+        }
+        let mut seen: Vec<Symbol> = Vec::new(env);
+        for f in functions.iter() {
+            if seen.contains(&f) {
+                return Err(PermissionError::InvalidParam);
+            }
+            seen.push_back(f);
+        }
+        Ok(())
+    }
+
     /// Recursively revokes every child permission granted under
     /// `(owner, delegate)` via `grant_child`.
     fn revoke_children(env: &Env, owner: &Address, delegate: &Address) {
@@ -1813,11 +2034,54 @@ impl PermissionsContract {
         amount: i128,
         merchant: Address,
     ) -> Result<(), PermissionError> {
+        // No invocation is stated here, so a scoped grant fails closed in
+        // `check_function_scope` rather than slipping through unchecked
+        // (issue #369).
+        Self::can_spend_scoped(env, owner, delegate, amount, merchant, None, None)
+    }
+
+    /// [`Self::can_spend`] extended with the invocation being authorized
+    /// (issue #369).
+    ///
+    /// When the `(owner, delegate)` record carries a [`ScopedPermissionConfig`],
+    /// `target_contract` and `invoked_function` must both be supplied and
+    /// must both be authorized; otherwise the spend is rejected with
+    /// [`PermissionError::UnauthorizedFunction`]. For an unscoped grant the
+    /// extra arguments are ignored and the result is identical to
+    /// [`Self::can_spend`].
+    ///
+    /// Scoping is evaluated *before* the limit checks so an unauthorized
+    /// entrypoint reports the authorization failure rather than an incidental
+    /// amount/merchant error, and so an unauthorized entrypoint is rejected
+    /// even when it would otherwise have failed for another reason.
+    // Reason: Soroban ABI entry point — signature is part of the published
+    // on-chain ABI and cannot be restructured without a breaking change.
+    #[allow(clippy::too_many_arguments)]
+    pub fn can_spend_scoped(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        amount: i128,
+        merchant: Address,
+        target_contract: Option<Address>,
+        invoked_function: Option<Symbol>,
+    ) -> Result<(), PermissionError> {
         let key = DataKey::Permission(owner.clone(), delegate.clone());
         let record: PermissionRecord = match env.storage().persistent().get(&key) {
             Some(r) => r,
             None => return Err(PermissionError::PermissionNotFound),
         };
+
+        // Issue #369: enforce the function scope (and every ancestor's scope)
+        // before any amount is committed.
+        Self::check_function_scope(
+            &env,
+            &owner,
+            &delegate,
+            &record,
+            target_contract.as_ref(),
+            &invoked_function,
+        )?;
 
         match record.status {
             PermissionStatus::Active => {}
@@ -1878,6 +2142,101 @@ impl PermissionsContract {
         }
         if record.not_after_ledger != 0 && current > record.not_after_ledger {
             return Err(PermissionError::Expired);
+        }
+        Ok(())
+    }
+
+    /// Enforces the function scope of `(owner, delegate)` and of every
+    /// ancestor it was granted under (issue #369).
+    ///
+    /// The chain walk is what closes lateral privilege escalation: a
+    /// `grant_child` sub-delegation inherits its parent's scope, so a delegate
+    /// holding `only escrow.fund` cannot hand a downstream agent a broader
+    /// (or absent) scope by leaving the child unscoped. A missing ancestor
+    /// ends the walk — `validate_chain` already reports a genuinely missing
+    /// parent separately, and an unverifiable ancestor must not widen the
+    /// effective scope.
+    ///
+    /// Every scope in the chain must authorize the same invocation, so the
+    /// effective scope is the intersection of the lineage rather than the
+    /// narrowest-looking single link.
+    #[allow(clippy::too_many_arguments)]
+    fn check_function_scope(
+        env: &Env,
+        owner: &Address,
+        delegate: &Address,
+        record: &PermissionRecord,
+        target_contract: Option<&Address>,
+        invoked_function: &Option<Symbol>,
+    ) -> Result<(), PermissionError> {
+        Self::enforce_single_scope(
+            &Self::load_scope(env, owner, delegate),
+            target_contract,
+            invoked_function,
+        )?;
+
+        let mut next_parent = match (record.parent_owner.clone(), record.parent_delegate.clone()) {
+            (Some(p_owner), Some(p_delegate)) => Some((p_owner, p_delegate)),
+            _ => None,
+        };
+
+        let mut hops = 0u32;
+        while let Some((p_owner, p_delegate)) = next_parent {
+            if hops >= 32 {
+                break;
+            }
+            hops += 1;
+
+            let parent_key = DataKey::Permission(p_owner.clone(), p_delegate.clone());
+            let parent_record: PermissionRecord = match env.storage().persistent().get(&parent_key)
+            {
+                Some(r) => r,
+                None => break,
+            };
+
+            Self::enforce_single_scope(
+                &Self::load_scope(env, &p_owner, &p_delegate),
+                target_contract,
+                invoked_function,
+            )?;
+
+            next_parent = match (
+                parent_record.parent_owner.clone(),
+                parent_record.parent_delegate.clone(),
+            ) {
+                (Some(p_owner), Some(p_delegate)) => Some((p_owner, p_delegate)),
+                _ => None,
+            };
+        }
+
+        Ok(())
+    }
+
+    /// Applies a single pair's scope to one invocation. An absent scope is
+    /// vacuously satisfied; a present one requires the invocation to name the
+    /// scoped contract and one of its allowed function symbols.
+    fn enforce_single_scope(
+        scope: &Option<ScopedPermissionConfig>,
+        target_contract: Option<&Address>,
+        invoked_function: &Option<Symbol>,
+    ) -> Result<(), PermissionError> {
+        let scope = match scope {
+            None => return Ok(()),
+            Some(scope) => scope,
+        };
+
+        // Fail closed: a scoped grant is only spendable through an entrypoint
+        // that names the contract and the function being invoked.
+        let target = target_contract.ok_or(PermissionError::UnauthorizedFunction)?;
+        let invoked = invoked_function
+            .clone()
+            .ok_or(PermissionError::UnauthorizedFunction)?;
+
+        if *target != scope.target_contract {
+            return Err(PermissionError::UnauthorizedFunction);
+        }
+        if !scope.allowed_function_symbols.contains(&invoked) {
+            return Err(PermissionError::UnauthorizedFunction);
         }
         Ok(())
     }
@@ -2034,6 +2393,70 @@ impl PermissionsContract {
         Ok(())
     }
 
+    /// Sets, replaces, or clears the function scope of an existing delegation
+    /// (issue #369).
+    ///
+    /// Owner-authorized, mirroring [`Self::set_merchant_allowlist`]: the scope
+    /// is a narrowing of the delegate's authority, so only the owner may set
+    /// it. Passing `None` clears the scope and returns the delegation to
+    /// unscoped behaviour, which is how an owner widens authority again after
+    /// a period of tight scoping — a deliberate, observable act that emits
+    /// [`PermissionScopeUpdatedEvent`] with a zero `function_count`.
+    ///
+    /// # Errors
+    /// - [`PermissionError::PermissionNotFound`] if no permission exists for
+    ///   the pair.
+    /// - [`PermissionError::InvalidParam`] if `scope` is malformed (see
+    ///   `MAX_FUNCTIONS_PER_PERMISSION`).
+    pub fn set_permission_scope(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        scope: Option<ScopedPermissionConfig>,
+    ) -> Result<(), PermissionError> {
+        owner.require_auth();
+
+        let key = DataKey::Permission(owner.clone(), delegate.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(PermissionError::PermissionNotFound);
+        }
+
+        if let Some(ref s) = scope {
+            Self::validate_scope_config(&env, s)?;
+        }
+
+        Self::store_scope(&env, &owner, &delegate, scope.clone());
+
+        let (target_contract, function_count) = match &scope {
+            Some(s) => (
+                Some(s.target_contract.clone()),
+                s.allowed_function_symbols.len(),
+            ),
+            // A cleared scope names no target contract.
+            None => (None, 0),
+        };
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("scope")),
+            PermissionScopeUpdatedEvent {
+                owner: owner.clone(),
+                delegate: delegate.clone(),
+                target_contract,
+                function_count,
+            },
+        );
+
+        Self::append_audit_log(
+            &env,
+            &owner,
+            &delegate,
+            owner.clone(),
+            symbol_short!("scope"),
+        );
+
+        Ok(())
+    }
+
     /// Removes any business-hour restriction configured for `(owner,
     /// delegate)` (issue #315). A no-op (not an error) when none was set.
     pub fn clear_time_window_restriction(
@@ -2107,6 +2530,16 @@ impl PermissionsContract {
         Ok(())
     }
 
+    /// Returns the [`ScopedPermissionConfig`] attached to `(owner, delegate)`,
+    /// or `None` when the delegation is unscoped or unknown (issue #369).
+    pub fn get_permission_scope(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+    ) -> Option<ScopedPermissionConfig> {
+        Self::load_scope(&env, &owner, &delegate)
+    }
+
     pub fn execute_spend(
         env: Env,
         owner: Address,
@@ -2116,14 +2549,69 @@ impl PermissionsContract {
     ) -> Result<(), PermissionError> {
         delegate.require_auth();
 
-        // Propagate the precise reason (expired, over-limit, wrong merchant, …)
-        // to the caller instead of panicking with an opaque string.
-        Self::can_spend(
+        Self::execute_spend_impl(env, owner, delegate, amount, merchant, None, None)
+    }
+
+    /// Executes a spend on behalf of a permission restricted to specific
+    /// contract entrypoints (issue #369).
+    ///
+    /// Identical to [`Self::execute_spend`] except that it states *what* is
+    /// being invoked. For a grant carrying a [`ScopedPermissionConfig`] this
+    /// is the only entrypoint that can succeed: `target_contract` must equal
+    /// the scoped contract and `invoked_function` must be one of
+    /// `allowed_function_symbols`, otherwise the spend is rejected with
+    /// [`PermissionError::UnauthorizedFunction`] and no allowance moves. For
+    /// an unscoped grant the two extra arguments are simply ignored.
+    // Reason: Soroban ABI entry point — signature is part of the published
+    // on-chain ABI and cannot be restructured without a breaking change.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_spend_scoped(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        amount: i128,
+        merchant: Address,
+        target_contract: Option<Address>,
+        invoked_function: Option<Symbol>,
+    ) -> Result<(), PermissionError> {
+        delegate.require_auth();
+
+        Self::execute_spend_impl(
+            env,
+            owner,
+            delegate,
+            amount,
+            merchant,
+            target_contract,
+            invoked_function,
+        )
+    }
+
+    /// Shared implementation for [`Self::execute_spend`] and
+    /// [`Self::execute_spend_scoped`]. `target_contract` / `invoked_function`
+    /// are forwarded to `can_spend_scoped` so both entrypoints run the exact
+    /// same authorization, velocity and accounting sequence.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_spend_impl(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        amount: i128,
+        merchant: Address,
+        target_contract: Option<Address>,
+        invoked_function: Option<Symbol>,
+    ) -> Result<(), PermissionError> {
+        // Propagate the precise reason (expired, over-limit, wrong merchant,
+        // unauthorized function, …) to the caller instead of panicking with
+        // an opaque string.
+        Self::can_spend_scoped(
             env.clone(),
             owner.clone(),
             delegate.clone(),
             amount,
             merchant.clone(),
+            target_contract,
+            invoked_function,
         )?;
 
         // #54: Velocity check — reject if min_spend_interval has not yet elapsed
@@ -2204,11 +2692,8 @@ impl PermissionsContract {
         // execute_spend and execute_spend_via_relayer (issue #55).
         while let Some((p_owner, p_delegate)) = next_parent {
             let parent_key = DataKey::Permission(p_owner, p_delegate);
-            let mut parent_record: PermissionRecord = env
-                .storage()
-                .persistent()
-                .get(&parent_key)
-                .unwrap();
+            let mut parent_record: PermissionRecord =
+                env.storage().persistent().get(&parent_key).unwrap();
 
             let parent_spent = parent_record
                 .spent
@@ -2282,9 +2767,14 @@ impl PermissionsContract {
         if min_interval_secs > 0 {
             // Pairs whose last spend predates timestamp tracking have no
             // recorded timestamp; they are governed by the ledger check alone.
-            if let Some(last_ts) = env.storage().persistent().get::<DataKey, u64>(
-                &DataKey::LastSpendTimestamp(owner.clone(), delegate.clone()),
-            ) {
+            if let Some(last_ts) =
+                env.storage()
+                    .persistent()
+                    .get::<DataKey, u64>(&DataKey::LastSpendTimestamp(
+                        owner.clone(),
+                        delegate.clone(),
+                    ))
+            {
                 let next_allowed = last_ts.saturating_add(min_interval_secs);
                 if env.ledger().timestamp() < next_allowed {
                     return Err(PermissionError::VelocityLimitExceeded);
@@ -2435,6 +2925,17 @@ impl PermissionsContract {
     /// delegate's registered public key, the `nonce` and `epoch` must match
     /// the current execution context (preventing replay), and
     /// `expiration_ledger` must not yet have been reached.
+    ///
+    /// The signed payload names no contract entrypoint, so this path is only
+    /// usable by unscoped delegations: for a permission carrying a
+    /// [`ScopedPermissionConfig`] (issue #369) the shared validation rejects
+    /// the relayed spend with [`PermissionError::UnauthorizedFunction`],
+    /// because there is no way for the signature to attest *which* function
+    /// the relayer is invoking on the delegate's behalf. Relayed agents on a
+    /// scoped grant must therefore submit [`Self::execute_spend_scoped`]
+    /// themselves. Scoping fails closed here rather than being skipped.
+    // Reason: Soroban ABI entry point — signature is part of the published
+    // on-chain ABI and cannot be restructured without a breaking change.
     #[allow(clippy::too_many_arguments)]
     pub fn execute_spend_via_relayer(
         env: Env,
@@ -2804,6 +3305,7 @@ impl PermissionsContract {
                     PermissionError::OutsideAuthorizedWindow => {
                         Symbol::new(&env, "outside_win")
                     }
+                    PermissionError::UnauthorizedFunction => Symbol::new(&env, "bad_function"),
                     // Remaining variants cannot be returned by can_spend but
                     // exhaustively handled to satisfy the compiler.
                     _ => Symbol::new(&env, "unauthorized"),
@@ -2837,16 +3339,29 @@ impl PermissionsContract {
         records
     }
 
-    pub fn get_permission(env: Env, owner: Address, delegate: Address) -> Result<PermissionRecord, PermissionError> {
+    pub fn get_permission(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+    ) -> Result<PermissionRecord, PermissionError> {
         let key = DataKey::Permission(owner, delegate);
-        env.storage().persistent().get(&key).ok_or(PermissionError::PermissionNotFound)
+        env.storage()
+            .persistent()
+            .get(&key)
+            .ok_or(PermissionError::PermissionNotFound)
     }
 
-
-
-    pub fn get_remaining_allowance(env: Env, owner: Address, delegate: Address) -> Result<i128, PermissionError> {
+    pub fn get_remaining_allowance(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+    ) -> Result<i128, PermissionError> {
         let key = DataKey::Permission(owner, delegate);
-        let record: PermissionRecord = env.storage().persistent().get(&key).ok_or(PermissionError::PermissionNotFound)?;
+        let record: PermissionRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(PermissionError::PermissionNotFound)?;
         Ok(record.limit_total - record.spent)
     }
 
@@ -2948,7 +3463,8 @@ impl PermissionsContract {
         }
 
         let execution_time = env.ledger().timestamp() + 86400;
-        let execution_time = env.ledger().timestamp() + Self::get_decrease_timelock_secs(env.clone());
+        let execution_time =
+            env.ledger().timestamp() + Self::get_decrease_timelock_secs(env.clone());
 
         let pending = PendingAllowanceDecrement {
             amount,
@@ -3575,10 +4091,7 @@ impl PermissionsContract {
             return Err(PermissionError::InvalidParam);
         }
 
-        let previous: Option<u64> = env
-            .storage()
-            .instance()
-            .get(&DataKey::MinSpendIntervalSecs);
+        let previous: Option<u64> = env.storage().instance().get(&DataKey::MinSpendIntervalSecs);
 
         env.storage()
             .instance()
@@ -3714,6 +4227,7 @@ impl PermissionsContract {
             allowed_merchants,
             ttl_ledgers,
             false,
+            None,
         )?;
         Self::store_metadata(&env, &owner, &delegate, metadata);
         Ok(())
@@ -3724,6 +4238,14 @@ impl PermissionsContract {
     /// the metadata handling of [`Self::grant_with_metadata`]: permitted on a
     /// live permission, fails with `PermissionError::PermissionNotFound` if no
     /// record exists, and the granted event reports the previous spent amount.
+    ///
+    /// Unlike [`Self::re_grant`], this entrypoint does **not** clear an
+    /// existing [`ScopedPermissionConfig`] (issue #369). It exists to change
+    /// limits/metadata, so dropping the function scope here would silently
+    /// widen the delegate's authority as a side effect of a limit bump. The
+    /// scope is preserved verbatim; an owner who wants to drop it uses
+    /// [`Self::re_grant`] (clears) or [`Self::set_permission_scope`] with
+    /// `None` (clears without touching limits).
     pub fn re_grant_with_metadata(
         env: Env,
         owner: Address,
@@ -3735,6 +4257,13 @@ impl PermissionsContract {
         metadata: Option<PermissionMetadata>,
     ) -> Result<(), PermissionError> {
         Self::validate_metadata_schema(&env, &metadata)?;
+
+        // Issue #369: read the live scope before `grant_impl` overwrites the
+        // record, then hand it straight back so the narrowest-restriction
+        // path is the default on the metadata entrypoint.
+        let preserved_scope: Option<ScopedPermissionConfig> =
+            Self::load_scope(&env, &owner, &delegate);
+
         Self::grant_impl(
             env.clone(),
             owner.clone(),
@@ -3744,6 +4273,7 @@ impl PermissionsContract {
             allowed_merchants,
             ttl_ledgers,
             true,
+            preserved_scope,
         )?;
         Self::store_metadata(&env, &owner, &delegate, metadata);
         Ok(())
@@ -3792,6 +4322,39 @@ impl PermissionsContract {
         env.storage()
             .persistent()
             .get(&DataKey::Metadata(owner, delegate))
+    }
+
+    /// Writes a `(owner, delegate)` pair's function scope, or removes the slot
+    /// entirely when `scope` is `None` (issue #369). Removal — rather than
+    /// storing an empty config — keeps an unscoped delegation byte-identical
+    /// to one that was never scoped.
+    fn store_scope(
+        env: &Env,
+        owner: &Address,
+        delegate: &Address,
+        scope: Option<ScopedPermissionConfig>,
+    ) {
+        let scope_key = DataKey::PermissionScope(owner.clone(), delegate.clone());
+        match scope {
+            Some(s) => env.storage().persistent().set(&scope_key, &s),
+            None => {
+                if env.storage().persistent().has(&scope_key) {
+                    env.storage().persistent().remove(&scope_key);
+                }
+            }
+        }
+    }
+
+    /// Reads a `(owner, delegate)` pair's function scope, or `None` when the
+    /// delegation is unscoped or unknown (issue #369).
+    fn load_scope(
+        env: &Env,
+        owner: &Address,
+        delegate: &Address,
+    ) -> Option<ScopedPermissionConfig> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PermissionScope(owner.clone(), delegate.clone()))
     }
 
     /// Returns the merchant restriction configured under the spending
@@ -4084,9 +4647,7 @@ impl PermissionsContract {
 
         if let Some(total_entries) = storage.get::<_, u32>(&count_key) {
             let first = start.min(total_entries);
-            let end = first
-                .saturating_add(MAX_AUDIT_PAGE_SIZE)
-                .min(total_entries);
+            let end = first.saturating_add(MAX_AUDIT_PAGE_SIZE).min(total_entries);
             let oldest_slot: u32 = storage
                 .get(&DataKey::AuditLogStart(owner.clone(), delegate.clone()))
                 .unwrap_or(0);
@@ -4114,9 +4675,7 @@ impl PermissionsContract {
             .unwrap_or_else(|| Vec::new(&env));
         let total_entries = legacy.len();
         let first = start.min(total_entries);
-        let end = first
-            .saturating_add(MAX_AUDIT_PAGE_SIZE)
-            .min(total_entries);
+        let end = first.saturating_add(MAX_AUDIT_PAGE_SIZE).min(total_entries);
         for i in first..end {
             if let Some(entry) = legacy.get(i) {
                 entries.push_back(entry);
@@ -4234,8 +4793,6 @@ mod absent_key_tests {
         let delegate = Address::generate(&env);
         (env, owner, delegate)
     }
-
-
 }
 
 #[cfg(test)]
@@ -4319,6 +4876,9 @@ mod audit_log_page_tests {
         let page = client.get_audit_log_page(&owner, &delegate, &None);
         assert_eq!(page.total_entries, 3);
         assert_eq!(page.entries.len(), 3);
-        assert_eq!(page.entries.get(2).unwrap().timestamp, env.ledger().timestamp());
+        assert_eq!(
+            page.entries.get(2).unwrap().timestamp,
+            env.ledger().timestamp()
+        );
     }
 }
