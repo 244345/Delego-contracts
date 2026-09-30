@@ -3169,6 +3169,29 @@ mod test {
         );
     }
 
+    // --- Issue: Prevent Unauthorized Delegate Cancellation of Pending Allowance Decreases ---
+
+    #[test]
+    fn test_cancel_pending_decrease_requires_owner_auth() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
+        client.decrease_allowance(&owner, &delegate, &200);
+
+        // Owner can cancel the pending decrease.
+        assert_eq!(
+            client.try_cancel_pending_decrease(&owner, &delegate),
+            Ok(Ok(()))
+        );
+    }
+
     #[test]
     fn test_v1_signature_fails_verification_on_v2() {
         let env = Env::default();
@@ -3300,5 +3323,123 @@ mod test {
             validate_relayer_fee(-100, 0),
             Err(PermissionError::InvalidParam)
         );
+    }
+
+    #[test]
+    fn test_cancel_pending_decrease_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
+
+        // No pending decrease queued yet.
+        assert_eq!(
+            client.try_cancel_pending_decrease(&owner, &delegate),
+            Err(Ok(PermissionError::NotFound))
+        );
+    }
+
+    #[test]
+    fn test_delegate_cannot_cancel_pending_decrease() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &owner,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "grant",
+                    args: (
+                        owner.clone(),
+                        delegate.clone(),
+                        1000i128,
+                        100i128,
+                        merchants.clone(),
+                        10000u32,
+                    )
+                        .into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .grant(&owner, &delegate, &1000, &100, &merchants, &10000);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &owner,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "decrease_allowance",
+                    args: (owner.clone(), delegate.clone(), 200i128).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .decrease_allowance(&owner, &delegate, &200);
+
+        // Delegate attempts to cancel using their own auth — must fail.
+        let res = client
+            .mock_auths(&[MockAuth {
+                address: &delegate,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "cancel_pending_decrease",
+                    args: (owner.clone(), delegate.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_cancel_pending_decrease(&owner, &delegate);
+        assert!(res.is_err());
+
+        // The pending decrease must still be present and executable by the owner.
+        env.ledger().with_mut(|li| {
+            li.timestamp += 86401;
+        });
+        assert_eq!(
+            client.try_execute_decrease_allowance(&owner, &delegate),
+            Ok(Ok(()))
+        );
+        let detail = client.get_allowance_detail(&owner, &delegate);
+        assert_eq!(detail.limit, 800);
+    }
+
+    #[test]
+    fn test_delegate_cannot_erase_pending_decrease_via_increase() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
+        client.decrease_allowance(&owner, &delegate, &200);
+
+        // A delegate-initiated increase must not clear the pending decrease.
+        let _ = client.try_increase_allowance(&delegate, &delegate, &100);
+
+        // The pending decrease remains queued and executable by the owner.
+        env.ledger().with_mut(|li| {
+            li.timestamp += 86401;
+        });
+        assert_eq!(
+            client.try_execute_decrease_allowance(&owner, &delegate),
+            Ok(Ok(()))
+        );
+        let detail = client.get_allowance_detail(&owner, &delegate);
+        assert_eq!(detail.limit, 800);
     }
 }
