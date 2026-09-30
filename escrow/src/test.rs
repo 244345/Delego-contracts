@@ -1241,6 +1241,12 @@ use soroban_sdk::{
         let record = client.get_escrow(&escrow_id);
         assert_eq!(record.status, crate::EscrowStatus::Created);
 
+        // A freshly created order sits inside its cancellation protection
+        // window (issue #355), so a unilateral seller cancel only becomes
+        // possible once that window has elapsed.
+        env.ledger()
+            .set_sequence_number(crate::DEFAULT_CANCEL_LOCKOUT_LEDGERS);
+
         let cancelled = client.cancel(&escrow_id, &seller, &reason);
         assert!(cancelled);
 
@@ -1346,6 +1352,11 @@ use soroban_sdk::{
             &buyer, &seller, &token, &1000i128, &order_id, &100u32, &None, &None,
         );
 
+        // Step past the protection window (issue #355) so the first cancel is
+        // itself a legitimate unilateral one.
+        env.ledger()
+            .set_sequence_number(crate::DEFAULT_CANCEL_LOCKOUT_LEDGERS);
+
         client.cancel(&escrow_id, &seller, &reason);
 
         let res = client.try_cancel(&escrow_id, &seller, &reason);
@@ -1372,6 +1383,11 @@ use soroban_sdk::{
         let escrow_id = client.create(
             &buyer, &seller, &token, &1000i128, &order_id, &100u32, &None, &None,
         );
+
+        // Step past the protection window (issue #355) so the cancel succeeds
+        // and only the follow-up funding attempt is rejected.
+        env.ledger()
+            .set_sequence_number(crate::DEFAULT_CANCEL_LOCKOUT_LEDGERS);
 
         client.cancel(&escrow_id, &seller, &reason);
 

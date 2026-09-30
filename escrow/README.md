@@ -10,7 +10,13 @@ Soroban smart contract for holding purchase funds until fulfillment.
 | `version` | — | Return contract name and semver |
 | `create` | — | Create an unfunded escrow record in `Created` status |
 | `fund` | buyer | Fund an existing `Created` escrow |
-| `cancel` | seller (merchant) | Cancel an unfunded `Created` escrow |
+| `cancel` | seller (merchant) | Cancel an unfunded `Created` escrow (guarded, see below) |
+| `accept_order` | seller (merchant) | Record acceptance of an order and re-anchor its cancel window |
+| `agree_cancel` | buyer | Waive the cancel protection window for one escrow |
+| `get_order_acceptance` | — | Acceptance and cancel-protection snapshot for an escrow |
+| `get_cancel_eligibility` | — | Whether a seller may cancel an escrow right now, and why |
+| `get_cancel_lockout` | — | Configured default cancel protection window, in ledgers |
+| `set_cancel_lockout` | admin | Set the default cancel protection window for new escrows |
 | `deposit` | buyer | Lock buyer funds for an order (convenience `create` + `fund`) |
 | `batch_create_escrows` | buyer | Atomically create and fund up to 50 orders with aggregated token allowances |
 | `release` | buyer / admin | Transfer full remaining balance to seller |
@@ -134,6 +140,11 @@ Cancellation transitions the escrow to `EscrowStatus::Cancelled` (a terminal sta
 pub fn cancel(env: Env, escrow_id: u64, caller: Address, reason: Symbol) -> Result<bool, EscrowError>
 ```
 
+A unilateral `cancel` is refused for a short window after the order is created
+(and after a seller acceptance) so that a seller watching the mempool cannot
+front-run a buyer's pending `fund`/`deposit` submission. See
+[Cancellation protection](#cancellation-protection-issue-355).
+
 ### `EscrowCancelledEvent`
 
 ```rust
@@ -150,7 +161,73 @@ pub struct EscrowCancelledEvent {
 |---|---|
 | `EscrowError::AlreadyFunded` (28) | Cannot cancel an escrow after funds are locked |
 | `EscrowError::AlreadyCancelled` (27) | Escrow has already been cancelled |
+| `EscrowError::InvalidStatus` (6) | Escrow is in a state that cannot be cancelled |
 | `EscrowError::Unauthorized` (3) | Caller is not the merchant (`seller`) |
+| `EscrowError::CancelLockoutActive` (411) | Cancel protection window is running and no agreement or timeout applies |
+| `EscrowError::NotFound` (2) | No escrow exists for the given `escrow_id` |
+
+## Cancellation protection (issue #355)
+
+An order is created before the buyer commits funds, so a seller that watches
+the mempool could otherwise get a `cancel` in front of a pending
+`fund`/`deposit` and invalidate an order the buyer is already committed to.
+The contract cannot observe mempool ordering, so it makes the *unilateral*
+cancel lose deterministically instead:
+
+- **Protection window.** Every escrow snapshots `cancel_lockout_ledgers`
+  (default `10`, admin-configurable, `0` disables) at creation. Inside the
+  window a seller can only cancel with the buyer's agreement on-chain, or
+  once the escrow's own timeout is reached.
+- **Acceptance re-anchors the window.** `accept_order` moves the deadline to
+  the acceptance ledger, so a seller who accepts an order cannot shorten the
+  buyer's window afterwards.
+- **Funding always wins.** `fund`/`deposit` moves the escrow to `Funded`, and
+  `cancel` then fails with `AlreadyFunded` in every ledger, protected or not.
+- **Fails closed.** An escrow whose protection snapshot is missing (a legacy
+  record, or an evicted entry) is treated as if the window never expires;
+  only the buyer's agreement or the escrow timeout can clear it.
+- **Deterministic previews.** `get_cancel_eligibility` returns exactly the
+  answer `cancel` will give, with a `reason` symbol, so clients never have to
+  guess at submission order.
+
+```rust
+pub struct OrderAcceptanceState {
+    pub seller_accepted: bool,
+    pub accepted_at_ledger: u32,
+    pub cancel_lockout_ledgers: u32,
+}
+
+pub struct CancelEligibility {
+    pub escrow_id: u64,
+    pub eligible: bool,
+    pub reason: Symbol,   // ok | agreed | timeout | lockout | funded | cancelled | badstate | notseller | notfound
+}
+```
+
+### New entry points
+
+```rust
+pub fn accept_order(env: Env, escrow_id: u64, seller: Address) -> Result<bool, EscrowError>
+pub fn agree_cancel(env: Env, escrow_id: u64, buyer: Address) -> Result<bool, EscrowError>
+pub fn get_order_acceptance(env: Env, escrow_id: u64) -> Result<OrderAcceptanceState, EscrowError>
+pub fn get_cancel_eligibility(env: Env, escrow_id: u64, caller: Address) -> CancelEligibility
+pub fn get_cancel_lockout(env: Env) -> u32
+pub fn set_cancel_lockout(env: Env, admin: Address, ledgers: u32) -> Result<bool, EscrowError>
+```
+
+`set_cancel_lockout` rejects values above `MAX_CANCEL_LOCKOUT_LEDGERS` (1000)
+with `InvalidCancelLockout` and is admin-only; the new default is snapshotted
+into each escrow at creation and on acceptance, so it never changes the
+protection of an order that is already live.
+
+### Storage keys added
+
+`DataKey::OrderAcceptance(escrow_id)`, `DataKey::CancelLockoutLedger(escrow_id)`,
+`DataKey::CancelBuyerAgreement(escrow_id)` and the instance-level
+`DataKey::CancelLockoutLedgers`. All are written on the same paths as the
+escrow record and bumped with the same TTL thresholds; the agreement key is
+only written when a buyer agrees, and is consumed by the `cancel` it
+authorized.
 
 ## Events
 
@@ -159,6 +236,8 @@ pub struct EscrowCancelledEvent {
 | `("escrow", "created")` | `EscrowCreatedEvent` | `create` / `deposit` |
 | `("escrow", "metadata")` | `EscrowMetadataEvent` | `create` / `deposit` (when metadata supplied) |
 | `("escrow", "cancelled")` | `EscrowCancelledEvent` | `cancel` |
+| `("escrow", "accepted", escrow_id)` | `EscrowOrderAcceptedEvent` | `accept_order` |
+| `("escrow", "agreed", escrow_id)` | `EscrowCancelAgreedEvent` | `agree_cancel` |
 | `("escrow", "released")` | `EscrowReleasedEvent` | `partial_release` / `release` |
 | `("escrow", "refunded")` | `EscrowRefundedEvent` | `refund` |
 | `("escrow", "disputed")` | `EscrowDisputedEvent` | `dispute` |

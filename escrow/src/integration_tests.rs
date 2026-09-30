@@ -1739,6 +1739,12 @@ fn test_cancellation_full_lifecycle() {
     assert_eq!(token_client.balance(&t.buyer), 10000);
     assert_eq!(token_client.balance(&t.escrow_contract_id), 0);
 
+    // Step past the cancellation protection window (issue #355) so the seller
+    // may cancel unilaterally.
+    t.env
+        .ledger()
+        .set_sequence_number(crate::DEFAULT_CANCEL_LOCKOUT_LEDGERS);
+
     // Merchant cancels escrow
     assert!(escrow_client.cancel(&escrow_id, &t.seller, &reason));
 
