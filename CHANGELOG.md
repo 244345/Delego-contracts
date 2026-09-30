@@ -65,6 +65,12 @@ will reject the change.
   the removals, and reports the reclaimed entry count. New
   `EscrowError::ArchivalRetentionNotElapsed` for a sweep that arrives
   before the window has passed.
+- Prevent sellers from front-running buyer deposits: `cancel` is now guarded by a
+  snapshotted, admin-configurable protection window (default 10 ledgers) that can
+  only be cleared by the buyer's on-chain agreement (`agree_cancel`) or the
+  escrow timeout. Adds `accept_order`, `get_order_acceptance`,
+  `get_cancel_eligibility`, `get_cancel_lockout`, and `set_cancel_lockout`, plus
+  the new `CancelLockoutActive` (411) and `InvalidCancelLockout` (412) errors.
 
 ### 0.2.0 - 2026-08-29
 

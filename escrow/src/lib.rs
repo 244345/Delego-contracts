@@ -28,6 +28,19 @@
 //! | `escrow` | `bounty` | `u64` escrow_id | `KeeperBountyPaidEvent` |
 //! | `escrow` | `fee_sched` | — | `ConfigChangeScheduledEvent` |
 //! | `escrow` | `dispsplit` | `u64` escrow_id | `DisputeResolvedEvent` |
+//! # Cancellation protection (issue #355)
+//!
+//! A seller may only cancel an escrow that is still `Created`, but a created
+//! order is not yet funded: without a guard a seller could get a `cancel` in
+//! front of a buyer's pending `fund`/`deposit` and invalidate an order the
+//! buyer is already committed to. `cancel` therefore refuses a unilateral
+//! cancellation until a protection window — snapshotted into the escrow at
+//! creation and re-anchored by `accept_order` — has elapsed, and the only
+//! early ways out are the buyer's own `agree_cancel` or the escrow timeout.
+//! Once the buyer's deposit lands the escrow is `Funded` and `cancel` always
+//! fails with `AlreadyFunded`. `get_cancel_eligibility` answers the same
+//! question read-only, with a `reason` symbol, so a client never has to guess
+//! at transaction ordering.
 
 // Contract crates compile as no_std for release and wasm builds, but keep std
 // enabled during testing so dev-dependencies and test assertions operate normally.
@@ -223,6 +236,30 @@ pub struct InspectionPeriodConfig {
     pub delivery_confirmed_ledger: u32,
     /// Ledger sequence at which funds will auto-release if no dispute is filed.
     pub auto_release_ledger: u32,
+/// Order acceptance and cancel-protection state for a single escrow
+/// (issue #355).
+///
+/// An escrow is created *before* the buyer commits funds, which leaves a
+/// window in which a seller that watches the mempool can front-run a pending
+/// `fund`/`deposit` with a `cancel` for the very same escrow. The state below
+/// is snapshotted at creation (and refreshed by `accept_order`) so the
+/// contract can answer one deterministic question — "may this seller cancel
+/// unilaterally right now?" — from stored data alone.
+///
+/// The window is snapshotted per escrow rather than read from a live config on
+/// every call, so an admin config change can never retroactively shorten (or
+/// lengthen) the protection of an order that is already live.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrderAcceptanceState {
+    /// Whether the seller has acknowledged the order via `accept_order`.
+    pub seller_accepted: bool,
+    /// Ledger sequence at which the seller accepted the order, or `0` while
+    /// the order has not been accepted yet.
+    pub accepted_at_ledger: u32,
+    /// Minimum number of ledgers that must elapse after creation (and after a
+    /// seller acceptance) before the seller may cancel unilaterally.
+    pub cancel_lockout_ledgers: u32,
 }
 
 /// Full on-chain record for a single escrow.
@@ -460,6 +497,35 @@ pub struct EscrowCancelledEvent {
     pub cancelled_by: Address,
     /// Symbolic reason for cancellation.
     pub reason: Symbol,
+}
+
+/// Emitted when a seller accepts a created order (issue #355).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowOrderAcceptedEvent {
+    /// Unique identifier for the escrow.
+    pub escrow_id: u64,
+    /// Seller that accepted the order.
+    pub seller: Address,
+    /// Ledger sequence at which the seller accepted the order.
+    pub accepted_at_ledger: u32,
+    /// First ledger at which the seller may cancel this escrow unilaterally.
+    pub cancel_allowed_ledger: u32,
+}
+
+/// Emitted when a buyer agrees to a cancellation (issue #355).
+///
+/// The recorded agreement is what lets the seller cancel inside the
+/// front-running protection window; it is consumed by the cancelling call.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowCancelAgreedEvent {
+    /// Unique identifier for the escrow.
+    pub escrow_id: u64,
+    /// Buyer that agreed to the cancellation.
+    pub buyer: Address,
+    /// Ledger sequence at which the agreement was recorded.
+    pub agreed_at_ledger: u32,
 }
 
 /// Emitted when funds are released to the seller.
@@ -1639,6 +1705,16 @@ pub enum DataKey {
     MilestoneConfig(u64),
     /// Prevents release entry points from being re-entered during token calls.
     ReleaseGuard,
+    /// Per-escrow order acceptance + cancel lockout snapshot (issue #355).
+    OrderAcceptance(u64),
+    /// First ledger at which a unilateral seller cancel is permitted for an
+    /// escrow (issue #355). `u32::MAX` while the escrow is un-cancellable.
+    CancelLockoutLedger(u64),
+    /// Buyer agreement that lets the seller cancel inside the protection
+    /// window (issue #355).
+    CancelBuyerAgreement(u64),
+    /// Contract-wide default cancel lockout window, in ledgers (issue #355).
+    CancelLockoutLedgers,
 }
 
 // `export = false` suppresses the generated `contractspecv0` entry for this
@@ -1815,6 +1891,8 @@ pub enum DataKey {
 // | 418+ | Reserved for new variants | next major |
 // | 411 | MathOverflow | next major |
 // | 412 | ReentrancyDetected | next major |
+// | 411 | CancelLockoutActive | next major |
+// | 412 | InvalidCancelLockout | next major |
 // | 413+ | Reserved for new variants | next major |
 //
 // # Allocating new variants
@@ -2337,6 +2415,13 @@ pub enum MultiOracleError {
     DepositUnderfunded = 411,
     /// Arithmetic overflow when computing the deposit balance delta.
     MathOverflow = 412,
+    /// A unilateral seller cancel is blocked by the front-running protection
+    /// window: the buyer has not agreed to the cancellation and the escrow's
+    /// timeout has not been reached (issue #355).
+    CancelLockoutActive = 411,
+    /// Requested cancel lockout window is above `MAX_CANCEL_LOCKOUT_LEDGERS`
+    /// (issue #355).
+    InvalidCancelLockout = 412,
 }
 
 /// Compact receipt returned to buyers after escrow creation via `get_receipt`.
@@ -2421,6 +2506,24 @@ pub struct MerchantVolumeTierUpdatedEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReleaseEligibility {
     pub escrow_id: BytesN<32>,
+    pub eligible: bool,
+    pub reason: Symbol,
+}
+
+/// Cancellation eligibility result returned by `get_cancel_eligibility`
+/// (issue #355).
+///
+/// The answer is derived purely from stored state plus the current ledger, so
+/// a client can predict `cancel`'s outcome before submitting a transaction and
+/// cannot be tricked into a different result by transaction ordering. `reason`
+/// is one of: `ok`, `notfound`, `notseller`, `funded`, `cancelled`,
+/// `badstate`, `timeout` (timeout reached — cancellation is allowed), `agreed`
+/// (buyer agreed — cancellation is allowed) or `lockout` (protection window is
+/// still running — the seller must wait or obtain the buyer's agreement).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancelEligibility {
+    pub escrow_id: u64,
     pub eligible: bool,
     pub reason: Symbol,
 }
@@ -2603,6 +2706,78 @@ pub const VOLUME_WINDOW_SECS: u64 = 2_592_000; // 30 days
 pub const TIER_LOCK_UNSET: u32 = 0;
 /// Delay between an emergency rescue proposal and its earliest execution (14 days).
 pub const EMERGENCY_RESCUE_TIMELOCK_SECS: u64 = 1_209_600;
+
+/// Default front-running protection window for seller cancellation, in ledgers
+/// (issue #355).
+///
+/// A contract cannot observe the mempool, so the only deterministic way to
+/// stop a seller from cancelling an order a buyer is about to fund is to make
+/// the freshly created (or freshly accepted) order non-cancellable for a
+/// minimum number of ledgers. At Stellar's ~5 s ledger time, 10 ledgers is
+/// roughly one minute — long enough for a `fund`/`deposit` transaction that is
+/// already in flight to land first, short enough that a genuinely stalled order
+/// can still be cleaned up by its seller or by mutual agreement.
+pub const DEFAULT_CANCEL_LOCKOUT_LEDGERS: u32 = 10;
+
+/// Upper bound for the admin-configurable cancel protection window
+/// (issue #355). Keeps a mis-configuration from parking escrows in an
+/// effectively permanent `Created` state.
+pub const MAX_CANCEL_LOCKOUT_LEDGERS: u32 = 1_000;
+
+/// Sentinel "first ledger at which cancellation is allowed" used when the
+/// protection state for an escrow cannot be read. The guard fails closed:
+/// a seller must obtain the buyer's agreement (or wait for the timeout)
+/// instead of cancelling on a state the contract cannot verify.
+const CANCEL_LOCKOUT_NEVER: u32 = u32::MAX;
+
+/// Why a unilateral seller `cancel` cannot proceed right now (issue #355).
+///
+/// The variants map one-to-one onto the errors `cancel` returns and onto the
+/// reason symbols reported by `get_cancel_eligibility`, so the read-only view
+/// and the state-changing call can never disagree.
+enum CancelBlock {
+    /// The escrow is already funded, so the buyer's deposit is on-chain.
+    Funded,
+    /// The escrow is already cancelled.
+    Cancelled,
+    /// The escrow is in a state that is not cancellable at all.
+    InvalidStatus,
+    /// The protection window is still running and no mutual agreement or
+    /// timeout applies.
+    Lockout,
+}
+
+impl CancelBlock {
+    /// The typed error `cancel` returns for this block reason.
+    fn into_error(self) -> EscrowError {
+        match self {
+            CancelBlock::Funded => EscrowError::AlreadyFunded,
+            CancelBlock::Cancelled => EscrowError::AlreadyCancelled,
+            CancelBlock::InvalidStatus => EscrowError::InvalidStatus,
+            CancelBlock::Lockout => EscrowError::CancelLockoutActive,
+        }
+    }
+
+    /// The reason symbol reported by `get_cancel_eligibility`.
+    fn reason(&self) -> Symbol {
+        match self {
+            CancelBlock::Funded => symbol_short!("funded"),
+            CancelBlock::Cancelled => symbol_short!("cancelled"),
+            CancelBlock::InvalidStatus => symbol_short!("badstate"),
+            CancelBlock::Lockout => symbol_short!("lockout"),
+        }
+    }
+}
+
+/// Snapshot of the cancellation guard for a single escrow (issue #355).
+struct CancelGuard {
+    /// Acceptance + lockout configuration snapshotted for the escrow.
+    acceptance: OrderAcceptanceState,
+    /// First ledger at which a unilateral cancel is permitted.
+    allowed_ledger: u32,
+    /// Whether the buyer has agreed to a cancellation.
+    buyer_agreed: bool,
+}
 
 fn check_not_terminal(record: &EscrowRecord) -> Result<(), EscrowError> {
     match record.status {
@@ -4016,6 +4191,9 @@ impl EscrowContract {
         // Extend TTL of the escrow record
         let storage = env.storage().persistent();
         storage.extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        // Keep the cancellation guard snapshot (issue #355) on the same
+        // schedule as the record it describes.
+        Self::bump_cancel_guard_ttl(&env, escrow_id);
 
         // Check if within bounty threshold and pay bounty
         let bounty_paid = if ledgers_until_timeout <= BUMP_BOUNTY_THRESHOLD_LEDGERS
@@ -5405,6 +5583,13 @@ impl EscrowContract {
             .persistent()
             .set(&DataKey::Escrow(last_id), &record);
 
+        // Seed the cancellation guard for the new order (issue #355). The
+        // escrow is only `Created` at this point, so a seller that front-runs
+        // a pending buyer deposit with `cancel` is exactly the case this state
+        // exists for: the window runs from creation until
+        // `created_sequence + cancel_lockout_ledgers`.
+        Self::init_cancel_guard(&env, last_id);
+
         // Maintain global escrow ID index for list_escrows (issue #49).
         let mut all_ids: soroban_sdk::Vec<u64> = env
             .storage()
@@ -5549,6 +5734,36 @@ impl EscrowContract {
 
     /// Cancel an escrow that has been created but not yet funded.
     /// Only the merchant (seller) may call.
+    ///
+    /// A seller may not cancel unilaterally while the order is still inside
+    /// its front-running protection window (issue #355). An escrow is created
+    /// before the buyer commits funds, so without the window a seller that
+    /// watches the mempool could front-run a pending `fund`/`deposit` with a
+    /// `cancel` for the same order and take the order (and the inventory it
+    /// reserves) out from under the buyer. A contract cannot observe the
+    /// mempool, so the window is the deterministic approximation: for the
+    /// first `cancel_lockout_ledgers` ledgers after creation — and after a
+    /// seller `accept_order` — a unilateral cancel is rejected with
+    /// [`EscrowError::CancelLockoutActive`].
+    ///
+    /// Cancellation inside the window requires one of the two escape hatches
+    /// this design keeps on purpose:
+    /// * explicit mutual agreement — the buyer records consent with
+    ///   `agree_cancel`, after which the seller may cancel immediately, or
+    /// * expiry — the escrow's own timeout has been reached, which is the
+    ///   seller's existing right to clean up a stalled order.
+    ///
+    /// Once the buyer's deposit is on-chain the escrow is `Funded` and the
+    /// existing [`EscrowError::AlreadyFunded`] guard rejects the cancel, so a
+    /// submitted deposit can never be unwound by the seller.
+    ///
+    /// # Errors
+    /// Returns [`EscrowError::NotFound`] when no escrow exists,
+    /// [`EscrowError::Unauthorized`] when the caller is not the seller,
+    /// [`EscrowError::AlreadyFunded`]/[`EscrowError::AlreadyCancelled`]/
+    /// [`EscrowError::InvalidStatus`] for non-`Created` escrows, and
+    /// [`EscrowError::CancelLockoutActive`] while the protection window runs
+    /// and neither agreement nor timeout applies.
     pub fn cancel(
         env: Env,
         escrow_id: u64,
@@ -5567,21 +5782,20 @@ impl EscrowContract {
             return Err(EscrowError::Unauthorized);
         }
 
-        if record.status == EscrowStatus::Funded {
-            return Err(EscrowError::AlreadyFunded);
-        }
-
-        if record.status == EscrowStatus::Cancelled {
-            return Err(EscrowError::AlreadyCancelled);
-        }
-
-        if record.status != EscrowStatus::Created {
-            return Err(EscrowError::InvalidStatus);
+        // Single source of truth for "may this seller cancel right now?" —
+        // the same evaluation backs `get_cancel_eligibility` (issue #355).
+        let guard = Self::cancel_guard(&env, escrow_id);
+        if let Some(block) = Self::cancel_block(&env, &record, &guard) {
+            return Err(block.into_error());
         }
 
         record.status = EscrowStatus::Cancelled;
         record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
+
+        // The buyer's agreement authorized exactly this cancellation; it must
+        // not survive it and authorize another one later.
+        Self::clear_cancel_agreement(&env, escrow_id);
 
         env.events().publish(
             (
@@ -5597,6 +5811,349 @@ impl EscrowContract {
         );
 
         Ok(true)
+    }
+
+    /// Record that the seller accepts a created order (issue #355).
+    ///
+    /// Acceptance is what a buyer's `fund`/`deposit` is normally waiting on,
+    /// so it re-anchors the front-running protection window: the seller gets
+    /// no shorter a window than the one that started at creation, and the
+    /// buyer is guaranteed a full `cancel_lockout_ledgers` window in which to
+    /// fund the order it just accepted. The window can therefore only ever be
+    /// extended, never shortened, by accepting.
+    ///
+    /// Accepting is idempotent with respect to the recorded ledger only in the
+    /// sense that a second call simply re-anchors the window to the current
+    /// ledger; the buyer is never left with less time than the configured
+    /// window, and the escrow's timeout still bounds how long a `Created`
+    /// escrow can be held. An escrow with no readable snapshot is left failing
+    /// closed instead of being given a window.
+    ///
+    /// # Errors
+    /// Returns [`EscrowError::NotFound`] when no escrow exists,
+    /// [`EscrowError::Unauthorized`] when the caller is not the seller, and
+    /// [`EscrowError::InvalidStatus`] when the escrow is not `Created`.
+    pub fn accept_order(env: Env, escrow_id: u64, seller: Address) -> Result<bool, EscrowError> {
+        seller.require_auth();
+
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+
+        if seller != record.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        if record.status != EscrowStatus::Created {
+            return Err(EscrowError::InvalidStatus);
+        }
+
+        let now = env.ledger().sequence();
+        let mut guard = Self::cancel_guard(&env, escrow_id);
+        // An escrow whose window cannot be read fails closed
+        // (`CANCEL_LOCKOUT_NEVER`); accepting must never turn that into a
+        // cancellable window, so the deadline is only re-anchored when the
+        // escrow actually carries a snapshot.
+        let has_snapshot = env
+            .storage()
+            .persistent()
+            .has(&DataKey::CancelLockoutLedger(escrow_id));
+        if has_snapshot {
+            guard.allowed_ledger = now.saturating_add(guard.acceptance.cancel_lockout_ledgers);
+        }
+        let cancel_allowed_ledger = guard.allowed_ledger;
+
+        guard.acceptance.seller_accepted = true;
+        guard.acceptance.accepted_at_ledger = now;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::OrderAcceptance(escrow_id), &guard.acceptance);
+        if has_snapshot {
+            env.storage().persistent().set(
+                &DataKey::CancelLockoutLedger(escrow_id),
+                &cancel_allowed_ledger,
+            );
+        }
+        Self::bump_cancel_guard_ttl(&env, escrow_id);
+
+        env.events().publish(
+            (
+                symbol_short!("escrow"),
+                symbol_short!("accepted"),
+                escrow_id,
+            ),
+            EscrowOrderAcceptedEvent {
+                escrow_id,
+                seller,
+                accepted_at_ledger: now,
+                cancel_allowed_ledger,
+            },
+        );
+
+        Ok(true)
+    }
+
+    /// Record the buyer's agreement to cancel an unfunded escrow
+    /// (issue #355).
+    ///
+    /// This is the "explicit mutual agreement" half of the cancellation
+    /// guard: while the protection window is running, the buyer can waive it
+    /// on-chain, and the seller's next `cancel` succeeds. The agreement is
+    /// consumed by the cancelling call and is rejected for any escrow that is
+    /// not in `Created` status.
+    ///
+    /// # Errors
+    /// Returns [`EscrowError::NotFound`] when no escrow exists,
+    /// [`EscrowError::Unauthorized`] when the caller is not the escrow's
+    /// buyer, and [`EscrowError::InvalidStatus`] when the escrow is not
+    /// `Created`.
+    pub fn agree_cancel(env: Env, escrow_id: u64, buyer: Address) -> Result<bool, EscrowError> {
+        buyer.require_auth();
+
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+
+        if buyer != record.buyer {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        if record.status != EscrowStatus::Created {
+            return Err(EscrowError::InvalidStatus);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::CancelBuyerAgreement(escrow_id), &true);
+        Self::bump_cancel_guard_ttl(&env, escrow_id);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("agreed"), escrow_id),
+            EscrowCancelAgreedEvent {
+                escrow_id,
+                buyer,
+                agreed_at_ledger: env.ledger().sequence(),
+            },
+        );
+
+        Ok(true)
+    }
+
+    /// Read-only view of the order acceptance and cancel-protection state
+    /// (issue #355).
+    ///
+    /// Escrows created before this state existed (or whose snapshot has been
+    /// evicted) report a freshly derived state with `seller_accepted: false`
+    /// and the contract-wide default window; `get_cancel_eligibility` still
+    /// fails closed for those, so a missing snapshot can never widen a
+    /// seller's cancellation rights.
+    ///
+    /// # Errors
+    /// Returns [`EscrowError::NotFound`] when no escrow exists for `escrow_id`.
+    pub fn get_order_acceptance(
+        env: Env,
+        escrow_id: u64,
+    ) -> Result<OrderAcceptanceState, EscrowError> {
+        let key = DataKey::Escrow(escrow_id);
+        if !env.storage().persistent().has(&key) {
+            return Err(EscrowError::NotFound);
+        }
+        let guard = Self::cancel_guard(&env, escrow_id);
+        Self::bump_cancel_guard_ttl(&env, escrow_id);
+        Ok(guard.acceptance)
+    }
+
+    /// Deterministic, read-only answer to "can `caller` cancel this escrow
+    /// right now?" (issue #355).
+    ///
+    /// The answer is computed from the same guard `cancel` enforces, using
+    /// only stored state and `env.ledger()`. Callers can therefore predict the
+    /// outcome of a `cancel` transaction instead of guessing at mempool
+    /// ordering, and a seller cannot obtain a different answer by racing a
+    /// deposit. `reason` is `ok` when the cancel may proceed; see
+    /// [`CancelEligibility`] for the full symbol list.
+    pub fn get_cancel_eligibility(env: Env, escrow_id: u64, caller: Address) -> CancelEligibility {
+        let record: EscrowRecord = match env.storage().persistent().get(&DataKey::Escrow(escrow_id))
+        {
+            Some(rec) => rec,
+            None => {
+                return CancelEligibility {
+                    escrow_id,
+                    eligible: false,
+                    reason: symbol_short!("notfound"),
+                };
+            }
+        };
+
+        let (eligible, reason) = if caller != record.seller {
+            (false, symbol_short!("notseller"))
+        } else {
+            let guard = Self::cancel_guard(&env, escrow_id);
+            match Self::cancel_block(&env, &record, &guard) {
+                Some(block) => (false, block.reason()),
+                // `cancel_block` cleared the escrow for one of three reasons;
+                // name the one that applied so a client knows which escape
+                // hatch it is relying on.
+                None if guard.buyer_agreed => (true, symbol_short!("agreed")),
+                None if env.ledger().sequence() >= record.timeout_ledger => {
+                    (true, symbol_short!("timeout"))
+                }
+                None => (true, symbol_short!("ok")),
+            }
+        };
+
+        CancelEligibility {
+            escrow_id,
+            eligible,
+            reason,
+        }
+    }
+
+    /// Configure the default cancellation protection window for new escrows,
+    /// in ledgers. Admin-only (issue #355).
+    ///
+    /// The value is snapshotted into each escrow at creation (and on
+    /// acceptance), so changing it never retroactively alters the protection
+    /// of an order that is already live. `0` disables the window entirely and
+    /// is only appropriate for deployments that settle cancellation off-chain.
+    ///
+    /// # Errors
+    /// Returns [`EscrowError::Unauthorized`] when the caller is not an admin
+    /// and [`EscrowError::InvalidCancelLockout`] when `ledgers` exceeds
+    /// [`MAX_CANCEL_LOCKOUT_LEDGERS`].
+    pub fn set_cancel_lockout(env: Env, admin: Address, ledgers: u32) -> Result<bool, EscrowError> {
+        admin.require_auth();
+        if !Self::is_admin(env.clone(), admin) {
+            return Err(EscrowError::Unauthorized);
+        }
+        if ledgers > MAX_CANCEL_LOCKOUT_LEDGERS {
+            return Err(EscrowError::InvalidCancelLockout);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::CancelLockoutLedgers, &ledgers);
+        Ok(true)
+    }
+
+    /// Current default cancellation protection window, in ledgers (issue #355).
+    ///
+    /// Returns [`DEFAULT_CANCEL_LOCKOUT_LEDGERS`] when no admin override is
+    /// configured.
+    pub fn get_cancel_lockout(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::CancelLockoutLedgers)
+            .unwrap_or(DEFAULT_CANCEL_LOCKOUT_LEDGERS)
+    }
+
+    /// Seed the cancellation guard for a newly created escrow (issue #355).
+    fn init_cancel_guard(env: &Env, escrow_id: u64) {
+        let lockout_ledgers = Self::get_cancel_lockout(env.clone());
+        let acceptance = OrderAcceptanceState {
+            seller_accepted: false,
+            accepted_at_ledger: 0,
+            cancel_lockout_ledgers: lockout_ledgers,
+        };
+        let allowed_ledger = env.ledger().sequence().saturating_add(lockout_ledgers);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::OrderAcceptance(escrow_id), &acceptance);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CancelLockoutLedger(escrow_id), &allowed_ledger);
+        Self::bump_cancel_guard_ttl(env, escrow_id);
+    }
+
+    /// Read the cancellation guard for an escrow (issue #355).
+    ///
+    /// Fails closed: an escrow whose protection state cannot be read gets
+    /// `CANCEL_LOCKOUT_NEVER`, which only the buyer's agreement or the escrow
+    /// timeout can clear.
+    fn cancel_guard(env: &Env, escrow_id: u64) -> CancelGuard {
+        let acceptance: Option<OrderAcceptanceState> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OrderAcceptance(escrow_id));
+        let allowed_ledger: Option<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CancelLockoutLedger(escrow_id));
+        let buyer_agreed: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CancelBuyerAgreement(escrow_id))
+            .unwrap_or(false);
+
+        CancelGuard {
+            acceptance: acceptance.unwrap_or(OrderAcceptanceState {
+                seller_accepted: false,
+                accepted_at_ledger: 0,
+                cancel_lockout_ledgers: Self::get_cancel_lockout(env.clone()),
+            }),
+            allowed_ledger: allowed_ledger.unwrap_or(CANCEL_LOCKOUT_NEVER),
+            buyer_agreed,
+        }
+    }
+
+    /// Evaluate the cancellation guard for a seller cancel (issue #355).
+    ///
+    /// A unilateral cancel is permitted only when the escrow is `Created` and
+    /// at least one of the following holds:
+    /// * the buyer's deposit is on-chain — rejected, the escrow is no longer
+    ///   `Created` and the buyer's funds stay locked;
+    /// * the buyer agreed to the cancellation (`agree_cancel`);
+    /// * the escrow's timeout has been reached; or
+    /// * the protection window has fully elapsed.
+    fn cancel_block(env: &Env, record: &EscrowRecord, guard: &CancelGuard) -> Option<CancelBlock> {
+        if record.status == EscrowStatus::Funded {
+            return Some(CancelBlock::Funded);
+        }
+        if record.status == EscrowStatus::Cancelled {
+            return Some(CancelBlock::Cancelled);
+        }
+        if record.status != EscrowStatus::Created {
+            return Some(CancelBlock::InvalidStatus);
+        }
+        if guard.buyer_agreed || env.ledger().sequence() >= record.timeout_ledger {
+            return None;
+        }
+        if env.ledger().sequence() >= guard.allowed_ledger {
+            return None;
+        }
+        Some(CancelBlock::Lockout)
+    }
+
+    /// Consume a recorded buyer agreement so it can only authorize one cancel.
+    fn clear_cancel_agreement(env: &Env, escrow_id: u64) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::CancelBuyerAgreement(escrow_id), &false);
+    }
+
+    /// Keep the guard state alive for as long as the escrow record itself.
+    ///
+    /// Mirrors the TTL handling of [`EscrowRecord`]: the snapshot and the
+    /// deadline are bumped with the same thresholds. Keys that are not stored
+    /// are skipped — `extend_ttl` on a missing key is a host error, and the
+    /// buyer agreement is only written when a buyer actually agrees.
+    fn bump_cancel_guard_ttl(env: &Env, escrow_id: u64) {
+        let storage = env.storage().persistent();
+        let keys = [
+            DataKey::OrderAcceptance(escrow_id),
+            DataKey::CancelLockoutLedger(escrow_id),
+            DataKey::CancelBuyerAgreement(escrow_id),
+        ];
+        for key in keys.iter() {
+            if storage.has(key) {
+                storage.extend_ttl(key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+            }
+        }
     }
 
     /// Deposit funds into escrow for an order.
@@ -5694,6 +6251,10 @@ impl EscrowContract {
             PERSISTENT_BUMP_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+        // The buyer's deposit is now on-chain, so the escrow is no longer
+        // cancellable by the seller; keep the guard snapshot (issue #355) in
+        // step with the record it protects.
+        Self::bump_cancel_guard_ttl(&env, escrow_id);
         env.storage()
             .instance()
             .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
@@ -10531,6 +11092,650 @@ impl EscrowContract {
     }
 }
 
+/// Cancellation protection for created (unfunded) orders — issue #355.
+///
+/// A buyer broadcasts `deposit` for an accepted order while a seller
+/// broadcasts `cancel` for the very same escrow. On a chain without mempool
+/// visibility the contract cannot know which of the two lands first, so it
+/// makes the unilateral `cancel` *lose* whenever it would land first: for a
+/// window of ledgers after creation (and after a seller acceptance) the
+/// seller may only cancel with the buyer's agreement on-chain or once the
+/// escrow's own timeout has been reached. Once the buyer's deposit is
+/// on-chain the escrow is `Funded` and the pre-existing `AlreadyFunded`
+/// guard keeps the funds locked.
+#[cfg(test)]
+mod cancel_guard_tests {
+    use super::*;
+    use soroban_sdk::{
+        testutils::{Address as _, Events, Ledger as _},
+        token::StellarAssetClient,
+        TryIntoVal,
+    };
+
+    const DEPOSIT: i128 = 1_000;
+    const TIMEOUT: u32 = 10_000;
+    const REASON: Symbol = symbol_short!("cancel");
+    const FAR_FUTURE: u32 = 100_000;
+
+    struct Setup<'a> {
+        client: EscrowContractClient<'a>,
+        contract: Address,
+        admin: Address,
+        buyer: Address,
+        seller: Address,
+        token: Address,
+    }
+
+    fn setup(env: &Env) -> Setup<'_> {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let buyer = Address::generate(env);
+        let seller = Address::generate(env);
+        let token = env
+            .register_stellar_asset_contract_v2(Address::generate(env))
+            .address();
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 250,
+            treasury: Address::generate(env),
+            min_amount: 100,
+            max_amount: 1_000_000,
+        };
+        let contract = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(env, &contract);
+        StellarAssetClient::new(env, &token).mint(&buyer, &10_000);
+        client.add_token(&admin, &token);
+        Setup {
+            client,
+            contract,
+            admin,
+            buyer,
+            seller,
+            token,
+        }
+    }
+
+    fn order_id(env: &Env, byte: u8) -> BytesN<32> {
+        BytesN::from_array(env, &[byte; 32])
+    }
+
+    /// Create an order without funding it — the only state a seller is ever
+    /// allowed to cancel.
+    fn create(env: &Env, s: &Setup, byte: u8) -> u64 {
+        s.client.create(
+            &s.buyer,
+            &s.seller,
+            &s.token,
+            &DEPOSIT,
+            &order_id(env, byte),
+            &TIMEOUT,
+            &None,
+            &None,
+        )
+    }
+
+    /// The buyer's funding submission — the transaction whose mempool entry a
+    /// seller would try to get ahead of.
+    fn fund(s: &Setup, escrow_id: u64) {
+        assert!(s.client.fund(&escrow_id, &s.buyer));
+        assert_eq!(s.client.get_escrow(&escrow_id).status, EscrowStatus::Funded);
+    }
+
+    fn reason_of(s: &Setup, escrow_id: u64) -> Symbol {
+        s.client
+            .get_cancel_eligibility(&escrow_id, &s.seller)
+            .reason
+    }
+
+    fn eligible(s: &Setup, escrow_id: u64) -> bool {
+        s.client
+            .get_cancel_eligibility(&escrow_id, &s.seller)
+            .eligible
+    }
+
+    fn has_event(env: &Env, action: &str) -> bool {
+        env.events().all().iter().any(|(_, topics, data)| {
+            if topics.len() != 3 {
+                return false;
+            }
+            let topic: Symbol = topics.get(1).unwrap().try_into_val(env).unwrap();
+            topic == Symbol::new(env, action) && !data.is_void()
+        })
+    }
+
+    #[test]
+    fn creation_snapshots_the_protection_window() {
+        let env = Env::default();
+        let s = setup(&env);
+        let escrow_id = create(&env, &s, 1);
+
+        let acceptance = s.client.get_order_acceptance(&escrow_id);
+        assert!(!acceptance.seller_accepted);
+        assert_eq!(acceptance.accepted_at_ledger, 0);
+        assert_eq!(
+            acceptance.cancel_lockout_ledgers,
+            DEFAULT_CANCEL_LOCKOUT_LEDGERS
+        );
+
+        let eligibility = s.client.get_cancel_eligibility(&escrow_id, &s.seller);
+        assert_eq!(eligibility.escrow_id, escrow_id);
+        assert!(!eligibility.eligible);
+        assert_eq!(eligibility.reason, symbol_short!("lockout"));
+    }
+
+    #[test]
+    fn a_seller_cancel_inside_the_window_is_rejected() {
+        let env = Env::default();
+        let s = setup(&env);
+        let escrow_id = create(&env, &s, 2);
+
+        assert_eq!(
+            s.client.try_cancel(&escrow_id, &s.seller, &REASON),
+            Err(Ok(EscrowError::CancelLockoutActive))
+        );
+        // The rejection leaves no trace: the order is still open, so the
+        // buyer can still fund it instead of losing it to a losing race.
+        assert_eq!(
+            s.client.get_escrow(&escrow_id).status,
+            EscrowStatus::Created
+        );
+        assert_eq!(
+            s.client
+                .get_cancel_eligibility(&escrow_id, &s.seller)
+                .reason,
+            symbol_short!("lockout")
+        );
+    }
+
+    #[test]
+    fn a_rejected_cancel_does_not_block_the_buyer_deposit() {
+        let env = Env::default();
+        let s = setup(&env);
+        let escrow_id = create(&env, &s, 27);
+
+        // The seller's front-running attempt is rejected...
+        assert_eq!(
+            s.client.try_cancel(&escrow_id, &s.seller, &REASON),
+            Err(Ok(EscrowError::CancelLockoutActive))
+        );
+        // ...and the buyer's own funding submission — the thing the guard
+        // exists to protect — still lands.
+        fund(&s, escrow_id);
+
+        // Only the escrow's buyer may fund it.
+        assert_eq!(
+            s.client.try_fund(&escrow_id, &s.seller),
+            Err(Ok(EscrowError::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn only_the_seller_may_cancel() {
+        let env = Env::default();
+        let s = setup(&env);
+        let escrow_id = create(&env, &s, 3);
+        env.ledger()
+            .set_sequence_number(DEFAULT_CANCEL_LOCKOUT_LEDGERS);
+
+        // The buyer cannot cancel the seller's order even after the window
+        // elapsed — that is what makes the buyer's on-chain agreement
+        // meaningful instead of redundant.
+        assert_eq!(
+            s.client.try_cancel(&escrow_id, &s.buyer, &REASON),
+            Err(Ok(EscrowError::Unauthorized))
+        );
+        assert_eq!(
+            s.client
+                .try_cancel(&escrow_id, &Address::generate(&env), &REASON),
+            Err(Ok(EscrowError::Unauthorized))
+        );
+        assert_eq!(
+            s.client.get_cancel_eligibility(&escrow_id, &s.buyer).reason,
+            symbol_short!("notseller")
+        );
+    }
+
+    #[test]
+    fn the_window_expires_at_the_configured_ledger() {
+        let env = Env::default();
+        let s = setup(&env);
+        let escrow_id = create(&env, &s, 4);
+
+        // One ledger short of the deadline the window is still running.
+        env.ledger()
+            .set_sequence_number(DEFAULT_CANCEL_LOCKOUT_LEDGERS - 1);
+        assert_eq!(
+            s.client.try_cancel(&escrow_id, &s.seller, &REASON),
+            Err(Ok(EscrowError::CancelLockoutActive))
+        );
+
+        // The first unprotected ledger is cancellable again.
+        env.ledger()
+            .set_sequence_number(DEFAULT_CANCEL_LOCKOUT_LEDGERS);
+        assert_eq!(reason_of(&s, escrow_id), symbol_short!("ok"));
+        assert!(s.client.cancel(&escrow_id, &s.seller, &REASON));
+        assert_eq!(
+            s.client.get_escrow(&escrow_id).status,
+            EscrowStatus::Cancelled
+        );
+        assert_eq!(
+            s.client.try_cancel(&escrow_id, &s.seller, &REASON),
+            Err(Ok(EscrowError::AlreadyCancelled))
+        );
+        assert_eq!(reason_of(&s, escrow_id), symbol_short!("cancelled"));
+    }
+
+    #[test]
+    fn the_buyer_can_waive_the_window() {
+        let env = Env::default();
+        let s = setup(&env);
+        let escrow_id = create(&env, &s, 5);
+
+        assert!(s.client.agree_cancel(&escrow_id, &s.buyer));
+        assert!(has_event(&env, "agreed"));
+        assert!(eligible(&s, escrow_id));
+        assert_eq!(reason_of(&s, escrow_id), symbol_short!("agreed"));
+
+        // Inside the nominal window, but explicitly agreed to.
+        assert!(s.client.cancel(&escrow_id, &s.seller, &REASON));
+        assert_eq!(
+            s.client.get_escrow(&escrow_id).status,
+            EscrowStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn only_the_buyer_may_agree_to_a_cancellation() {
+        let env = Env::default();
+        let s = setup(&env);
+        let escrow_id = create(&env, &s, 6);
+
+        assert_eq!(
+            s.client.try_agree_cancel(&escrow_id, &s.seller),
+            Err(Ok(EscrowError::Unauthorized))
+        );
+        assert_eq!(
+            s.client
+                .try_agree_cancel(&escrow_id, &Address::generate(&env)),
+            Err(Ok(EscrowError::Unauthorized))
+        );
+        // A seller cannot manufacture the buyer's consent, so the window
+        // still applies.
+        assert_eq!(reason_of(&s, escrow_id), symbol_short!("lockout"));
+    }
+
+    #[test]
+    fn agreement_is_only_valid_while_the_order_is_unfunded() {
+        let env = Env::default();
+        let s = setup(&env);
+        let funded = create(&env, &s, 7);
+        fund(&s, funded);
+
+        assert_eq!(
+            s.client.try_agree_cancel(&funded, &s.buyer),
+            Err(Ok(EscrowError::InvalidStatus))
+        );
+    }
+
+    #[test]
+    fn a_deposit_cannot_be_front_run_by_a_seller_cancel() {
+        let env = Env::default();
+        let s = setup(&env);
+        let escrow_id = create(&env, &s, 8);
+
+        // Legitimate order: the buyer funds the order it accepted.
+        fund(&s, escrow_id);
+
+        // Attack: the seller's cancel is submitted in the very first ledger,
+        // where it would have won the race before this fix. It must lose
+        // regardless of submission order, and the funds stay in escrow.
+        assert_eq!(
+            s.client.try_cancel(&escrow_id, &s.seller, &REASON),
+            Err(Ok(EscrowError::AlreadyFunded))
+        );
+        assert_eq!(reason_of(&s, escrow_id), symbol_short!("funded"));
+        let record = s.client.get_escrow(&escrow_id);
+        assert_eq!(record.status, EscrowStatus::Funded);
+        assert_eq!(record.amount, DEPOSIT);
+    }
+
+    #[test]
+    fn a_settled_escrow_can_never_be_cancelled() {
+        let env = Env::default();
+        let s = setup(&env);
+        let escrow_id = create(&env, &s, 9);
+        s.client.accept_order(&escrow_id, &s.seller);
+        fund(&s, escrow_id);
+        env.ledger().set_sequence_number(FAR_FUTURE);
+
+        assert_eq!(
+            s.client.try_cancel(&escrow_id, &s.seller, &REASON),
+            Err(Ok(EscrowError::AlreadyFunded))
+        );
+    }
+
+    #[test]
+    fn a_losing_cancel_cannot_be_retried_after_the_window() {
+        let env = Env::default();
+        let s = setup(&env);
+        let escrow_id = create(&env, &s, 10);
+
+        // The seller tries to front-run and is blocked...
+        assert_eq!(
+            s.client.try_cancel(&escrow_id, &s.seller, &REASON),
+            Err(Ok(EscrowError::CancelLockoutActive))
+        );
+
+        // ...and the window is short enough that a seller who was never
+        // front-running keeps its ability to clean up a stalled order.
+        env.ledger()
+            .set_sequence_number(DEFAULT_CANCEL_LOCKOUT_LEDGERS);
+        assert!(s.client.cancel(&escrow_id, &s.seller, &REASON));
+    }
+
+    #[test]
+    fn acceptance_is_seller_only() {
+        let env = Env::default();
+        let s = setup(&env);
+        let escrow_id = create(&env, &s, 11);
+
+        assert!(s.client.accept_order(&escrow_id, &s.seller));
+        assert!(has_event(&env, "accepted"));
+        let acceptance = s.client.get_order_acceptance(&escrow_id);
+        assert!(acceptance.seller_accepted);
+        assert_eq!(acceptance.accepted_at_ledger, env.ledger().sequence());
+
+        assert_eq!(
+            s.client.try_accept_order(&escrow_id, &s.buyer),
+            Err(Ok(EscrowError::Unauthorized))
+        );
+        assert_eq!(
+            s.client
+                .try_accept_order(&escrow_id, &Address::generate(&env)),
+            Err(Ok(EscrowError::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn acceptance_re_anchors_the_protection_window() {
+        let env = Env::default();
+        let s = setup(&env);
+        let escrow_id = create(&env, &s, 12);
+
+        // The seller accepts the order some ledgers after it was created; the
+        // buyer is then guaranteed a full window to fund the order it just
+        // saw accepted.
+        env.ledger().set_sequence_number(4);
+        s.client.accept_order(&escrow_id, &s.seller);
+
+        let now = env.ledger().sequence();
+        assert_eq!(
+            s.client
+                .get_cancel_eligibility(&escrow_id, &s.seller)
+                .reason,
+            symbol_short!("lockout")
+        );
+        assert_eq!(
+            s.client.try_cancel(&escrow_id, &s.seller, &REASON),
+            Err(Ok(EscrowError::CancelLockoutActive))
+        );
+
+        // Four ledgers past the original deadline, but inside the re-anchored
+        // one, the buyer's deposit is still safe.
+        env.ledger()
+            .set_sequence_number(now + DEFAULT_CANCEL_LOCKOUT_LEDGERS - 1);
+        assert_eq!(
+            s.client.try_cancel(&escrow_id, &s.seller, &REASON),
+            Err(Ok(EscrowError::CancelLockoutActive))
+        );
+
+        env.ledger()
+            .set_sequence_number(now + DEFAULT_CANCEL_LOCKOUT_LEDGERS);
+        assert!(s.client.cancel(&escrow_id, &s.seller, &REASON));
+    }
+
+    #[test]
+    fn acceptance_is_only_valid_while_the_order_is_open() {
+        let env = Env::default();
+        let s = setup(&env);
+        let cancelled = create(&env, &s, 13);
+        let funded = create(&env, &s, 14);
+        env.ledger()
+            .set_sequence_number(DEFAULT_CANCEL_LOCKOUT_LEDGERS);
+        s.client.cancel(&cancelled, &s.seller, &REASON);
+        fund(&s, funded);
+
+        assert_eq!(
+            s.client.try_accept_order(&cancelled, &s.seller),
+            Err(Ok(EscrowError::InvalidStatus))
+        );
+        assert_eq!(
+            s.client.try_accept_order(&funded, &s.seller),
+            Err(Ok(EscrowError::InvalidStatus))
+        );
+    }
+
+    #[test]
+    fn the_order_timeout_waives_the_window() {
+        let env = Env::default();
+        let s = setup(&env);
+        let escrow_id = create(&env, &s, 15);
+        let timeout_ledger = s.client.get_escrow(&escrow_id).timeout_ledger;
+
+        // The timeout is reached long before the window would have expired.
+        env.ledger().set_sequence_number(timeout_ledger);
+        assert!(eligible(&s, escrow_id));
+        assert_eq!(reason_of(&s, escrow_id), symbol_short!("timeout"));
+        assert!(s.client.cancel(&escrow_id, &s.seller, &REASON));
+    }
+
+    #[test]
+    fn the_admin_configures_the_window() {
+        let env = Env::default();
+        let s = setup(&env);
+        let escrow_id = create(&env, &s, 16);
+
+        assert_eq!(
+            s.client.get_cancel_lockout(),
+            DEFAULT_CANCEL_LOCKOUT_LEDGERS
+        );
+        assert_eq!(
+            s.client
+                .get_order_acceptance(&escrow_id)
+                .cancel_lockout_ledgers,
+            DEFAULT_CANCEL_LOCKOUT_LEDGERS
+        );
+
+        s.client.set_cancel_lockout(&s.admin, &7);
+        assert_eq!(s.client.get_cancel_lockout(), 7);
+        // An order that is already live keeps the window it was created with.
+        assert_eq!(
+            s.client
+                .get_order_acceptance(&escrow_id)
+                .cancel_lockout_ledgers,
+            DEFAULT_CANCEL_LOCKOUT_LEDGERS
+        );
+
+        s.client
+            .set_cancel_lockout(&s.admin, &MAX_CANCEL_LOCKOUT_LEDGERS);
+        assert_eq!(s.client.get_cancel_lockout(), MAX_CANCEL_LOCKOUT_LEDGERS);
+
+        s.client.set_cancel_lockout(&s.admin, &0);
+        assert_eq!(s.client.get_cancel_lockout(), 0);
+
+        assert_eq!(
+            s.client.try_set_cancel_lockout(&s.seller, &5),
+            Err(Ok(EscrowError::Unauthorized))
+        );
+        assert_eq!(
+            s.client.try_set_cancel_lockout(&s.buyer, &5),
+            Err(Ok(EscrowError::Unauthorized))
+        );
+        assert_eq!(
+            s.client
+                .try_set_cancel_lockout(&s.admin, &(MAX_CANCEL_LOCKOUT_LEDGERS + 1)),
+            Err(Ok(EscrowError::InvalidCancelLockout))
+        );
+        // Rejected values must not be persisted.
+        assert_eq!(s.client.get_cancel_lockout(), 0);
+    }
+
+    #[test]
+    fn the_window_is_snapshotted_per_escrow() {
+        let env = Env::default();
+        let s = setup(&env);
+        let early = create(&env, &s, 17);
+        s.client
+            .set_cancel_lockout(&s.admin, &MAX_CANCEL_LOCKOUT_LEDGERS);
+        let late = create(&env, &s, 18);
+        s.client.set_cancel_lockout(&s.admin, &3);
+
+        // A later configuration change must not retroactively alter the
+        // protection of orders that are already live.
+        assert_eq!(
+            s.client.get_order_acceptance(&early).cancel_lockout_ledgers,
+            DEFAULT_CANCEL_LOCKOUT_LEDGERS
+        );
+        assert_eq!(
+            s.client.get_order_acceptance(&late).cancel_lockout_ledgers,
+            MAX_CANCEL_LOCKOUT_LEDGERS
+        );
+
+        env.ledger()
+            .set_sequence_number(DEFAULT_CANCEL_LOCKOUT_LEDGERS);
+        assert!(s.client.cancel(&early, &s.seller, &REASON));
+        assert_eq!(
+            s.client.try_cancel(&late, &s.seller, &REASON),
+            Err(Ok(EscrowError::CancelLockoutActive))
+        );
+    }
+
+    #[test]
+    fn a_zero_window_leaves_cancels_unilateral() {
+        let env = Env::default();
+        let s = setup(&env);
+        s.client.set_cancel_lockout(&s.admin, &0);
+        let escrow_id = create(&env, &s, 19);
+
+        assert!(eligible(&s, escrow_id));
+        assert_eq!(reason_of(&s, escrow_id), symbol_short!("ok"));
+        assert!(s.client.cancel(&escrow_id, &s.seller, &REASON));
+    }
+
+    #[test]
+    fn the_guard_never_agrees_with_itself() {
+        let env = Env::default();
+        let s = setup(&env);
+        let fresh = create(&env, &s, 20);
+        let funded = create(&env, &s, 21);
+        let agreed = create(&env, &s, 22);
+        fund(&s, funded);
+        s.client.agree_cancel(&agreed, &s.buyer);
+
+        // The read-only view and the state-changing call must agree on every
+        // outcome an order can be in while the seller is watching it.
+        for (escrow_id, can_cancel) in [(fresh, false), (funded, false), (agreed, true)] {
+            let eligibility = s.client.get_cancel_eligibility(&escrow_id, &s.seller);
+            assert_eq!(eligibility.escrow_id, escrow_id);
+            assert_eq!(
+                eligibility.eligible, can_cancel,
+                "eligibility for {escrow_id}"
+            );
+            let result = s.client.try_cancel(&escrow_id, &s.seller, &REASON);
+            assert_eq!(result.is_ok(), can_cancel, "cancel for {escrow_id}");
+        }
+
+        // Once the window elapses the same order is cancellable, and the view
+        // follows it into the terminal state.
+        env.ledger()
+            .set_sequence_number(DEFAULT_CANCEL_LOCKOUT_LEDGERS);
+        assert!(s.client.cancel(&fresh, &s.seller, &REASON));
+        let eligibility = s.client.get_cancel_eligibility(&fresh, &s.seller);
+        assert!(!eligibility.eligible);
+        assert_eq!(eligibility.reason, symbol_short!("cancelled"));
+    }
+
+    #[test]
+    fn a_missing_snapshot_fails_closed() {
+        let env = Env::default();
+        let s = setup(&env);
+        let escrow_id = create(&env, &s, 24);
+
+        // Simulate a legacy escrow (or an evicted snapshot) whose protection
+        // state cannot be read.
+        env.as_contract(&s.contract, || {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::OrderAcceptance(escrow_id));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::CancelLockoutLedger(escrow_id));
+        });
+
+        assert_eq!(reason_of(&s, escrow_id), symbol_short!("lockout"));
+        assert_eq!(
+            s.client.try_cancel(&escrow_id, &s.seller, &REASON),
+            Err(Ok(EscrowError::CancelLockoutActive))
+        );
+
+        // The buyer's agreement is still honoured, so a missing snapshot can
+        // never trap the escrow.
+        s.client.agree_cancel(&escrow_id, &s.buyer);
+        assert!(s.client.cancel(&escrow_id, &s.seller, &REASON));
+    }
+
+    #[test]
+    fn accepting_cannot_open_a_missing_snapshot() {
+        let env = Env::default();
+        let s = setup(&env);
+        let escrow_id = create(&env, &s, 26);
+        env.as_contract(&s.contract, || {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::CancelLockoutLedger(escrow_id));
+        });
+
+        // Acceptance records the acknowledgement but must not hand the seller a
+        // window the escrow never had.
+        assert!(s.client.accept_order(&escrow_id, &s.seller));
+        assert!(s.client.get_order_acceptance(&escrow_id).seller_accepted);
+        env.ledger()
+            .set_sequence_number(DEFAULT_CANCEL_LOCKOUT_LEDGERS);
+        assert_eq!(reason_of(&s, escrow_id), symbol_short!("lockout"));
+        assert_eq!(
+            s.client.try_cancel(&escrow_id, &s.seller, &REASON),
+            Err(Ok(EscrowError::CancelLockoutActive))
+        );
+    }
+
+    #[test]
+    fn unknown_escrows_are_rejected() {
+        let env = Env::default();
+        let s = setup(&env);
+        let missing = 9_999u64;
+
+        assert_eq!(
+            s.client.try_accept_order(&missing, &s.seller),
+            Err(Ok(EscrowError::NotFound))
+        );
+        assert_eq!(
+            s.client.try_agree_cancel(&missing, &s.buyer),
+            Err(Ok(EscrowError::NotFound))
+        );
+        assert_eq!(
+            s.client.try_get_order_acceptance(&missing),
+            Err(Ok(EscrowError::NotFound))
+        );
+        assert_eq!(
+            s.client.try_cancel(&missing, &s.seller, &REASON),
+            Err(Ok(EscrowError::NotFound))
+        );
+        let eligibility = s.client.get_cancel_eligibility(&missing, &s.seller);
+        assert!(!eligibility.eligible);
+        assert_eq!(eligibility.reason, symbol_short!("notfound"));
+    }
+}
+
 #[cfg(test)]
 mod escrow_feature_tests {
     use super::*;
@@ -13962,6 +15167,8 @@ mod error_code_allocation_tests {
             EscrowError::AdminActionVetoed as u32,
             EscrowError::AdminActionAlreadyQueued as u32,
             EscrowError::AdminActionOverflow as u32,
+            EscrowError::CancelLockoutActive as u32,
+            EscrowError::InvalidCancelLockout as u32,
         ]
     }
 

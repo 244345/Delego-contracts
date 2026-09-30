@@ -42,7 +42,13 @@ The escrow contract holds funds in trust during agent-mediated purchases, releas
 - `release(escrow_id)` / `partial_release(...)`: Transfer remaining/partial balance to seller
 - `refund(escrow_id)`: Return funds to buyer (after timeout if needed)
 - `dispute(escrow_id)` / `resolve_dispute(...)` / `resolve_dispute_quorum(...)`: Dispute lifecycle
-- `cancel(escrow_id)`: Merchant cancels an unfunded escrow
+- `cancel(escrow_id)`: Merchant cancels an unfunded escrow, subject to the
+  cancellation protection window (issue #355)
+- `accept_order(escrow_id)`: Seller records acceptance and re-anchors the
+  protection window; `agree_cancel(escrow_id)`: buyer waives it
+- `get_cancel_eligibility(escrow_id, caller)` /
+  `get_order_acceptance(escrow_id)`: deterministic, read-only cancel guards
+- Admin: `set_cancel_lockout(ledgers)` / `get_cancel_lockout()`
 - `get_escrow(escrow_id)`: Get full escrow record
 - `get_receipt(escrow_id)` / `get_merchant_receipt(...)`: Buyer/seller receipts
 - `get_release_eligibility(...)` / `get_refund_eligibility(...)` / `get_timeout_view(...)`: Read-only eligibility checks
@@ -74,7 +80,27 @@ enum EscrowStatus {
     Cancelled,
     Disputed,
 }
+
+// Cancellation protection snapshot (issue #355), one per escrow.
+struct OrderAcceptanceState {
+    seller_accepted: bool,
+    accepted_at_ledger: u32,
+    cancel_lockout_ledgers: u32,
+}
 ```
+
+#### Cancellation protection (issue #355)
+
+An order is created before the buyer funds it, so a seller watching the mempool
+could get a `cancel` in front of a pending `fund`/`deposit`. Each escrow
+snapshots a protection window (default 10 ledgers, `0..=1000`, admin-set via
+`set_cancel_lockout`) at creation and on every `accept_order`. Inside that
+window `cancel` fails with `CancelLockoutActive` unless the buyer recorded
+`agree_cancel` or the escrow's own timeout was reached. Once the buyer's
+deposit lands the escrow is `Funded` and `cancel` always fails with
+`AlreadyFunded`, so a submitted deposit can never be unwound. Missing snapshot
+state fails closed, and `get_cancel_eligibility` returns the same answer
+`cancel` would give.
 
 #### Use Cases
 
@@ -82,6 +108,8 @@ enum EscrowStatus {
 - Delivery confirmed → funds released to merchant
 - Delivery failed → funds refunded to buyer
 - Dispute → funds held until resolution (admin or arbiter quorum)
+- Seller stalls on an order → seller cancels unilaterally after the protection
+  window, or the buyer agrees with `agree_cancel`
 
 ### Permissions Contract
 
