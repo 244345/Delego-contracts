@@ -1763,6 +1763,8 @@ pub enum DataKey {
 // | 416 | AdminActionAlreadyQueued | next major |
 // | 417 | AdminActionOverflow | next major |
 // | 418+ | Reserved for new variants | next major |
+// | 411 | MathOverflow | next major |
+// | 412+ | Reserved for new variants | next major |
 //
 // # Allocating new variants
 //
@@ -2292,6 +2294,8 @@ pub enum MultiOracleError {
     AdminActionAlreadyQueued = 416,
     /// Proposal ID or review deadline would overflow.
     AdminActionOverflow = 417,
+    /// A fee or yield calculation exceeded the supported integer range.
+    MathOverflow = 411,
 }
 
 /// Compact receipt returned to buyers after escrow creation via `get_receipt`.
@@ -2480,6 +2484,25 @@ pub const MAX_PAGE_LIMIT: u32 = 50;
 /// Seconds in a 365-day year, used to prorate `YieldConfig::apr_bps` down to
 /// the actual holding period of an escrow.
 const SECONDS_PER_YEAR: i128 = 31_536_000;
+
+/// Calculate a basis-point amount without allowing intermediate overflow.
+fn calculate_fee_and_yield(amount: i128, bps: u32) -> Result<i128, EscrowError> {
+    amount
+        .checked_mul(bps as i128)
+        .and_then(|product| product.checked_div(10_000))
+        .ok_or(EscrowError::MathOverflow)
+}
+
+fn calculate_yield(amount: i128, bps: u32, held_seconds: u64) -> Result<i128, EscrowError> {
+    let denominator = 10_000i128
+        .checked_mul(SECONDS_PER_YEAR)
+        .ok_or(EscrowError::MathOverflow)?;
+    amount
+        .checked_mul(bps as i128)
+        .and_then(|product| product.checked_mul(held_seconds as i128))
+        .and_then(|product| product.checked_div(denominator))
+        .ok_or(EscrowError::MathOverflow)
+}
 
 /// Maximum number of treasury rows accepted by `set_fee_distribution`.
 /// Keeps the fee-splitting loop bounded and prevents unbounded config growth.
@@ -4234,7 +4257,9 @@ impl EscrowContract {
         } else {
             let mut total_bps: i128 = 0;
             for share in shares.iter() {
-                total_bps += share.bps as i128;
+                total_bps = total_bps
+                    .checked_add(share.bps as i128)
+                    .ok_or(EscrowError::MathOverflow)?;
             }
 
             let mut distributed: i128 = 0;
@@ -4252,14 +4277,19 @@ impl EscrowContract {
                     }
                 } else {
                     let bps = share.bps as i128;
-                    let fee = (total_fee * bps) / total_bps;
+                    let fee = total_fee
+                        .checked_mul(bps)
+                        .and_then(|product| product.checked_div(total_bps))
+                        .ok_or(EscrowError::MathOverflow)?;
                     if fee > 0 {
                         token_client.transfer(
                             &env.current_contract_address(),
                             &share.treasury,
                             &fee,
                         );
-                        distributed += fee;
+                        distributed = distributed
+                            .checked_add(fee)
+                            .ok_or(EscrowError::MathOverflow)?;
                     }
                 }
             }
@@ -4290,14 +4320,17 @@ impl EscrowContract {
         if !shares.is_empty() {
             let mut total_fee: i128 = 0;
             for share in shares.iter() {
-                let bps = share.bps as i128;
-                total_fee +=
-                    (amount / 10_000i128) * bps + ((amount % 10_000i128) * bps) / 10_000i128;
+                let fee = calculate_fee_and_yield(amount, share.bps)?;
+                total_fee = total_fee
+                    .checked_add(fee)
+                    .ok_or(EscrowError::MathOverflow)?;
             }
             Ok(total_fee)
         } else {
             let fee_bps = effective_fee_bps(env, merchant)? as i128;
             Ok((amount / 10_000i128) * fee_bps + ((amount % 10_000i128) * fee_bps) / 10_000i128)
+            let fee_config: FeeConfig = Self::get_fee_config(env.clone())?;
+            calculate_fee_and_yield(amount, fee_config.fee_bps)
         }
     }
 
@@ -4311,7 +4344,7 @@ impl EscrowContract {
         let fee = Self::compute_fee_amount(env, merchant, amount)?;
         let fee_config: FeeConfig = Self::get_fee_config(env.clone())?;
         Ok(ReleasePayout {
-            seller_net: amount - fee,
+            seller_net: amount.checked_sub(fee).ok_or(EscrowError::MathOverflow)?,
             fee,
             treasury: fee_config.treasury,
         })
@@ -6074,6 +6107,16 @@ impl EscrowContract {
                         );
                     }
                 }
+                let (yield_amount, held_seconds) = Self::compute_yield(&record, Some(cfg), env)?;
+                env.events().publish(
+                    (symbol_short!("escrow"), symbol_short!("yield"), escrow_id),
+                    EscrowYieldAccruedEvent {
+                        escrow_id,
+                        seller: record.seller.clone(),
+                        yield_amount,
+                        held_seconds,
+                    },
+                );
             }
         }
 
@@ -8439,6 +8482,7 @@ impl EscrowContract {
             Some(cfg) => Self::accrued_yield(&record, cfg, &env),
             None => (0, 0),
         };
+        let (accrued, held_seconds) = Self::compute_yield(&record, yield_config.as_ref(), &env)?;
 
         let remaining = record.amount - record.released_amount - record.refunded_amount;
 
@@ -9539,7 +9583,7 @@ impl EscrowContract {
         record: &EscrowRecord,
         yield_config: Option<&YieldConfig>,
         env: &Env,
-    ) -> (i128, u64) {
+    ) -> Result<(i128, u64), EscrowError> {
         match yield_config {
             Some(cfg) => {
                 let held_seconds = env.ledger().timestamp().saturating_sub(record.created_at);
@@ -9547,8 +9591,15 @@ impl EscrowContract {
                 let yield_amount = (remaining * cfg.apr_bps as i128 * held_seconds as i128)
                     / (10_000i128 * SECONDS_PER_YEAR);
                 (yield_amount, held_seconds)
+                let remaining =
+                    record.amount
+                        .checked_sub(record.released_amount)
+                        .and_then(|amount| amount.checked_sub(record.refunded_amount))
+                        .ok_or(EscrowError::MathOverflow)?;
+                let yield_amount = calculate_yield(remaining, cfg.apr_bps, held_seconds)?;
+                Ok((yield_amount, held_seconds))
             }
-            None => (0, 0),
+            None => Ok((0, 0)),
         }
     }
 
@@ -9669,7 +9720,7 @@ impl EscrowContract {
                 .persistent()
                 .get(&DataKey::EscrowYieldConfig(escrow_id));
             if let Some(cfg) = &yield_config {
-                let (yield_amount, held_seconds) = Self::compute_yield(&record, Some(cfg), &env);
+                let (yield_amount, held_seconds) = Self::compute_yield(&record, Some(cfg), &env)?;
                 env.events().publish(
                     (symbol_short!("escrow"), symbol_short!("yield"), escrow_id),
                     EscrowYieldAccruedEvent {
@@ -13649,6 +13700,7 @@ mod error_code_allocation_tests {
     fn escrow_error_codes() -> [u32; 61] {
     fn escrow_error_codes() -> [u32; 50] {
     fn escrow_error_codes() -> [u32; 52] {
+    fn escrow_error_codes() -> [u32; 46] {
         [
             EscrowError::AlreadyInitialized as u32,
             EscrowError::NotFound as u32,
@@ -14199,6 +14251,38 @@ mod error_code_allocation_tests {
         // Non-admin cannot approve
         let result = client.try_approve_emergency_rescue(&escrow_id, &not_admin);
         assert_eq!(result, Err(Ok(EscrowError::Unauthorized)));
+            EscrowError::MathOverflow as u32,
+        ]
+    }
+
+    #[test]
+    fn fee_calculation_checks_maximum_i128_boundary() {
+        assert_eq!(
+            calculate_fee_and_yield(i128::MAX, 0),
+            Ok(0),
+        );
+        assert_eq!(
+            calculate_fee_and_yield(i128::MAX / 10_000, 10_000),
+            Ok(i128::MAX / 10_000),
+        );
+        assert_eq!(
+            calculate_fee_and_yield(i128::MAX, 10_000),
+            Err(EscrowError::MathOverflow),
+        );
+    }
+
+    #[test]
+    fn yield_calculation_checks_maximum_i128_boundary() {
+        assert_eq!(calculate_yield(i128::MAX, 0, u64::MAX), Ok(0));
+        assert_eq!(
+            calculate_yield(i128::MAX, 1, u64::MAX),
+            Err(EscrowError::MathOverflow),
+        );
+    }
+
+    #[test]
+    fn math_overflow_uses_next_escrow_error_code() {
+        assert_eq!(EscrowError::MathOverflow as u32, 411);
     }
 
     #[test]
