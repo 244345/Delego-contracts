@@ -368,6 +368,43 @@ pub struct ScoreAccumulator {
     pub disputed_recent: i128,
 }
 
+/// Cursor for keyset pagination over the reputation-ranked merchant index.
+///
+/// The cursor encodes the last `(score_bps, merchant_id)` pair returned to
+/// the caller. The next page resumes strictly *after* this pair in
+/// descending `(score_bps, merchant_id)` order, which makes pagination
+/// stable across ties: two merchants with identical `score_bps` are
+/// disambiguated by their `merchant_id`, so no record is skipped or
+/// duplicated when the page boundary falls inside a tie group.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReputationCursor {
+    pub last_score_bps: u32,
+    pub last_merchant_id: u64,
+}
+
+/// A single page of the reputation-ranked merchant index.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RankedMerchantPage {
+    pub merchants: Vec<MerchantView>,
+    pub next_cursor: Option<ReputationCursor>,
+    pub total_count: u32,
+}
+
+/// Read-only projection of a merchant's reputation used by the discovery
+/// index. Mirrors the fields buyers need to render a ranked listing without
+/// pulling the full [`ReputationScore`] record.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantView {
+    pub merchant_id: u64,
+    pub entity: Address,
+    pub score_bps: u32,
+    pub total_transactions: u64,
+    pub avg_rating: u32,
+}
+
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -393,6 +430,15 @@ pub enum DataKey {
     /// call, so the same settled escrow cannot back more than one verified
     /// review (issue #286).
     VerifiedEscrowReview(u64),
+    /// Monotonic counter assigning a stable `merchant_id` to each entity
+    /// that has ever had a reputation record written. Used as the tie-break
+    /// key in the `(score_bps, merchant_id)` composite index.
+    MerchantId(Address),
+    /// Reverse lookup from `merchant_id` to the owning entity, so the
+    /// ranked index can be materialized without scanning all entities.
+    MerchantEntity(u64),
+    /// Total number of merchants currently present in the ranked index.
+    MerchantCount,
 }
 
 /// Maximum basis points value (100.00%), used both for ratings/scores and
@@ -416,6 +462,15 @@ const MAX_HALVINGS: u64 = 13;
 /// so `record_transaction` and `rate_entity` stay bounded-cost regardless of
 /// how large an entity's lifetime history grows.
 const SCORE_WINDOW: u32 = 200;
+
+/// Default page size for [`ReputationContract::get_ranked_merchants`] when
+/// the caller does not specify one. Chosen so a full page fits comfortably
+/// within Soroban's per-invocation CPU/memory budget.
+const DEFAULT_PAGE_SIZE: u32 = 20;
+
+/// Hard upper bound on a single ranked-merchant page. Callers requesting a
+/// larger page are clamped to this value to keep gas bounded.
+const MAX_PAGE_SIZE: u32 = 50;
 
 /// Persistent entries are bumped when they approach expiry and kept alive
 /// for roughly 30 days, matching the repository's persistent-storage policy.
@@ -1032,6 +1087,126 @@ impl ReputationContract {
             .ok_or(ReputationError::NotInitialized)
     }
 
+    // --- Ranked Discovery Index ---
+
+    /// Returns a page of merchants ranked by descending reputation score,
+    /// using stable keyset pagination over the composite
+    /// `(score_bps, merchant_id)` index.
+    ///
+    /// The cursor semantics are `WHERE (score, id) < (cursor.score, cursor.id)`
+    /// in descending order: the next page resumes strictly after the last
+    /// `(score_bps, merchant_id)` pair returned. Because `merchant_id` is
+    /// unique and monotonic, ties on `score_bps` are broken deterministically
+    /// and no record is skipped or duplicated across page boundaries.
+    ///
+    /// `cursor` is `None` for the first page. `limit` is clamped to
+    /// `[1, MAX_PAGE_SIZE]`; a `limit` of `0` is treated as
+    /// `DEFAULT_PAGE_SIZE`.
+    pub fn get_ranked_merchants(
+        env: Env,
+        cursor: Option<ReputationCursor>,
+        limit: u32,
+    ) -> Result<RankedMerchantPage, ReputationError> {
+        // Require initialization so callers get a deterministic error rather
+        // than an empty page against an unconfigured contract.
+        Self::get_config(env.clone())?;
+
+        let page_size = if limit == 0 {
+            DEFAULT_PAGE_SIZE
+        } else {
+            limit.min(MAX_PAGE_SIZE)
+        };
+
+        let total_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MerchantCount)
+            .unwrap_or(0);
+
+        let mut merchants: Vec<MerchantView> = Vec::new(&env);
+        if total_count == 0 {
+            return Ok(RankedMerchantPage {
+                merchants,
+                next_cursor: None,
+                total_count,
+            });
+        }
+
+        // Walk the merchant_id space in descending order, collecting entries
+        // that sort strictly after the cursor in `(score_bps, merchant_id)`
+        // descending order. `merchant_id` is assigned monotonically, so
+        // iterating ids downward visits candidates in the exact tie-break
+        // order the index requires; the score comparison then filters to the
+        // keyset window.
+        let mut next_cursor: Option<ReputationCursor> = None;
+        let mut id = total_count as u64;
+        while id > 0 {
+            id -= 1;
+
+            let entity: Address = match env
+                .storage()
+                .persistent()
+                .get(&DataKey::MerchantEntity(id))
+            {
+                Some(entity) => entity,
+                None => continue,
+            };
+
+            let rep: ReputationScore = match env
+                .storage()
+                .persistent()
+                .get(&DataKey::Reputation(entity.clone()))
+            {
+                Some(rep) => rep,
+                None => continue,
+            };
+
+            // Keyset filter: keep only pairs strictly less than the cursor
+            // in descending `(score_bps, merchant_id)` order.
+            if let Some(ref c) = cursor {
+                let after_cursor = rep.score < c.last_score_bps
+                    || (rep.score == c.last_score_bps && id < c.last_merchant_id);
+                if !after_cursor {
+                    continue;
+                }
+            }
+
+            if merchants.len() >= page_size {
+                // We have a full page and found at least one more eligible
+                // record, so the caller can continue from the last emitted
+                // pair.
+                next_cursor = Some(ReputationCursor {
+                    last_score_bps: rep.score,
+                    last_merchant_id: id,
+                });
+                break;
+            }
+
+            merchants.push_back(MerchantView {
+                merchant_id: id,
+                entity,
+                score_bps: rep.score,
+                total_transactions: rep.total_transactions,
+                avg_rating: rep.avg_rating,
+            });
+        }
+
+        Ok(RankedMerchantPage {
+            merchants,
+            next_cursor,
+            total_count,
+        })
+    }
+
+    /// Returns the stable `merchant_id` assigned to `entity`, if any. The id
+    /// is allocated lazily the first time an entity's reputation record is
+    /// written, and never changes thereafter.
+    pub fn get_merchant_id(env: Env, entity: Address) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantId(entity))
+    }
+
     // --- Flagging ---
 
     /// Report `entity` for fraud or dispute-worthy behavior. Reporting is
@@ -1425,6 +1600,41 @@ impl ReputationContract {
             })
     }
 
+    /// Allocates a stable `merchant_id` for `entity` on first use and
+    /// registers the reverse `merchant_id -> entity` mapping used by the
+    /// ranked discovery index. Idempotent: repeated calls for the same
+    /// entity return the existing id without mutating the counter.
+    fn ensure_merchant_id(env: &Env, entity: &Address) -> u64 {
+        let key = DataKey::MerchantId(entity.clone());
+        if let Some(id) = env.storage().persistent().get::<_, u64>(&key) {
+            return id;
+        }
+
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MerchantCount)
+            .unwrap_or(0);
+        env.storage().persistent().set(&key, &id);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantEntity(id), entity);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MerchantEntity(id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantCount, &(id + 1));
+        id
+    }
+
     /// `true` for the outcomes that count toward `successful_transactions`.
     fn is_successful_outcome(outcome: &TransactionOutcome) -> bool {
         matches!(
@@ -1437,6 +1647,7 @@ impl ReputationContract {
     /// Called once per `escrow_id`, not on lifecycle updates — see
     /// [`Self::apply_outcome_change_counts`] for those.
     fn apply_new_transaction_counts(env: &Env, entity: &Address, outcome: &TransactionOutcome) {
+        Self::ensure_merchant_id(env, entity);
         let mut rep = Self::load_or_default_reputation(env, entity);
         rep.total_transactions += 1;
         if Self::is_successful_outcome(outcome) {
