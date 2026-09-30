@@ -7,7 +7,6 @@
 // enabled during testing so dev-dependencies and test assertions operate normally.
 // This exact conditional form must be consistent across all workspace contract crates.
 #![cfg_attr(not(test), no_std)]
-#![no_std]
 #![warn(missing_docs)]
 // Several entry points mirror escrow/permissions call shapes and exceed
 // clippy's default 7-argument limit; restructuring them would break the
