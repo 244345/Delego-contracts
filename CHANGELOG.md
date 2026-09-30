@@ -27,6 +27,9 @@ will reject the change.
   via the shared `LendingPoolInterface` (`delego-interfaces`), falling back to
   the internal APR estimate when the pool is unreachable, paused, or reports a
   non-positive figure (issue #326).
+- Add buyer-committed slippage bounds for cross-currency DEX path payments, with
+  tighten-only windows, route validation, and settlement that reverts on realized
+  amounts outside the committed window.
 
 ### 0.2.0 - 2026-08-29
 
