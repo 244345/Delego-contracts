@@ -2578,7 +2578,6 @@ fn test_split_release_multi_treasury() {
     assert_eq!(token_client.balance(&treasury2), 300);
 }
 
-// ────────────────────────────────────────────────────────────────────────────────
 // Yield Split Distribution Tests (issue #360)
 // ────────────────────────────────────────────────────────────────────────────────
 
@@ -2877,4 +2876,313 @@ fn test_get_yield_split_config_none_when_not_set() {
     // No yield split config set - should return None
     let config = escrow_client.get_yield_split_config(&escrow_id);
     assert!(config.is_none());
+}
+
+// ── Issue #356: Buyer Inspection Period with Timelocked Auto-Release ──────
+
+#[test]
+fn test_inspection_period_status_after_delivery() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(record.status, EscrowStatus::Funded);
+
+    // Set up oracle key for delivery verification
+    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+    escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
+
+    // Create signed delivery proof
+    let proof = create_signed_delivery_proof(
+        &t,
+        &signing_key,
+        escrow_id,
+        record.created_at,
+    );
+
+    // Verify delivery and check status transitions to Inspection
+    escrow_client.verify_delivery_and_release(&t.agent, &escrow_id, &proof);
+    
+    let updated_record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(updated_record.status, EscrowStatus::Inspection);
+}
+
+#[test]
+fn test_buyer_can_release_after_inspection() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+
+    // Setup and verify delivery
+    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+    escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
+
+    let proof = create_signed_delivery_proof(&t, &signing_key, escrow_id, record.created_at);
+    escrow_client.verify_delivery_and_release(&t.agent, &escrow_id, &proof);
+
+    // Buyer releases after inspection passes
+    assert!(escrow_client.release_on_inspection_passed(&t.buyer, &escrow_id));
+
+    let final_record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(final_record.status, EscrowStatus::Released);
+    assert_eq!(final_record.released_amount, 1000);
+}
+
+#[test]
+fn test_inspection_auto_release_after_expiration() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+
+    // Setup and verify delivery with default inspection duration (72 hours)
+    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+    escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
+
+    let proof = create_signed_delivery_proof(&t, &signing_key, escrow_id, record.created_at);
+    escrow_client.verify_delivery_and_release(&t.agent, &escrow_id, &proof);
+
+    let inspection_record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(inspection_record.status, EscrowStatus::Inspection);
+
+    // Try to auto-release before expiration - should fail
+    assert_eq!(
+        escrow_client.try_claim_inspection_auto_release(&t.seller, &escrow_id),
+        Err(Ok(EscrowError::InspectionAutoReleaseNotReady))
+    );
+
+    // Advance ledger past inspection window (default 51,840 ledgers)
+    t.env.ledger().set_sequence_number(t.env.ledger().sequence() + 51_841);
+
+    // Now auto-release should succeed
+    assert!(escrow_client.claim_inspection_auto_release(&t.seller, &escrow_id));
+
+    let final_record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(final_record.status, EscrowStatus::Released);
+    assert_eq!(final_record.released_amount, 1000);
+}
+
+#[test]
+fn test_buyer_can_dispute_during_inspection() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+
+    // Setup and verify delivery
+    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+    escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
+
+    let proof = create_signed_delivery_proof(&t, &signing_key, escrow_id, record.created_at);
+    escrow_client.verify_delivery_and_release(&t.agent, &escrow_id, &proof);
+
+    let insp_record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(insp_record.status, EscrowStatus::Inspection);
+
+    // Buyer files dispute during inspection - should succeed
+    assert!(escrow_client.dispute(&escrow_id, &t.buyer));
+
+    let disputed_record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(disputed_record.status, EscrowStatus::Disputed);
+}
+
+#[test]
+fn test_dispute_fails_after_inspection_expiration() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+
+    // Setup and verify delivery
+    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+    escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
+
+    let proof = create_signed_delivery_proof(&t, &signing_key, escrow_id, record.created_at);
+    escrow_client.verify_delivery_and_release(&t.agent, &escrow_id, &proof);
+
+    // Advance ledger past inspection window
+    t.env.ledger().set_sequence_number(t.env.ledger().sequence() + 51_841);
+
+    // Dispute should fail after expiration
+    assert_eq!(
+        escrow_client.try_dispute(&escrow_id, &t.buyer),
+        Err(Ok(EscrowError::InspectionExpired))
+    );
+}
+
+#[test]
+fn test_buyer_can_refund_during_inspection() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+
+    // Setup and verify delivery
+    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+    escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
+
+    let proof = create_signed_delivery_proof(&t, &signing_key, escrow_id, record.created_at);
+    escrow_client.verify_delivery_and_release(&t.agent, &escrow_id, &proof);
+
+    let insp_record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(insp_record.status, EscrowStatus::Inspection);
+
+    // Buyer can refund during inspection period (defect found)
+    assert!(escrow_client.refund(&escrow_id, &t.buyer));
+
+    let refunded_record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(refunded_record.status, EscrowStatus::Refunded);
+}
+
+#[test]
+fn test_seller_cannot_refund_during_inspection() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+
+    // Setup and verify delivery
+    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+    escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
+
+    let proof = create_signed_delivery_proof(&t, &signing_key, escrow_id, record.created_at);
+    escrow_client.verify_delivery_and_release(&t.agent, &escrow_id, &proof);
+
+    // Seller cannot refund during inspection - only buyer can
+    assert_eq!(
+        escrow_client.try_refund(&escrow_id, &t.seller),
+        Err(Ok(EscrowError::Unauthorized))
+    );
+}
+
+#[test]
+fn test_set_custom_inspection_duration() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+
+    // Admin sets custom inspection duration (e.g., 24 hours = 17,280 ledgers)
+    assert_eq!(
+        escrow_client.set_inspection_config(&t.admin, &escrow_id, &17_280),
+        Ok(())
+    );
+
+    let record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(record.status, EscrowStatus::Funded);
+}
+
+#[test]
+fn test_release_not_allowed_during_inspection() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+
+    // Setup and verify delivery
+    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+    escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
+
+    let proof = create_signed_delivery_proof(&t, &signing_key, escrow_id, record.created_at);
+    escrow_client.verify_delivery_and_release(&t.agent, &escrow_id, &proof);
+
+    // Normal release() should fail during inspection
+    assert_eq!(
+        escrow_client.try_release(&escrow_id, &t.buyer, &t.seller),
+        Err(Ok(EscrowError::InvalidStatus))
+    );
+}
+
+#[test]
+fn test_inspection_events_emitted() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+
+    // Setup and verify delivery
+    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+    escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
+
+    let proof = create_signed_delivery_proof(&t, &signing_key, escrow_id, record.created_at);
+    escrow_client.verify_delivery_and_release(&t.agent, &escrow_id, &proof);
+
+    // Check that inspection started event was emitted
+    let events = t.env.events().all();
+    let inspection_events: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            if let soroban_sdk::Val::Object(obj) = &e.0 {
+                if let soroban_sdk::Val::Object(topics) = &obj.as_vec()[1] {
+                    // Look for inspection start event
+                    topics.as_vec().iter().any(|t| {
+                        if let soroban_sdk::Val::Symbol(s) = t {
+                            s.to_string() == "insp_start"
+                        } else {
+                            false
+                        }
+                    })
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        })
+        .collect();
+
+    assert!(!inspection_events.is_empty(), "Inspection started event should be emitted");
+}
+
+// Helper function to create signed delivery proofs for testing
+fn create_signed_delivery_proof(
+    t: &TestEnv,
+    signing_key: &ed25519_dalek::SigningKey,
+    escrow_id: u64,
+    created_at: u64,
+) -> crate::SignedDeliveryProof {
+    use ed25519_dalek::Signer;
+    use soroban_sdk::xdr::ToXdr;
+
+    let env = &t.env;
+    let payload = crate::SignedDeliveryPayload {
+        escrow_id,
+        carrier_code: symbol_short!("fedex"),
+        tracking_hash: BytesN::from_array(env, &[1u8; 32]),
+        delivery_timestamp: created_at + 1,
+    };
+
+    let payload_xdr = payload.to_xdr(env);
+    let signature_bytes = signing_key.sign(&payload_xdr.0);
+    
+    crate::SignedDeliveryProof {
+        escrow_id,
+        carrier_code: symbol_short!("fedex"),
+        tracking_hash: BytesN::from_array(env, &[1u8; 32]),
+        delivery_timestamp: created_at + 1,
+        oracle_pubkey: BytesN::from_array(
+            env,
+            &signing_key.verifying_key().to_bytes(),
+        ),
+        signature: BytesN::from_array(env, &signature_bytes.to_bytes()),
+    }
 }
