@@ -147,6 +147,14 @@ pub struct RegisterParams {
     pub required_verifications: u32,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AffiliateConfig {
+    pub referrer_address: Address,
+    pub referral_share_bps: u32,
+    pub expires_at_ledger: u32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
 pub struct VerificationPolicy {

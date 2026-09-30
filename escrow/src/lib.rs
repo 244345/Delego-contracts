@@ -407,6 +407,22 @@ pub struct EscrowSplitReleasedEvent {
     pub released_by: Address,
 }
 
+/// Affiliate referral configuration for a merchant (issue #affiliate).
+///
+/// When a merchant is onboarded via an affiliate referrer, a share of the
+/// platform commission fee is routed directly to the referrer's address on
+/// each settled order.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AffiliateConfig {
+    /// Address that receives the referral share of platform fees.
+    pub referrer_address: Address,
+    /// Referral share of the platform fee in basis points (e.g. 2000 = 20%).
+    pub referral_share_bps: u32,
+    /// Ledger sequence at which the affiliate configuration expires.
+    pub expires_at_ledger: u32,
+}
+
 /// Emitted when an escrow's timeout ledger is extended (#323).
 #[contracttype]
 #[derive(Clone, Debug)]

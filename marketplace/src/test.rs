@@ -1,3 +1,4 @@
+use crate::AffiliateConfig;
 use crate::{
     AdminAcceptedEvent, AdminProposedEvent, MarketplaceContract, MarketplaceContractClient,
     MarketplaceError, MerchantRegisteredEvent, MerchantStatus, RegisterParams, Verifier,
@@ -3094,3 +3095,217 @@ fn test_register_merchant_event_carries_merchant_id_topic() {
     assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::InvalidParam);
     let unchanged = f.client.get_merchant(&id);
     assert_eq!(unchanged.name, String::from_str(&f.env, "Store A Updated"));
+
+#[test]
+fn test_register_merchant_with_affiliate_config() {
+    let f = TestFixture::setup();
+    let merchant_addr = Address::generate(&f.env);
+    let referrer = Address::generate(&f.env);
+
+    let params = RegisterParams {
+        name: String::from_str(&f.env, "Affiliate Store"),
+        description: String::from_str(&f.env, "Onboarded via affiliate"),
+        category: symbol_short!("tech"),
+        image_url: String::from_str(&f.env, "url"),
+        metadata: None,
+        metadata_uri: None,
+        required_verifications: 1,
+    };
+
+    let affiliate = AffiliateConfig {
+        referrer_address: referrer.clone(),
+        referral_share_bps: 2000,
+        expires_at_ledger: 10_000,
+    };
+
+    let id = f
+        .client
+        .register_merchant_with_affiliate(&merchant_addr, &params, &Some(affiliate.clone()));
+    assert_eq!(id, 1);
+
+    let stored = f.client.get_affiliate_config(&id);
+    assert_eq!(stored, Some(affiliate));
+}
+
+#[test]
+fn test_register_merchant_without_affiliate_config() {
+    let f = TestFixture::setup();
+    let merchant_addr = Address::generate(&f.env);
+
+    let params = RegisterParams {
+        name: String::from_str(&f.env, "No Affiliate Store"),
+        description: String::from_str(&f.env, "Direct signup"),
+        category: symbol_short!("tech"),
+        image_url: String::from_str(&f.env, "url"),
+        metadata: None,
+        metadata_uri: None,
+        required_verifications: 1,
+    };
+
+    let id = f
+        .client
+        .register_merchant_with_affiliate(&merchant_addr, &params, &None);
+    assert_eq!(id, 1);
+    assert_eq!(f.client.get_affiliate_config(&id), None);
+}
+
+#[test]
+fn test_register_merchant_rejects_invalid_affiliate_share() {
+    let f = TestFixture::setup();
+    let merchant_addr = Address::generate(&f.env);
+    let referrer = Address::generate(&f.env);
+
+    let params = RegisterParams {
+        name: String::from_str(&f.env, "Bad Affiliate Store"),
+        description: String::from_str(&f.env, "Desc"),
+        category: symbol_short!("tech"),
+        image_url: String::from_str(&f.env, "url"),
+        metadata: None,
+        metadata_uri: None,
+        required_verifications: 1,
+    };
+
+    let bad = AffiliateConfig {
+        referrer_address: referrer.clone(),
+        referral_share_bps: 10_001,
+        expires_at_ledger: 10_000,
+    };
+
+    let err = f
+        .client
+        .try_register_merchant_with_affiliate(&merchant_addr, &params, &Some(bad));
+    assert_eq!(
+        err.unwrap_err().unwrap(),
+        MarketplaceError::InvalidCommissionBps
+    );
+}
+
+#[test]
+fn test_three_way_fee_split_with_affiliate() {
+    let f = TestFixture::setup();
+    let merchant_addr = Address::generate(&f.env);
+    let referrer = Address::generate(&f.env);
+    let platform = f.admin.clone();
+
+    let params = RegisterParams {
+        name: String::from_str(&f.env, "Split Store"),
+        description: String::from_str(&f.env, "Desc"),
+        category: symbol_short!("tech"),
+        image_url: String::from_str(&f.env, "url"),
+        metadata: None,
+        metadata_uri: None,
+        required_verifications: 1,
+    };
+
+    let affiliate = AffiliateConfig {
+        referrer_address: referrer.clone(),
+        referral_share_bps: 2000,
+        expires_at_ledger: 1_000_000,
+    };
+
+    let id = f
+        .client
+        .register_merchant_with_affiliate(&merchant_addr, &params, &Some(affiliate));
+
+    // 10% platform commission, 20% of that goes to referrer.
+    f.client.set_merchant_commission(&id, &merchant_addr, &1000);
+
+    let gross: i128 = 10_000;
+    let platform_fee = gross * 1000 / 10_000; // 1_000
+    let referrer_share = platform_fee * 2000 / 10_000; // 200
+    let platform_net = platform_fee - referrer_share; // 800
+    let seller_share = gross - platform_fee; // 9_000
+
+    let split = f
+        .client
+        .compute_fee_split(&id, &gross);
+
+    assert_eq!(split.seller_amount, seller_share);
+    assert_eq!(split.platform_amount, platform_net);
+    assert_eq!(split.referrer_amount, referrer_share);
+    assert_eq!(
+        split.seller_amount + split.platform_amount + split.referrer_amount,
+        gross,
+        "three-way split must conserve total"
+    );
+    assert_eq!(split.referrer_address, Some(referrer));
+    assert_eq!(split.platform_address, platform);
+}
+
+#[test]
+fn test_three_way_fee_split_expired_affiliate() {
+    let f = TestFixture::setup();
+    let merchant_addr = Address::generate(&f.env);
+    let referrer = Address::generate(&f.env);
+
+    f.env.ledger().set_sequence_number(500);
+
+    let params = RegisterParams {
+        name: String::from_str(&f.env, "Expired Affiliate Store"),
+        description: String::from_str(&f.env, "Desc"),
+        category: symbol_short!("tech"),
+        image_url: String::from_str(&f.env, "url"),
+        metadata: None,
+        metadata_uri: None,
+        required_verifications: 1,
+    };
+
+    let affiliate = AffiliateConfig {
+        referrer_address: referrer.clone(),
+        referral_share_bps: 2000,
+        expires_at_ledger: 100,
+    };
+
+    let id = f
+        .client
+        .register_merchant_with_affiliate(&merchant_addr, &params, &Some(affiliate));
+    f.client.set_merchant_commission(&id, &merchant_addr, &1000);
+
+    let gross: i128 = 10_000;
+    let split = f.client.compute_fee_split(&id, &gross);
+
+    // Expired affiliate: no referrer share, full platform fee retained.
+    assert_eq!(split.referrer_amount, 0);
+    assert_eq!(split.referrer_address, None);
+    assert_eq!(split.platform_amount, 1_000);
+    assert_eq!(split.seller_amount, 9_000);
+    assert_eq!(
+        split.seller_amount + split.platform_amount + split.referrer_amount,
+        gross
+    );
+}
+
+#[test]
+fn test_three_way_fee_split_zero_commission() {
+    let f = TestFixture::setup();
+    let merchant_addr = Address::generate(&f.env);
+    let referrer = Address::generate(&f.env);
+
+    let params = RegisterParams {
+        name: String::from_str(&f.env, "Zero Commission Store"),
+        description: String::from_str(&f.env, "Desc"),
+        category: symbol_short!("tech"),
+        image_url: String::from_str(&f.env, "url"),
+        metadata: None,
+        metadata_uri: None,
+        required_verifications: 1,
+    };
+
+    let affiliate = AffiliateConfig {
+        referrer_address: referrer.clone(),
+        referral_share_bps: 2000,
+        expires_at_ledger: 1_000_000,
+    };
+
+    let id = f
+        .client
+        .register_merchant_with_affiliate(&merchant_addr, &params, &Some(affiliate));
+
+    let gross: i128 = 5_000;
+    let split = f.client.compute_fee_split(&id, &gross);
+
+    assert_eq!(split.seller_amount, gross);
+    assert_eq!(split.platform_amount, 0);
+    assert_eq!(split.referrer_amount, 0);
+    assert_eq!(split.referrer_address, None);
+}
