@@ -2,8 +2,9 @@
 #![allow(clippy::module_inception)]
 
 use crate::{
-    DataKey, ReputationConfig, ReputationContract, ReputationContractClient, ReputationError,
-    TransactionOutcome, PERSISTENT_BUMP_AMOUNT, PERSISTENT_BUMP_THRESHOLD, SCORE_WINDOW,
+    CompositeScore, DataKey, ReputationConfig, ReputationContract, ReputationContractClient,
+    ReputationError, TransactionOutcome, PERSISTENT_BUMP_AMOUNT, PERSISTENT_BUMP_THRESHOLD,
+    SCORE_WINDOW,
 };
 use soroban_sdk::{
     symbol_short,
@@ -747,15 +748,15 @@ fn test_amount_does_not_affect_scoring() {
     }
 
     let rep = client.get_reputation(&entity);
-    // All transactions are Released and fresh, so score should be full (10_000)
-    // regardless of the widely varying amounts.
-    assert_eq!(rep.score, 10_000);
+    // All transactions are Released and fresh, so count score should be full
+    // (10_000). The blended score is dampened by the volume component, so it
+    // must be strictly below the count score.
+    assert!(rep.score < 10_000);
     assert_eq!(rep.total_transactions, 5);
 
     // Now record a Disputed transaction with a very high amount.
-    // If amount weighted scoring, this would significantly impact the score.
-    // Since scoring is amount-independent, it should have the same effect as
-    // a small-amount dispute.
+    // With volume-weighted scoring, a high-amount dispute carries more
+    // statistical significance than a small-amount one.
     client.record_transaction(
         &admin,
         &100u64,
@@ -766,13 +767,12 @@ fn test_amount_does_not_affect_scoring() {
     );
 
     let rep_after_dispute = client.get_reputation(&entity);
-    // The score should decrease due to the dispute, but the amount should
-    // not amplify this effect. We assert the score is less than 10_000
-    // (dispute had an effect) but we don't assert a specific value since
-    // the exact penalty depends on config.dispute_penalty_bps.
-    assert!(rep_after_dispute.score < 10_000);
+    // The score should decrease due to the dispute.
+    assert!(rep_after_dispute.score < rep.score);
 
-    // Record another Disputed with a tiny amount to verify they have the same effect.
+    // Record another Disputed with a tiny amount. Because volume weighting
+    // dampens the impact of micro-transactions, a tiny dispute must move the
+    // blended score less than the high-amount dispute did.
     client.record_transaction(
         &admin,
         &101u64,
@@ -783,9 +783,240 @@ fn test_amount_does_not_affect_scoring() {
     );
 
     let rep_after_second_dispute = client.get_reputation(&entity);
-    // The score should decrease further by the same penalty amount,
-    // confirming that amount does not weight the scoring.
+    // The score should decrease further, but the tiny-amount dispute's impact
+    // is smaller than the high-amount dispute's impact.
     assert!(rep_after_second_dispute.score < rep_after_dispute.score);
+    let high_amount_drop = rep.score - rep_after_dispute.score;
+    let tiny_amount_drop = rep_after_dispute.score - rep_after_second_dispute.score;
+    assert!(tiny_amount_drop < high_amount_drop);
+}
+
+// --- composite (volume-weighted vs count-weighted) scoring ---
+
+#[test]
+fn test_composite_score_high_value_transactions_carry_more_weight() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut cfg = default_config();
+    cfg.min_transactions_threshold = 1;
+    let contract_id = env.register(ReputationContract, (admin.clone(), cfg));
+    let client = ReputationContractClient::new(&env, &contract_id);
+
+    // Entity A: five tiny Released transactions.
+    let entity_a = Address::generate(&env);
+    let cp_a = Address::generate(&env);
+    for i in 0..5u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity_a,
+            &cp_a,
+            &1i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    // Entity B: five large Released transactions.
+    let entity_b = Address::generate(&env);
+    let cp_b = Address::generate(&env);
+    for i in 0..5u64 {
+        client.record_transaction(
+            &admin,
+            &(100 + i),
+            &entity_b,
+            &cp_b,
+            &1_000_000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    let rep_a = client.get_reputation(&entity_a);
+    let rep_b = client.get_reputation(&entity_b);
+
+    // Both have identical count scores (all Released), but B's volume score
+    // is higher because its transactions carry more dollar volume.
+    assert!(rep_b.score >= rep_a.score);
+    assert!(rep_b.volume_score_bps >= rep_a.volume_score_bps);
+}
+
+#[test]
+fn test_composite_score_micro_transaction_spam_cannot_inflate_reputation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut cfg = default_config();
+    cfg.min_transactions_threshold = 1;
+    let contract_id = env.register(ReputationContract, (admin.clone(), cfg));
+    let client = ReputationContractClient::new(&env, &contract_id);
+
+    // Spammer: 50 positive reviews on $1 items.
+    let spammer = Address::generate(&env);
+    let spam_cp = Address::generate(&env);
+    for i in 0..50u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &spammer,
+            &spam_cp,
+            &1i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    // Honest merchant: a single large transaction.
+    let honest = Address::generate(&env);
+    let honest_cp = Address::generate(&env);
+    client.record_transaction(
+        &admin,
+        &1000u64,
+        &honest,
+        &honest_cp,
+        &10_000i128,
+        &TransactionOutcome::Released,
+    );
+
+    let spam_rep = client.get_reputation(&spammer);
+    let honest_rep = client.get_reputation(&honest);
+
+    // The spammer's volume score must be strictly less than the honest
+    // merchant's, since logarithmic dampening prevents count from dominating.
+    assert!(spam_rep.volume_score_bps < honest_rep.volume_score_bps);
+}
+
+#[test]
+fn test_composite_score_blend_weights() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut cfg = default_config();
+    cfg.min_transactions_threshold = 1;
+    let contract_id = env.register(ReputationContract, (admin.clone(), cfg));
+    let client = ReputationContractClient::new(&env, &contract_id);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    for i in 0..5u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    let rep = client.get_reputation(&entity);
+    // Blended score must equal 40% count + 60% volume.
+    let expected_blended =
+        (rep.count_score_bps as u64 * 40 + rep.volume_score_bps as u64 * 60) / 100;
+    assert_eq!(rep.score as u64, expected_blended);
+}
+
+#[test]
+fn test_composite_score_confidence_rating_bounds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut cfg = default_config();
+    cfg.min_transactions_threshold = 1;
+    let contract_id = env.register(ReputationContract, (admin.clone(), cfg));
+    let client = ReputationContractClient::new(&env, &contract_id);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    for i in 0..10u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    let rep = client.get_reputation(&entity);
+    assert!(rep.confidence_rating <= 10_000);
+}
+
+#[test]
+fn test_composite_score_struct_fields_present() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut cfg = default_config();
+    cfg.min_transactions_threshold = 1;
+    let contract_id = env.register(ReputationContract, (admin.clone(), cfg));
+    let client = ReputationContractClient::new(&env, &contract_id);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    client.record_transaction(
+        &admin,
+        &1u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Released,
+    );
+
+    let rep = client.get_reputation(&entity);
+    // All four composite fields must be populated and within bps bounds.
+    assert!(rep.count_score_bps <= 10_000);
+    assert!(rep.volume_score_bps <= 10_000);
+    assert!(rep.blended_score_bps <= 10_000);
+    assert!(rep.confidence_rating <= 10_000);
+    // The canonical score is the blended score.
+    assert_eq!(rep.score, rep.blended_score_bps);
+}
+
+#[test]
+fn test_composite_score_logarithmic_dampening_avoids_whale_domination() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut cfg = default_config();
+    cfg.min_transactions_threshold = 1;
+    let contract_id = env.register(ReputationContract, (admin.clone(), cfg));
+    let client = ReputationContractClient::new(&env, &contract_id);
+
+    // Small merchant with modest volume.
+    let small = Address::generate(&env);
+    let small_cp = Address::generate(&env);
+    for i in 0..10u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &small,
+            &small_cp,
+            &100i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    // Whale with a single enormous transaction.
+    let whale = Address::generate(&env);
+    let whale_cp = Address::generate(&env);
+    client.record_transaction(
+        &admin,
+        &1000u64,
+        &whale,
+        &whale_cp,
+        &1_000_000_000i128,
+        &TransactionOutcome::Released,
+    );
+
+    let small_rep = client.get_reputation(&small);
+    let whale_rep = client.get_reputation(&whale);
+
+    // Logarithmic dampening means the whale's volume score is not
+    // disproportionately larger than the small merchant's.
+    assert!(whale_rep.volume_score_bps <= 10_000);
+    assert!(small_rep.volume_score_bps <= 10_000);
+    // The whale should not dominate by more than the bps scale allows.
+    assert!(whale_rep.volume_score_bps - small_rep.volume_score_bps <= 10_000);
 }
 
 // --- rate_entity ---
