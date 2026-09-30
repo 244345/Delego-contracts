@@ -52,7 +52,7 @@ The escrow contract holds funds in trust during agent-mediated purchases, releas
 - `get_escrow(escrow_id)`: Get full escrow record
 - `get_receipt(escrow_id)` / `get_merchant_receipt(...)`: Buyer/seller receipts
 - `get_release_eligibility(...)` / `get_refund_eligibility(...)` / `get_timeout_view(...)`: Read-only eligibility checks
-- Admin: `set_limits`, `update_fee`, `add_token`, `set_create_paused`, `propose_admin`, `accept_admin`, `add_co_admin`
+- Admin: `set_limits`, `update_fee`, `set_min_fee_stroops`, `add_token`, `set_create_paused`, `propose_admin`, `accept_admin`, `add_co_admin`
 
 #### State
 

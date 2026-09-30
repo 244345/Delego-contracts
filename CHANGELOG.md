@@ -71,6 +71,8 @@ will reject the change.
   escrow timeout. Adds `accept_order`, `get_order_acceptance`,
   `get_cancel_eligibility`, `get_cancel_lockout`, and `set_cancel_lockout`, plus
   the new `CancelLockoutActive` (411) and `InvalidCancelLockout` (412) errors.
+- Enforce a configurable minimum release fee floor so small escrows can no longer
+  truncate the platform fee to zero and evade it by fragmenting a payment.
 
 ### 0.2.0 - 2026-08-29
 
