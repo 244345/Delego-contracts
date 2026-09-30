@@ -714,7 +714,7 @@ impl ReputationContract {
         };
 
         env.events().publish(
-            (symbol_short!("reput"), symbol_short!("tx_rec")),
+            (symbol_short!("reput"), symbol_short!("tx_rec"), entity.clone()),
             TransactionRecordedEvent {
                 escrow_id,
                 entity,
@@ -775,7 +775,7 @@ impl ReputationContract {
         Self::recompute_score(&env, &entity)?;
 
         env.events().publish(
-            (symbol_short!("reput"), symbol_short!("rated")),
+            (symbol_short!("reput"), symbol_short!("rated"), entity.clone()),
             EntityRatedEvent {
                 rater,
                 entity,
@@ -1255,7 +1255,7 @@ impl ReputationContract {
         let active_count = flags.iter().filter(|f| !f.resolved).count() as u32;
 
         env.events().publish(
-            (symbol_short!("reput"), symbol_short!("flagged")),
+            (symbol_short!("reput"), symbol_short!("flagged"), entity.clone()),
             EntityFlaggedEvent {
                 reporter,
                 entity: entity.clone(),
@@ -1271,7 +1271,7 @@ impl ReputationContract {
                 .persistent()
                 .set(&DataKey::FrozenStatus(entity.clone()), &true);
             env.events().publish(
-                (symbol_short!("reput"), symbol_short!("frozen")),
+                (symbol_short!("reput"), symbol_short!("frozen"), entity.clone()),
                 EntityFrozenEvent {
                     entity,
                     frozen_by: env.current_contract_address(),
@@ -1333,7 +1333,7 @@ impl ReputationContract {
             .persistent()
             .set(&DataKey::FrozenStatus(entity.clone()), &true);
         env.events().publish(
-            (symbol_short!("reput"), symbol_short!("frozen")),
+            (symbol_short!("reput"), symbol_short!("frozen"), entity.clone()),
             EntityFrozenEvent {
                 entity,
                 frozen_by: admin,
@@ -1354,7 +1354,7 @@ impl ReputationContract {
             .persistent()
             .set(&DataKey::FrozenStatus(entity.clone()), &false);
         env.events().publish(
-            (symbol_short!("reput"), symbol_short!("unfrozn")),
+            (symbol_short!("reput"), symbol_short!("unfrozn"), entity.clone()),
             EntityUnfrozenEvent {
                 entity,
                 unfrozen_by: admin,
@@ -1410,7 +1410,7 @@ impl ReputationContract {
 
         if pruned_count > 0 {
             env.events().publish(
-                (symbol_short!("reput"), symbol_short!("pruned")),
+                (symbol_short!("reput"), symbol_short!("pruned"), entity.clone()),
                 EntityHistoryPrunedEvent {
                     entity,
                     pruned_count,
@@ -1448,7 +1448,7 @@ impl ReputationContract {
             .instance()
             .set(&DataKey::PendingAdmin, &new_admin);
         env.events().publish(
-            (symbol_short!("reput"), soroban_sdk::Symbol::new(&env, "admin_prop")),
+            (symbol_short!("reput"), soroban_sdk::Symbol::new(&env, "admin_prop"), new_admin.clone()),
             AdminProposedEvent {
                 current_admin,
                 new_admin,
@@ -1472,7 +1472,7 @@ impl ReputationContract {
         env.storage().instance().set(&DataKey::Admin, &caller);
         env.storage().instance().remove(&DataKey::PendingAdmin);
         env.events().publish(
-            (symbol_short!("reput"), symbol_short!("admin_acc")),
+            (symbol_short!("reput"), symbol_short!("admin_acc"), caller.clone()),
             AdminAcceptedEvent { new_admin: caller },
         );
         Ok(())
@@ -1990,7 +1990,7 @@ impl ReputationContract {
         );
 
         env.events().publish(
-            (symbol_short!("reput"), symbol_short!("score_dec")),
+            (symbol_short!("reput"), symbol_short!("score_dec"), entity.clone()),
             decomposition,
         );
         Ok(rep)

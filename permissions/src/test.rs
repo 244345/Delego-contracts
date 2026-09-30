@@ -435,6 +435,98 @@ mod test {
         assert_eq!(result, Err(Ok(PermissionError::PermissionNotFound)));
     }
 
+    // --- Event topic structure tests ---
+
+    #[test]
+    fn test_grant_emits_three_topic_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
+
+        let events = env.events().all();
+        let last = events.last().unwrap();
+        assert_eq!(last.0, contract_id);
+        assert_eq!(last.1.len(), 3);
+        assert_eq!(
+            last.1.get(0).unwrap(),
+            Symbol::new(&env, "permissions").into_val(&env)
+        );
+        assert_eq!(
+            last.1.get(1).unwrap(),
+            Symbol::new(&env, "granted").into_val(&env)
+        );
+        let entity: Address = last.1.get(2).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(entity, delegate);
+    }
+
+    #[test]
+    fn test_revoke_emits_three_topic_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
+        client.revoke(&owner, &delegate);
+
+        let events = env.events().all();
+        let last = events.last().unwrap();
+        assert_eq!(last.0, contract_id);
+        assert_eq!(last.1.len(), 3);
+        assert_eq!(
+            last.1.get(0).unwrap(),
+            Symbol::new(&env, "permissions").into_val(&env)
+        );
+        assert_eq!(
+            last.1.get(1).unwrap(),
+            Symbol::new(&env, "revoked").into_val(&env)
+        );
+        let entity: Address = last.1.get(2).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(entity, delegate);
+    }
+
+    #[test]
+    fn test_execute_spend_emits_three_topic_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let merchant = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
+        client.execute_spend(&owner, &delegate, &30, &merchant);
+
+        let events = env.events().all();
+        let last = events.last().unwrap();
+        assert_eq!(last.0, contract_id);
+        assert_eq!(last.1.len(), 3);
+        assert_eq!(
+            last.1.get(0).unwrap(),
+            Symbol::new(&env, "permissions").into_val(&env)
+        );
+        assert_eq!(
+            last.1.get(1).unwrap(),
+            Symbol::new(&env, "spent").into_val(&env)
+        );
+        let entity: Address = last.1.get(2).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(entity, delegate);
+    }
+
     #[test]
     fn test_getter_missing_permission_returns_error() {
         let env = Env::default();
