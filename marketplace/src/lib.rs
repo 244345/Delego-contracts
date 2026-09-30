@@ -613,6 +613,8 @@ pub enum DataKey {
     PolicyRaisedAt(u64),
     /// Records the previous `required` value before a policy increase.
     PolicyPreviousRequired(u64),
+    PendingPayoutChange(u64),
+    PayoutAddress(u64),
 }
 
 /// Mirror of `ReputationScore` from `delego-reputation` for cross-contract deserialization.
@@ -638,6 +640,30 @@ const CATEGORY_VOTE_THRESHOLD: u32 = 3;
 const CATEGORY_VOTING_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280; // ~1 day of ledgers (5s/ledger)
 const PERSISTENT_BUMP_AMOUNT: u32 = 518_400; // ~30 days of ledgers
+pub const PAYOUT_CHANGE_COOLDOWN_LEDGERS: u32 = 17_280; // ~24 hours
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingPayoutChange {
+    pub merchant_id: u64,
+    pub proposed_payout_address: Address,
+    pub effective_at_ledger: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MerchantPayoutChangeScheduledEvent {
+    pub merchant_id: u64,
+    pub proposed_payout_address: Address,
+    pub effective_at_ledger: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MerchantPayoutChangeCancelledEvent {
+    pub merchant_id: u64,
+    pub cancelled_by: Address,
+}
 
 /// Base registration deposit in stroops (5 XLM = 50,000,000 stroops)
 pub const BASE_REGISTRATION_DEPOSIT_STROOPS: i128 = 50_000_000;
