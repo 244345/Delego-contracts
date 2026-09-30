@@ -2100,3 +2100,66 @@ fn test_slow_activity_liveness_keeps_entity_alive_on_read() {
     }
 }
 
+
+#[test]
+fn test_score_recalculates_after_feedback_submission() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    // Record enough transactions to pass the min_transactions_threshold (5).
+    for escrow_id in 1u64..=6 {
+        client.record_transaction(
+            &admin,
+            &escrow_id,
+            &entity,
+            &counterparty,
+            &1_000,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    let rep_before = client.get_reputation(&entity);
+    assert_eq!(rep_before.total_transactions, 6);
+    // Score is unmasked once threshold is met.
+    assert!(
+        rep_before.score > 0,
+        "score should be non-zero after threshold is met"
+    );
+
+    // Submit a dispute — this should drive the score down on next recompute.
+    client.record_transaction(
+        &admin,
+        &7,
+        &entity,
+        &counterparty,
+        &1_000,
+        &TransactionOutcome::Disputed,
+    );
+
+    let rep_after = client.get_reputation(&entity);
+    assert_eq!(rep_after.total_transactions, 7);
+    assert!(
+        rep_after.score <= rep_before.score,
+        "score should not rise after a dispute; before={} after={}",
+        rep_before.score,
+        rep_after.score,
+    );
+
+    // Verify that a ReputationScoreUpdatedEvent was emitted with the
+    // correct topic schema (reput, updated, entity).
+    let events = env.events().all();
+    let found = events.iter().any(|(contract_id, topics, _data)| {
+        use soroban_sdk::IntoVal;
+        contract_id == client.address
+            && topics.len() == 3
+            && topics.get(0) == Some(symbol_short!("reput").into_val(&env))
+            && topics.get(1) == Some(symbol_short!("updated").into_val(&env))
+            && topics.get(2) == Some(entity.clone().into_val(&env))
+    });
+    assert!(
+        found,
+        "expected a (reput, updated, entity) score-updated event"
+    );
+}

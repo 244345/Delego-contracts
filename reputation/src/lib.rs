@@ -344,6 +344,15 @@ pub struct EntityHistoryPrunedEvent {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReputationScoreUpdatedEvent {
+    pub entity: Address,
+    pub old_score_bps: u32,
+    pub new_score_bps: u32,
+    pub total_reviews: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScoreAccumulator {
     pub decay_window_seconds: u64,
     pub weighted_value_sum: i128,
@@ -1956,6 +1965,7 @@ impl ReputationContract {
     /// and [`Self::apply_outcome_change_counts`] — so they are left as-is here.
     fn recompute_score(env: &Env, entity: &Address) -> Result<ReputationScore, ReputationError> {
         let mut rep = Self::load_or_default_reputation(env, entity);
+        let old_score_bps = rep.score;
         let (decomposition, avg_rating, now, accumulator) =
             Self::compute_score_components(env, entity, rep.total_transactions)?;
         rep.score = decomposition.final_score;
@@ -1982,6 +1992,19 @@ impl ReputationContract {
         env.events().publish(
             (symbol_short!("reput"), symbol_short!("score_dec"), entity.clone()),
             decomposition,
+        );
+        env.events().publish(
+            (
+                symbol_short!("reput"),
+                symbol_short!("updated"),
+                entity.clone(),
+            ),
+            ReputationScoreUpdatedEvent {
+                entity: entity.clone(),
+                old_score_bps,
+                new_score_bps: rep.score,
+                total_reviews: rep.total_transactions,
+            },
         );
         Ok(rep)
     }

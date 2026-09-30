@@ -3656,6 +3656,7 @@ mod overflow_tests {
         };
 
         let merchant_id = client.register_merchant(&owner, &params);
+        let merchant_id = client.register_merchant(&owner, &params).unwrap();
 
         env.as_contract(&contract_id, || {
             env.storage()
@@ -3680,6 +3681,7 @@ mod overflow_tests {
     #[test]
     fn verification_count_overflow_error_payload() {
         assert_eq!(MarketplaceError::VerificationCountOverflow as u32, 5017);
+        assert_eq!(MarketplaceError::VerificationCountOverflow as u32, 16);
     }
 }
 
@@ -3694,6 +3696,13 @@ mod error_code_uniqueness_tests {
     const MARKETPLACE_ERROR_RANGE: (u32, u32) = (5000, 5999);
 
     fn marketplace_error_codes() -> [u32; 21] {
+    const PERMISSION_ERROR_RANGE: (u32, u32) = (1, 999);
+    const ESCROW_ERROR_RANGE: (u32, u32) = (1000, 1999);
+    const REPUTATION_ERROR_RANGE: (u32, u32) = (2000, 2999);
+    const DELEGATION_ERROR_RANGE: (u32, u32) = (3000, 3999);
+    const MARKETPLACE_ERROR_RANGE: (u32, u32) = (4000, 4999);
+
+    fn marketplace_error_codes() -> [u32; 19] {
         [
             MarketplaceError::AlreadyInitialized as u32,
             MarketplaceError::NotInitialized as u32,
