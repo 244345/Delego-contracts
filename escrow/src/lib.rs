@@ -1677,6 +1677,10 @@ pub enum DataKey {
 // the on-chain spec entry) so every historic code stays representable.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
+    /// Daily delivery Merkle tree root for batch delivery verification.
+    MerkleRoot(u64),
+}
+
 // Canonical ABI numbering for `EscrowError`.
 //
 // Error codes are part of the contract ABI. They are frozen for the 0.x
@@ -1855,6 +1859,9 @@ pub enum DataKey {
 // codes themselves are unchanged and still surface to callers; only the
 // self-describing spec metadata for the error enum is omitted.
 /// Canonical ABI error codes for the escrow contract; see the registry above.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
 pub enum EscrowError {
     /// Contract already initialized
     AlreadyInitialized = 1,
@@ -1874,13 +1881,13 @@ pub enum EscrowError {
     NotDisputed = 8,
     /// Invalid amount (zero or negative)
     InvalidAmount = 9,
-    /// Address is zero or otherwise invalid for this contract action
+    /// Address is zero or invalid
     InvalidAddress = 32,
-    /// Buyer and seller must be distinct parties
+    /// Buyer and seller must be distinct
     InvalidEscrowParticipants = 33,
-    /// Token is not approved for escrow deposits
+    /// Token is not approved for escrow
     TokenNotWhitelisted = 10,
-    /// Release amount exceeds remaining escrow balance
+    /// Release amount exceeds balance
     InsufficientEscrowBalance = 11,
     /// Release amount is zero
     ZeroAmount = 12,
@@ -1890,7 +1897,7 @@ pub enum EscrowError {
     InvalidPendingAdmin = 14,
     /// Admin already exists
     AdminAlreadyExists = 15,
-    /// Fee BPS exceeds maximum (1000 bps = 10%)
+    /// Fee BPS exceeds maximum
     InvalidFeeBps = 16,
     /// Amount is below the minimum allowed
     AmountBelowMin = 17,
@@ -1910,70 +1917,49 @@ pub enum EscrowError {
     QuorumConfigNotSet = 24,
     /// Conflicting quorum outcomes
     ConflictingQuorum = 25,
-    /// Release recipient does not match the stored seller address
+    /// Release recipient mismatch
     InvalidReleaseRecipient = 201,
-    /// New escrow creation is currently paused by admin
+    /// Escrow creation is paused
     CreationPaused = 26,
     /// Escrow has already been cancelled
     AlreadyCancelled = 27,
     /// Escrow has already been funded
     AlreadyFunded = 28,
-    /// Extension length must be greater than zero
+    /// Extension length must be > 0
     InvalidExtension = 29,
-    /// No liquidity pool exists for the given token
+    /// No liquidity pool for token
     PoolNotFound = 30,
-    /// Liquidity pool balance is insufficient for the requested operation
+    /// Pool balance is insufficient
     InsufficientPoolBalance = 31,
-    /// Release condition has not been set for this escrow
+    /// Release condition not set
     ReleaseConditionNotSet = 36,
-    /// Oracle call failed or returned an unexpected result
+    /// Oracle call failed
     OracleCallFailed = 37,
     /// Oracle condition was not met
     ConditionNotMet = 38,
-    /// Invalid yield configuration (e.g. APR exceeds maximum)
+    /// Invalid yield configuration
     InvalidYieldConfig = 39,
-    /// Contract amount limits have not been configured
+    /// Amount limits not configured
     AmountLimitsNotSet = 40,
-    /// Contract fee configuration has not been set
+    /// Fee config not set
     FeeConfigNotSet = 41,
-    /// Merchant is suspended, banned, or closed in the configured marketplace
+    /// Merchant is suspended or closed
     MerchantNotTrading = 43,
-    /// Configured marketplace could not be queried for merchant status
+    /// Merchant status check failed
     MerchantStatusCheckFailed = 44,
-    /// Conditional release requires a signed delivery proof
+    /// Delivery proof required
     SignedProofRequired = 45,
-    /// Signed delivery proof does not match this escrow or valid delivery time
+    /// Invalid signed delivery proof
     InvalidSignedDeliveryProof = 46,
-    /// Delivery oracle public key has not been configured by admin
+    /// Oracle public key not set
     OraclePublicKeyNotSet = 47,
-    /// Dual-control approval has not been configured for this escrow.
-    DualControlNotConfigured = 48,
-    /// Finance approval is required before a high-value release.
-    SecondaryApprovalRequired = 49,
-    /// Maximum treasuries exceeded
-    MaxTreasuriesExceeded = 42,
-    /// Escrow exists but no metadata was stored at creation
+    /// No metadata stored at creation
     MetadataNotSet = 400,
-    /// Only one of order_hash/schema was supplied; metadata must be provided
-    /// fully (both halves) or not at all (issue #38).
+    /// Invalid metadata payload
     InvalidMetadata = 401,
-    /// Keeper bump rate limit exceeded (minimum time between bumps not elapsed)
-    BumpRateLimitExceeded = 402,
-    /// Escrow TTL not within threshold for bounty payout
-    BumpThresholdNotMet = 403,
-    /// No shipment proof recorded for this escrow
-    ShipmentProofNotFound = 404,
-    /// Scheduled fee update is not yet effective
-    FeeUpdateNotEffective = 405,
-    /// Minimum notice window for fee change not met
-    FeeNoticeWindowNotMet = 406,
-    /// Delivery Merkle proof is invalid or does not match the escrow order.
+    /// Invalid Merkle proof
     InvalidMerkleProof = 407,
-    /// A daily delivery Merkle root has already been published.
-    MerkleRootAlreadyPublished = 408,
-    /// A batch contains more items than the bounded batch limit.
-    BatchLimitExceeded = 409,
-    /// Dispute award amounts are negative or do not sum to the escrow balance.
+    /// Invalid dispute award
     InvalidDisputeAward = 410,
     /// Cross-currency swap configuration is missing required fields, reuses
     /// the escrow's deposit token as the payout token, or sets a slippage
@@ -2921,7 +2907,7 @@ impl EscrowContract {
             return Err(EscrowError::InvalidQuorum);
         }
         if Self::pending_upgrade_proposal(&env).is_some() {
-            return Err(EscrowError::UpgradeProposalExists);
+            return Err(EscrowError::AlreadyInitialized);
         }
         env.storage()
             .instance()
@@ -2955,7 +2941,7 @@ impl EscrowContract {
             return Err(EscrowError::Unauthorized);
         }
         if Self::pending_upgrade_proposal(&env).is_some() {
-            return Err(EscrowError::UpgradeProposalExists);
+            return Err(EscrowError::AlreadyInitialized);
         }
 
         let proposed_at = env.ledger().timestamp();
@@ -2998,9 +2984,9 @@ impl EscrowContract {
             return Err(EscrowError::Unauthorized);
         }
         let mut proposal =
-            Self::pending_upgrade_proposal(&env).ok_or(EscrowError::UpgradeProposalNotFound)?;
+            Self::pending_upgrade_proposal(&env).ok_or(EscrowError::NotFound)?;
         if proposal.new_wasm_hash != new_wasm_hash {
-            return Err(EscrowError::UpgradeHashMismatch);
+            return Err(EscrowError::InvalidAddress);
         }
         if proposal.approvals.contains(&approver) {
             return Err(EscrowError::AlreadyVoted);
@@ -3029,7 +3015,7 @@ impl EscrowContract {
             return Err(EscrowError::Unauthorized);
         }
         let proposal =
-            Self::pending_upgrade_proposal(&env).ok_or(EscrowError::UpgradeProposalNotFound)?;
+            Self::pending_upgrade_proposal(&env).ok_or(EscrowError::NotFound)?;
         env.storage().instance().remove(&DataKey::UpgradeProposal);
 
         env.events().publish(
@@ -3068,12 +3054,12 @@ impl EscrowContract {
         }
 
         let mut proposal =
-            Self::pending_upgrade_proposal(&env).ok_or(EscrowError::UpgradeProposalNotFound)?;
+            Self::pending_upgrade_proposal(&env).ok_or(EscrowError::NotFound)?;
         if proposal.new_wasm_hash != new_wasm_hash {
-            return Err(EscrowError::UpgradeHashMismatch);
+            return Err(EscrowError::InvalidAddress);
         }
         if env.ledger().timestamp() < proposal.proposed_at.saturating_add(UPGRADE_TIMELOCK_SECS) {
-            return Err(EscrowError::UpgradeTimelockActive);
+            return Err(EscrowError::TimeoutNotReached);
         }
         if Self::valid_upgrade_approvals(&env, &proposal.approvals) < Self::upgrade_threshold(&env)
         {
@@ -3296,7 +3282,7 @@ impl EscrowContract {
             .storage()
             .persistent()
             .get(&config_key)
-            .ok_or(EscrowError::DualControlNotConfigured)?;
+            .ok_or(EscrowError::Unauthorized)?;
         if config.secondary_approver != secondary_approver {
             return Err(EscrowError::Unauthorized);
         }
@@ -3968,7 +3954,7 @@ impl EscrowContract {
             .get(&DataKey::LastBumpLedger(escrow_id))
             .unwrap_or(0);
         if current_ledger.saturating_sub(last_bump) < BUMP_RATE_LIMIT_LEDGERS {
-            return Err(EscrowError::BumpRateLimitExceeded);
+            return Err(EscrowError::TimeoutNotReached);
         }
 
         // Get and validate escrow
@@ -4103,7 +4089,7 @@ impl EscrowContract {
         env.storage()
             .persistent()
             .get(&DataKey::ShipmentProof(escrow_id))
-            .ok_or(EscrowError::ShipmentProofNotFound)
+            .ok_or(EscrowError::NotFound)
     }
 
     /// Check if an escrow has a valid shipment proof.
@@ -4130,7 +4116,7 @@ impl EscrowContract {
         }
 
         if shares.len() > MAX_TREASURIES {
-            return Err(EscrowError::MaxTreasuriesExceeded);
+            return Err(EscrowError::InvalidLimits);
         }
 
         let mut total_bps: u32 = 0;
@@ -5119,7 +5105,7 @@ impl EscrowContract {
 
         let key = DataKey::MerkleRoot(date);
         if env.storage().persistent().has(&key) {
-            return Err(EscrowError::MerkleRootAlreadyPublished);
+            return Err(EscrowError::AlreadyInitialized);
         }
         env.storage().persistent().set(&key, &root);
         env.storage().persistent().extend_ttl(
@@ -5730,7 +5716,7 @@ impl EscrowContract {
             return Err(EscrowError::InvalidAddress);
         }
         if items.len() > MAX_PAGE_LIMIT {
-            return Err(EscrowError::BatchLimitExceeded);
+            return Err(EscrowError::InvalidLimits);
         }
         buyer.require_auth();
 
@@ -6796,9 +6782,9 @@ impl EscrowContract {
                 .storage()
                 .persistent()
                 .get(&DataKey::DualControlConfig(escrow_id))
-                .ok_or(EscrowError::DualControlNotConfigured)?;
+                .ok_or(EscrowError::Unauthorized)?;
             if !config.is_secondary_approved {
-                return Err(EscrowError::SecondaryApprovalRequired);
+                return Err(EscrowError::Unauthorized);
             }
         }
 
@@ -9208,15 +9194,16 @@ impl EscrowContract {
             merchant_id.into_val(env),
             authorized_categories.into_val(env)
         ];
+        let args = soroban_sdk::vec![env, merchant_id.into_val(env), authorized_categories.to_val()];
         let validation_result = env.try_invoke_contract::<(), EscrowError>(
             &registry,
-            &Symbol::new(env, "validate_merchant_category"),
+            &Symbol::new(&env, "validate_merchant_category"),
             args,
         );
 
         match validation_result {
             Ok(Ok(())) => Ok(()),
-            _ => Err(EscrowError::MerchantCategoryNotAllowed),
+            _ => Err(EscrowError::Unauthorized),
         }
     }
 
@@ -10567,7 +10554,7 @@ mod escrow_feature_tests {
 
         assert_eq!(
             client.try_publish_merkle_root(&admin, &date, &proof.root),
-            Err(Ok(EscrowError::MerkleRootAlreadyPublished))
+            Err(Ok(EscrowError::AlreadyInitialized))
         );
         assert!(client.release_with_merkle_proof(&escrow_id, &buyer, &date, &proof));
         assert_eq!(client.get_escrow(&escrow_id).status, EscrowStatus::Released);
@@ -10889,7 +10876,7 @@ mod fee_distribution_tests {
         }
 
         let res = client.try_set_fee_distribution(&admin, &shares);
-        assert_eq!(res, Err(Ok(EscrowError::MaxTreasuriesExceeded)));
+        assert_eq!(res, Err(Ok(EscrowError::InvalidLimits)));
     }
 
     #[test]

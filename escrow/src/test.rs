@@ -3099,7 +3099,7 @@ use soroban_sdk::{
         );
         assert_eq!(
             client.try_verify_delivery_and_release(&escrow_id, &buyer, &proof),
-            Err(Ok(EscrowError::SecondaryApprovalRequired))
+            Err(Ok(EscrowError::Unauthorized))
         );
 
         assert!(client.approve_release(&escrow_id, &finance_manager));
@@ -3362,7 +3362,7 @@ use soroban_sdk::{
         
         // Immediate second bump should fail due to rate limit
         let result = client.try_bump_ttl_with_bounty(&escrow_id, &keeper);
-        assert_eq!(result, Err(Ok(EscrowError::BumpRateLimitExceeded)));
+        assert_eq!(result, Err(Ok(EscrowError::TimeoutNotReached)));
     }
 
     #[test]

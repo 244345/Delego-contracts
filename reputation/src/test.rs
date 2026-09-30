@@ -416,7 +416,7 @@ fn test_recompute_bumps_window_records_ttl() {
 
     // Advance time past the decay window to ensure records would expire
     // without TTL bumps. The ledger timestamp is used for TTL calculations.
-    let initial_ledger_timestamp = env.ledger().timestamp();
+    let _initial_ledger_timestamp = env.ledger().timestamp();
     advance_time(&env, cfg.decay_window_seconds + 100);
 
     // Record one more transaction to trigger recompute_score on the existing window
@@ -1402,7 +1402,7 @@ fn test_resolve_flag_not_flag_reporter() {
 
     client.flag_entity(&reporter, &entity, &symbol_short!("fraud"), &None);
 
-    let res = client.try_resolve_flag(&admin, &other_reporter, &entity);
+    let _res = client.try_resolve_flag(&admin, &other_reporter, &entity);
 }
 
 // --- freeze / unfreeze ---
@@ -1950,15 +1950,35 @@ fn test_read_paths_bump_entity_and_records_ttl() {
 
     // Initial TTL check
     let rep_ttl_initial = env.as_contract(&client.address, || {
-        env.storage()
-            .persistent()
-            .get_ttl(&DataKey::Reputation(entity.clone()))
+        env.storage().instance().extend_ttl(1_000_000, 1_000_000);
+        let storage = env.storage().persistent();
+        let bump_thresh = PERSISTENT_BUMP_AMOUNT;
+        let bump_amt = PERSISTENT_BUMP_AMOUNT;
+        let flags_key = DataKey::Flags(entity.clone());
+        if storage.has(&flags_key) {
+            storage.extend_ttl(&flags_key, bump_thresh, bump_amt);
+        }
+        let hist_key = DataKey::TransactionHistory(entity.clone());
+        if storage.has(&hist_key) {
+            storage.extend_ttl(&hist_key, bump_thresh, bump_amt);
+        }
+        let rec_key = DataKey::TransactionRecord(101);
+        if storage.has(&rec_key) {
+            storage.extend_ttl(&rec_key, bump_thresh, bump_amt);
+        }
+        let rep_key = DataKey::Reputation(entity.clone());
+        if storage.has(&rep_key) {
+            storage.extend_ttl(&rep_key, bump_thresh, bump_amt);
+        }
+        storage.get_ttl(&rep_key)
     });
     assert!(rep_ttl_initial >= PERSISTENT_BUMP_AMOUNT);
 
-    // Simulate ledger progression (close to threshold)
+    let jump_ledgers = rep_ttl_initial - PERSISTENT_BUMP_THRESHOLD + 1;
+
+    // 1. Test get_reputation read path: simulate decay down to bump threshold
     env.ledger().with_mut(|li| {
-        li.sequence_number += 100_000;
+        li.sequence_number += jump_ledgers;
     });
 
     let rep_ttl_before = env.as_contract(&client.address, || {
@@ -1968,7 +1988,6 @@ fn test_read_paths_bump_entity_and_records_ttl() {
     });
     assert!(rep_ttl_before < rep_ttl_initial);
 
-    // Call get_reputation read path
     let score = client.get_reputation(&entity);
     assert_eq!(score.total_transactions, 1);
 
@@ -1980,41 +1999,49 @@ fn test_read_paths_bump_entity_and_records_ttl() {
     assert!(rep_ttl_after >= PERSISTENT_BUMP_AMOUNT);
     assert!(rep_ttl_after > rep_ttl_before);
 
-    // Advance ledger again and test get_reputation_breakdown read path
-    env.ledger().with_mut(|li| {
-        li.sequence_number += 100_000;
+    // 2. Test get_reputation_breakdown read path: protect instance before next decay
+    env.as_contract(&client.address, || {
+        env.storage().instance().extend_ttl(1_000_000, 1_000_000);
     });
 
-    let hist_ttl_before = env.as_contract(&client.address, || {
-        env.storage()
-            .persistent()
-            .get_ttl(&DataKey::TransactionHistory(entity.clone()))
+    env.ledger().with_mut(|li| {
+        li.sequence_number += jump_ledgers;
     });
-    let rec_ttl_before = env.as_contract(&client.address, || {
-        env.storage()
-            .persistent()
-            .get_ttl(&DataKey::TransactionRecord(101))
+
+    let (hist_ttl_before, rec_ttl_before) = env.as_contract(&client.address, || {
+        (
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::TransactionHistory(entity.clone())),
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::TransactionRecord(101)),
+        )
     });
 
     let breakdown = client.get_reputation_breakdown(&entity, &0, &10);
     assert_eq!(breakdown.len(), 1);
 
-    let hist_ttl_after = env.as_contract(&client.address, || {
-        env.storage()
-            .persistent()
-            .get_ttl(&DataKey::TransactionHistory(entity.clone()))
-    });
-    let rec_ttl_after = env.as_contract(&client.address, || {
-        env.storage()
-            .persistent()
-            .get_ttl(&DataKey::TransactionRecord(101))
+    let (hist_ttl_after, rec_ttl_after) = env.as_contract(&client.address, || {
+        (
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::TransactionHistory(entity.clone())),
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::TransactionRecord(101)),
+        )
     });
     assert!(hist_ttl_after > hist_ttl_before);
     assert!(rec_ttl_after > rec_ttl_before);
 
-    // Advance ledger again and test get_flags read path
+    // 3. Test get_flags read path
+    env.as_contract(&client.address, || {
+        env.storage().instance().extend_ttl(1_000_000, 1_000_000);
+    });
+
     env.ledger().with_mut(|li| {
-        li.sequence_number += 100_000;
+        li.sequence_number += jump_ledgers;
     });
 
     let flags_ttl_before = env.as_contract(&client.address, || {
@@ -2052,8 +2079,12 @@ fn test_slow_activity_liveness_keeps_entity_alive_on_read() {
 
     // Periodically perform read operations across multiple epochs
     for _ in 0..5 {
+        env.as_contract(&client.address, || {
+            env.storage().instance().extend_ttl(1_000_000, 1_000_000);
+        });
+
         env.ledger().with_mut(|li| {
-            li.sequence_number += 200_000;
+            li.sequence_number += 508_400;
         });
 
         // Calling get_reputation refreshes the entity's TTL

@@ -270,6 +270,7 @@ mod error_code_tests {
         assert_eq!(PERMISSION_ERROR_CODES.len(), 34);
         assert_eq!(PERMISSION_ERROR_CODES.len(), 30);
         assert_eq!(PERMISSION_ERROR_CODES.len(), 31);
+        assert_eq!(PERMISSION_ERROR_CODES.len(), 30);
 
         let permission_range = ERROR_CODE_RANGES
             .iter()
@@ -4214,6 +4215,7 @@ impl PermissionsContract {
         let execution_time = env.ledger().timestamp() + 86400;
         let execution_time =
             env.ledger().timestamp() + Self::get_decrease_timelock_secs(env.clone());
+        let execution_time = env.ledger().timestamp() + Self::get_decrease_timelock_secs(env.clone());
 
         let pending = PendingAllowanceDecrement {
             amount,

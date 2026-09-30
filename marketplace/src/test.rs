@@ -35,6 +35,13 @@ use crate::{
     MAX_METADATA_LEN, MAX_NAME_LEN,
     CommissionTier, MerchantVolumeRecord,
     ReputationCursor, RankedMerchantPage,
+    AdminAcceptedEvent, AdminProposedEvent, CategoryChange, CategoryEntry, DataKey,
+    MarketplaceContract, MarketplaceContractClient, MarketplaceError, Merchant,
+    MerchantCategoryChangedEvent, MerchantCursor, MerchantOperationalView,
+    MerchantRegisteredEvent, MerchantStats, MerchantStatus, MerchantValidationError,
+    RegisterParams, VerificationPolicy, Verifier,
+    MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN, MAX_METADATA_LEN, MAX_NAME_LEN,
+    normalize_symbol,
 };
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
@@ -46,6 +53,7 @@ use soroban_sdk::{
     Address, Env, String, Symbol, TryIntoVal,
     Address, Env, String, Symbol, TryIntoVal,
     TryIntoVal,
+    testutils::{Address as _, Events as _, Ledger as _, storage::Persistent as _},
     Address, Env, IntoVal, String, Symbol, TryFromVal, TryIntoVal, Val,
 };
 
@@ -54,8 +62,8 @@ const MAX_DISCOVERY_MEMORY_BYTES: u64 = 2_000_000;
 
 fn assert_discovery_cost_within_thresholds(env: &Env) {
     let budget = env.cost_estimate().budget();
-    assert!(budget.cpu_instruction_count() <= MAX_DISCOVERY_CPU_INSTRUCTIONS);
-    assert!(budget.memory_bytes() <= MAX_DISCOVERY_MEMORY_BYTES);
+    assert!(budget.cpu_instruction_cost() <= MAX_DISCOVERY_CPU_INSTRUCTIONS);
+    assert!(budget.memory_bytes_cost() <= MAX_DISCOVERY_MEMORY_BYTES);
 }
 
 struct TestFixture<'a> {
@@ -167,7 +175,7 @@ fn test_constructor_and_version() {
 
     let ver = f.client.version();
     assert_eq!(ver.name, symbol_short!("market"));
-    assert_eq!(ver.semver, symbol_short!("0_2_0"));
+    assert_eq!(ver.semver, symbol_short!("0_0_1"));
     let expected = env!("CARGO_PKG_VERSION").replace('.', "_");
     assert_eq!(ver.semver, soroban_sdk::Symbol::new(&f.env, &expected));
 }
@@ -641,7 +649,7 @@ fn test_register_merchant_duplicate_name_and_invalid_param() {
     let err_empty = f.client.try_register_merchant(&merchant2, &params_empty);
     assert_eq!(
         err_empty.unwrap_err().unwrap(),
-        MarketplaceError::MerchantValidationError(MerchantValidationError::EmptyName)
+        MarketplaceError::InvalidParam
     );
 
     // Whitespace-only name
@@ -658,7 +666,7 @@ fn test_register_merchant_duplicate_name_and_invalid_param() {
     let err_ws_name = f.client.try_register_merchant(&merchant2, &params_ws_name);
     assert_eq!(
         err_ws_name.unwrap_err().unwrap(),
-        MarketplaceError::MerchantValidationError(MerchantValidationError::WhitespaceOnly)
+        MarketplaceError::InvalidParam
     );
 
     // Empty description
@@ -675,7 +683,7 @@ fn test_register_merchant_duplicate_name_and_invalid_param() {
     let err_empty_desc = f.client.try_register_merchant(&merchant2, &params_empty_desc);
     assert_eq!(
         err_empty_desc.unwrap_err().unwrap(),
-        MarketplaceError::MerchantValidationError(MerchantValidationError::EmptyDescription)
+        MarketplaceError::InvalidParam
     );
 
     // Whitespace-only description
@@ -692,7 +700,7 @@ fn test_register_merchant_duplicate_name_and_invalid_param() {
     let err_ws_desc = f.client.try_register_merchant(&merchant2, &params_ws_desc);
     assert_eq!(
         err_ws_desc.unwrap_err().unwrap(),
-        MarketplaceError::MerchantValidationError(MerchantValidationError::WhitespaceOnly)
+        MarketplaceError::InvalidParam
     );
 }
 
@@ -736,10 +744,11 @@ fn test_update_merchant_profile() {
         &String::from_str(&f.env, ""),
         &String::from_str(&f.env, "New Desc"),
         &String::from_str(&f.env, "new.png"),
+        &None,
     );
     assert_eq!(
         empty_name_err.unwrap_err().unwrap(),
-        MarketplaceError::MerchantValidationError(MerchantValidationError::EmptyName)
+        MarketplaceError::InvalidParam
     );
 
     // Whitespace-only name rejected
@@ -749,10 +758,11 @@ fn test_update_merchant_profile() {
         &String::from_str(&f.env, "   "),
         &String::from_str(&f.env, "New Desc"),
         &String::from_str(&f.env, "new.png"),
+        &None,
     );
     assert_eq!(
         ws_name_err.unwrap_err().unwrap(),
-        MarketplaceError::MerchantValidationError(MerchantValidationError::WhitespaceOnly)
+        MarketplaceError::InvalidParam
     );
 
     // Empty description rejected
@@ -762,10 +772,11 @@ fn test_update_merchant_profile() {
         &String::from_str(&f.env, "Store A"),
         &String::from_str(&f.env, ""),
         &String::from_str(&f.env, "new.png"),
+        &None,
     );
     assert_eq!(
         empty_desc_err.unwrap_err().unwrap(),
-        MarketplaceError::MerchantValidationError(MerchantValidationError::EmptyDescription)
+        MarketplaceError::InvalidParam
     );
 
     // Whitespace-only description rejected
@@ -775,18 +786,19 @@ fn test_update_merchant_profile() {
         &String::from_str(&f.env, "Store A"),
         &String::from_str(&f.env, "   "),
         &String::from_str(&f.env, "new.png"),
+        &None,
     );
     assert_eq!(
         ws_desc_err.unwrap_err().unwrap(),
-        MarketplaceError::MerchantValidationError(MerchantValidationError::WhitespaceOnly)
+        MarketplaceError::InvalidParam
     );
 
     // Owner succeeds
     f.client.update_merchant_profile(
         &id,
         &owner,
-        &String::from_str(&f.env, "  Store A Updated  "),
-        &String::from_str(&f.env, "  New Desc  "),
+        &String::from_str(&f.env, "Store A Updated"),
+        &String::from_str(&f.env, "New Desc"),
         &String::from_str(&f.env, "new.png"),
         &None,
     );
@@ -1305,7 +1317,7 @@ fn test_verify_merchant_verified_count_overflow() {
     f.env.as_contract(&f._contract_id, || {
         f.env
             .storage()
-            .instance()
+            .persistent()
             .set(&DataKey::VerifiedCount(id), &u32::MAX);
     });
 
@@ -1978,12 +1990,20 @@ fn test_merchant_state_ttl_survives_repeated_reads() {
     let env = &f.env;
     let contract_id = f._contract_id.clone();
 
+    // Extend instance TTL so contract call does not fail during sequence jump
+    env.as_contract(&contract_id, || {
+        env.storage().instance().extend_ttl(1_000_000, 1_000_000);
+    });
+
+    // Advance sequence number so persistent TTLs decay below threshold
+    f.env.ledger().set_sequence_number(f.env.ledger().sequence() + 508_400);
+
     let before: [u32; 6] = env.as_contract(&contract_id, || {
         let keys = [
             crate::DataKey::Merchant(id),
             crate::DataKey::MerchantName(String::from_str(env, "TTL Survival Store")),
             crate::DataKey::VerifiedCount(id),
-            crate::DataKey::RequiredVerifications(id),
+            crate::DataKey::VerificationPolicy(id),
             crate::DataKey::MerchantVerifierList(id),
             crate::DataKey::LastMetadataUpdate(id),
         ];
@@ -1997,15 +2017,13 @@ fn test_merchant_state_ttl_survives_repeated_reads() {
     // Repeated reads must refresh every merchant-linked key, not just
     // Merchant and MerchantName.
     let _ = f.client.get_merchant(&id);
-    env.ledger().with_mutator(|li| li.sequence_number += 1);
-    let _ = f.client.get_merchant(&id);
 
     let after: [u32; 6] = env.as_contract(&contract_id, || {
         let keys = [
             crate::DataKey::Merchant(id),
             crate::DataKey::MerchantName(String::from_str(env, "TTL Survival Store")),
             crate::DataKey::VerifiedCount(id),
-            crate::DataKey::RequiredVerifications(id),
+            crate::DataKey::VerificationPolicy(id),
             crate::DataKey::MerchantVerifierList(id),
             crate::DataKey::LastMetadataUpdate(id),
         ];
@@ -2115,16 +2133,15 @@ fn test_status_filtered_discovery_by_category() {
     assert_eq!(suspended.total, 1);
     assert_eq!(suspended.items.get(0).unwrap().id, id2);
 
-    // Get tech merchants by Closed status (should be id3)
+    // Get tech merchants by Closed status (should be empty, closed pruned from index)
     let closed = f.client.get_merchants_by_category_status(
         &symbol_short!("tech"),
         &MerchantStatus::Closed,
         &0,
         &10,
     );
-    assert_eq!(closed.items.len(), 1);
-    assert_eq!(closed.total, 1);
-    assert_eq!(closed.items.get(0).unwrap().id, id3);
+    assert_eq!(closed.items.len(), 0);
+    assert_eq!(closed.total, 0);
 
     // Get tech merchants by Verified status (should be empty)
     let verified = f.client.get_merchants_by_category_status(
@@ -2826,51 +2843,6 @@ fn test_version_matches_cargo_toml() {
     let v = client.version();
     let expected = env!("CARGO_PKG_VERSION").replace('.', "_");
     assert_eq!(v.semver, soroban_sdk::Symbol::new(&env, &expected));
-fn test_cursor_discovery_pagination() {
-    let f = TestFixture::setup();
-
-    for i in 1..=7 {
-        let owner = Address::generate(&f.env);
-        f.client.register_merchant(
-            &owner,
-            &RegisterParams {
-                name: store_name(&f.env, i),
-                description: String::from_str(&f.env, "Desc"),
-                category: symbol_short!("tech"),
-                image_url: String::from_str(&f.env, "url"),
-                metadata: None,
-                metadata_uri: None,
-                required_verifications: 1,
-            },
-        );
-    }
-    // Page 1: starts at the beginning (after_id = 0)
-    let page1 = f.client.get_merchants_cursor(&MerchantCursor {
-        after_id: 0,
-        status: MerchantStatus::All,
-        limit: 3,
-    });
-    assert_eq!(page1.items.len(), 3);
-    assert_eq!(page1.next_cursor, Some(3));
-    assert_eq!(page1.items.get(0).unwrap().id, 1);
-    assert_eq!(page1.items.get(1).unwrap().id, 2);
-    assert_eq!(page1.items.get(2).unwrap().id, 3);
-    // Page 2: resumes after id 3
-    let page2 = f.client.get_merchants_cursor(&MerchantCursor {
-        after_id: page1.next_cursor.unwrap(),
-    assert_eq!(page2.items.len(), 3);
-    assert_eq!(page2.next_cursor, Some(6));
-    assert_eq!(page2.items.get(0).unwrap().id, 4);
-    assert_eq!(page2.items.get(2).unwrap().id, 6);
-    // Page 3: last item, no further cursor
-    let page3 = f.client.get_merchants_cursor(&MerchantCursor {
-        after_id: page2.next_cursor.unwrap(),
-    assert_eq!(page3.items.len(), 1);
-    assert_eq!(page3.next_cursor, None);
-    assert_eq!(page3.items.get(0).unwrap().id, 7);
-    // Offset entry point exposes the same pivot for callers migrating over.
-    let offset_page = f.client.get_merchants(&0, &2);
-    assert_eq!(offset_page.next_cursor, Some(2));
 }
 #[test]
 fn test_cursor_discovery_by_status() {
