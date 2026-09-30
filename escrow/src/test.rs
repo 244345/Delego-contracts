@@ -47,6 +47,116 @@ use soroban_sdk::{
         }
     }
 
+    #[contracttype]
+    #[derive(Clone)]
+    enum ReentrantTokenKey {
+        Escrow,
+        EscrowId,
+        Caller,
+        Seller,
+        Enabled,
+        ReentryRejected,
+        SawReleasedState,
+    }
+
+    #[contract]
+    struct ReentrantToken;
+
+    #[contractimpl]
+    impl ReentrantToken {
+        pub fn configure_reentry(
+            env: Env,
+            escrow: Address,
+            escrow_id: u64,
+            caller: Address,
+            seller: Address,
+            enabled: bool,
+        ) {
+            env.storage().instance().set(&ReentrantTokenKey::Escrow, &escrow);
+            env.storage()
+                .instance()
+                .set(&ReentrantTokenKey::EscrowId, &escrow_id);
+            env.storage()
+                .instance()
+                .set(&ReentrantTokenKey::Caller, &caller);
+            env.storage()
+                .instance()
+                .set(&ReentrantTokenKey::Seller, &seller);
+            env.storage()
+                .instance()
+                .set(&ReentrantTokenKey::Enabled, &enabled);
+        }
+
+        pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {
+            let enabled: bool = _env
+                .storage()
+                .instance()
+                .get(&ReentrantTokenKey::Enabled)
+                .unwrap_or(false);
+            if !enabled {
+                return;
+            }
+
+            let escrow: Address = _env
+                .storage()
+                .instance()
+                .get(&ReentrantTokenKey::Escrow)
+                .unwrap();
+            let escrow_id: u64 = _env
+                .storage()
+                .instance()
+                .get(&ReentrantTokenKey::EscrowId)
+                .unwrap();
+            let caller: Address = _env
+                .storage()
+                .instance()
+                .get(&ReentrantTokenKey::Caller)
+                .unwrap();
+            let seller: Address = _env
+                .storage()
+                .instance()
+                .get(&ReentrantTokenKey::Seller)
+                .unwrap();
+
+            let client = EscrowContractClient::new(&_env, &escrow);
+            let nested_partial = client.try_partial_release(&escrow_id, &caller, &1i128);
+            let nested_release = client.try_release(&escrow_id, &caller, &seller);
+            let rejected = nested_partial == Err(Ok(EscrowError::ReentrancyDetected))
+                && nested_release == Err(Ok(EscrowError::ReentrancyDetected));
+            let record = client.get_escrow(&escrow_id);
+            _env.storage()
+                .instance()
+                .set(&ReentrantTokenKey::ReentryRejected, &rejected);
+            _env.storage().instance().set(
+                &ReentrantTokenKey::SawReleasedState,
+                &(record.status == crate::EscrowStatus::Released),
+            );
+        }
+
+        pub fn transfer_from(
+            _env: Env,
+            _spender: Address,
+            _from: Address,
+            _to: Address,
+            _amount: i128,
+        ) {
+        }
+
+        pub fn reentry_rejected(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get(&ReentrantTokenKey::ReentryRejected)
+                .unwrap_or(false)
+        }
+
+        pub fn saw_released_state(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get(&ReentrantTokenKey::SawReleasedState)
+                .unwrap_or(false)
+        }
+    }
+
     fn setup_client(env: &Env) -> (EscrowContractClient<'_>, Address, Address) {
         let admin = Address::generate(env);
         let treasury = Address::generate(env);
@@ -2398,6 +2508,42 @@ use soroban_sdk::{
             after.accrued > 0,
             "yield should still be non-zero after partial release"
         );
+    }
+
+    #[test]
+    fn test_release_commits_state_and_rejects_reentry_during_token_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, escrow_contract) = setup_client(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token = env.register(ReentrantToken, ());
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[72u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer,
+            &seller,
+            &token,
+            &1_000i128,
+            &order_id,
+            &1_000u32,
+            &None,
+            &None,
+        );
+        client.set_yield_config(&admin, &escrow_id, &token, &500u32);
+
+        let token_client = ReentrantTokenClient::new(&env, &token);
+        token_client.configure_reentry(&escrow_contract, &escrow_id, &buyer, &seller, &true);
+
+        let released = client.partial_release(&escrow_id, &buyer, &1_000i128);
+
+        assert!(released.fully_released);
+        assert!(token_client.reentry_rejected());
+        assert!(token_client.saw_released_state());
+        let record = client.get_escrow(&escrow_id);
+        assert_eq!(record.status, crate::EscrowStatus::Released);
+        assert_eq!(record.released_amount, 1_000i128);
     }
 
     // ─── Issue #35: updated_at lifecycle tests ──────────────────────────────

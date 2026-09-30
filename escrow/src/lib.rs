@@ -69,6 +69,14 @@ pub struct ArbiterStakingRecord {
     pub is_slashed: bool,
 }
 
+/// Instance-level lock held while a release calls external contracts.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReentrancyGuard {
+    Unlocked,
+    Locked,
+}
+
 /// Terminal states an escrow can reach after it is no longer active.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1593,6 +1601,8 @@ pub enum DataKey {
     RegisteredSchema(Symbol),
     /// Milestone schedule for escrows created via `create_milestone_escrow`.
     MilestoneConfig(u64),
+    /// Prevents release entry points from being re-entered during token calls.
+    ReleaseGuard,
 }
 
 // `export = false` suppresses the generated `contractspecv0` entry for this
@@ -1764,7 +1774,8 @@ pub enum DataKey {
 // | 417 | AdminActionOverflow | next major |
 // | 418+ | Reserved for new variants | next major |
 // | 411 | MathOverflow | next major |
-// | 412+ | Reserved for new variants | next major |
+// | 412 | ReentrancyDetected | next major |
+// | 413+ | Reserved for new variants | next major |
 //
 // # Allocating new variants
 //
@@ -2296,6 +2307,8 @@ pub enum MultiOracleError {
     AdminActionOverflow = 417,
     /// A fee or yield calculation exceeded the supported integer range.
     MathOverflow = 411,
+    /// A release entry point was re-entered while an external call was active.
+    ReentrancyDetected = 412,
 }
 
 /// Compact receipt returned to buyers after escrow creation via `get_receipt`.
@@ -2703,6 +2716,27 @@ pub struct EscrowContract;
 #[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl EscrowContract {
+    fn enter_release(env: &Env) -> Result<(), EscrowError> {
+        let guard: ReentrancyGuard = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReleaseGuard)
+            .unwrap_or(ReentrancyGuard::Unlocked);
+        if guard == ReentrancyGuard::Locked {
+            return Err(EscrowError::ReentrancyDetected);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::ReleaseGuard, &ReentrancyGuard::Locked);
+        Ok(())
+    }
+
+    fn exit_release(env: &Env) {
+        env.storage()
+            .instance()
+            .set(&DataKey::ReleaseGuard, &ReentrancyGuard::Unlocked);
+    }
+
     /// Soroban constructor: initialize the escrow contract at deployment time with
     /// atomic admin + config setup. The host invokes this exactly once, so a later
     /// post-deploy `initialize` call cannot front-run a real deployer.
@@ -3508,6 +3542,7 @@ impl EscrowContract {
         caller: Address,
     ) -> Result<bool, EscrowError> {
         caller.require_auth();
+        Self::enter_release(&env)?;
 
         let key = DataKey::Escrow(escrow_id);
         let mut record: EscrowRecord = match env.storage().persistent().get(&key) {
@@ -3564,21 +3599,38 @@ impl EscrowContract {
             update_merchant_volume_and_tier(&env, &record.seller, record.amount);
             record.status = EscrowStatus::Released;
             Self::try_mint_purchase_receipt(&env, &mut record);
+        let payout = if release_to_seller {
+            Some(Self::compute_payout(&env, record.amount)?)
         } else {
-            token_client.transfer(
-                &env.current_contract_address(),
-                &record.buyer,
-                &record.amount,
-            );
-            record.status = EscrowStatus::Refunded;
-        }
-
+            None
+        };
+        record.status = if release_to_seller {
+            EscrowStatus::Released
+        } else {
+            EscrowStatus::Refunded
+        };
         record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
         env.storage().persistent().remove(&votes_key);
         env.storage()
             .persistent()
             .remove(&DataKey::TimeoutExtensionVotes(escrow_id));
+
+        if release_to_seller {
+            let payout = payout.unwrap();
+            Self::distribute_fee(&env, &token_client, payout.fee)?;
+            token_client.transfer(
+                &env.current_contract_address(),
+                &record.seller,
+                &payout.seller_net,
+            );
+        } else {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &record.buyer,
+                &record.amount,
+            );
+        }
 
         env.events().publish(
             (
@@ -3593,6 +3645,7 @@ impl EscrowContract {
             },
         );
 
+        Self::exit_release(&env);
         Ok(true)
     }
 
@@ -5080,6 +5133,7 @@ impl EscrowContract {
         proof: MerkleDeliveryProof,
     ) -> Result<bool, EscrowError> {
         buyer.require_auth();
+        Self::enter_release(&env)?;
         let key = DataKey::Escrow(escrow_id);
         let record: EscrowRecord = env
             .storage()
@@ -5120,6 +5174,7 @@ impl EscrowContract {
             record.amount - record.released_amount - record.refunded_amount,
             0,
         )?;
+        Self::exit_release(&env);
         Ok(true)
     }
 
@@ -5720,6 +5775,7 @@ impl EscrowContract {
         releases: Vec<BatchReleaseParams>,
     ) -> Result<Vec<PartialReleaseResult>, EscrowError> {
         caller.require_auth();
+        Self::enter_release(&env)?;
 
         let mut results = Vec::new(&env);
         for item in releases.iter() {
@@ -5731,6 +5787,7 @@ impl EscrowContract {
             )?;
             results.push_back(result);
         }
+        Self::exit_release(&env);
         Ok(results)
     }
 
@@ -5771,7 +5828,10 @@ impl EscrowContract {
         release_amount: i128,
     ) -> Result<PartialReleaseResult, EscrowError> {
         caller.require_auth();
-        Self::partial_release_internal(env, escrow_id, caller, release_amount)
+        Self::enter_release(&env)?;
+        let result = Self::partial_release_internal(env.clone(), escrow_id, caller, release_amount);
+        Self::exit_release(&env);
+        result
     }
 
     /// Shared `partial_release` logic used by both `partial_release` and
@@ -5997,6 +6057,8 @@ impl EscrowContract {
         // Accumulate the merchant's settled volume and re-evaluate the fee
         // tier ladder (issue #328). Succeeds on every successful release.
         update_merchant_volume_and_tier(env, &record.seller, release_amount);
+        let payout = Self::compute_payout(env, release_amount)?;
+        record.released_amount += release_amount;
         let new_remaining = record.amount - record.released_amount - record.refunded_amount;
         record.released_amount = record
             .released_amount
@@ -6020,6 +6082,13 @@ impl EscrowContract {
 
         record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(key, &record);
+
+        Self::distribute_fee(env, &token_client, payout.fee)?;
+        token_client.transfer(
+            &env.current_contract_address(),
+            &record.seller,
+            &payout.seller_net,
+        );
 
         env.events().publish(
             (
@@ -6334,6 +6403,8 @@ impl EscrowContract {
         caller: Address,
         recipient: Address,
     ) -> Result<bool, EscrowError> {
+        caller.require_auth();
+        Self::enter_release(&env)?;
         let key = DataKey::Escrow(escrow_id);
         let record: EscrowRecord = match env.storage().persistent().get(&key) {
             Some(rec) => rec,
@@ -6348,7 +6419,8 @@ impl EscrowContract {
         Self::validate_seller_category(&env, &record.seller)?;
 
         let remaining = record.amount - record.released_amount - record.refunded_amount;
-        Self::partial_release(env, escrow_id, caller, remaining)?;
+        Self::partial_release_internal(env.clone(), escrow_id, caller, remaining)?;
+        Self::exit_release(&env);
         Ok(true)
     }
 
@@ -6671,6 +6743,7 @@ impl EscrowContract {
         proof: SignedDeliveryProof,
     ) -> Result<PartialReleaseResult, EscrowError> {
         caller.require_auth();
+        Self::enter_release(&env)?;
 
         let key = DataKey::Escrow(escrow_id);
         let record: EscrowRecord = match env.storage().persistent().get(&key) {
@@ -7248,6 +7321,9 @@ impl EscrowContract {
         } else {
             Err(MultiOracleError::ThresholdNotMet)
         }
+        let result = Self::execute_release(&env, escrow_id, &key, record, caller, remaining);
+        Self::exit_release(&env);
+        result
     }
 
     /// Mark the escrow as disputed. Only the buyer or seller may call.
@@ -7372,6 +7448,7 @@ impl EscrowContract {
         release_to_seller: bool,
     ) -> Result<bool, EscrowError> {
         caller.require_auth();
+        Self::enter_release(&env)?;
 
         if !Self::is_admin(env.clone(), caller.clone()) {
             return Err(EscrowError::Unauthorized);
@@ -7419,6 +7496,36 @@ impl EscrowContract {
         env.storage().persistent().set(&key, &record);
 
         // Emit event: initial ruling issued, appeal window open
+        let token_client = soroban_sdk::token::Client::new(&env, &record.token);
+        let payout = if release_to_seller {
+            Some(Self::compute_payout(&env, record.amount)?)
+        } else {
+            None
+        };
+        record.status = if release_to_seller {
+            EscrowStatus::Released
+        } else {
+            EscrowStatus::Refunded
+        };
+        record.updated_at = env.ledger().timestamp();
+        env.storage().persistent().set(&key, &record);
+
+        if release_to_seller {
+            let payout = payout.unwrap();
+            Self::distribute_fee(&env, &token_client, payout.fee)?;
+            token_client.transfer(
+                &env.current_contract_address(),
+                &record.seller,
+                &payout.seller_net,
+            );
+        } else {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &record.buyer,
+                &record.amount,
+            );
+        }
+
         env.events().publish(
             (
                 symbol_short!("escrow"),
@@ -7431,6 +7538,7 @@ impl EscrowContract {
             ),
         );
 
+        Self::exit_release(&env);
         Ok(true)
     }
 
@@ -9634,6 +9742,7 @@ impl EscrowContract {
         shares: Vec<(Address, i128)>,
     ) -> Result<bool, EscrowError> {
         caller.require_auth();
+        Self::enter_release(&env)?;
 
         let key = DataKey::Escrow(escrow_id);
         let mut record: EscrowRecord = match env.storage().persistent().get(&key) {
@@ -9672,6 +9781,7 @@ impl EscrowContract {
 
         let mut total_fee: i128 = 0;
         let mut total_released: i128 = 0;
+        let mut transfers = Vec::new(&env);
 
         for (recipient, amount) in shares.iter() {
             let fee = Self::compute_fee_amount(&env, &record.seller, amount)?;
@@ -9685,9 +9795,10 @@ impl EscrowContract {
             total_released = total_released
                 .checked_add(amount)
                 .ok_or(EscrowError::MathOverflow)?;
+            transfers.push_back((recipient, net));
+            total_fee += fee;
+            total_released += amount;
         }
-
-        Self::distribute_fee(&env, &token_client, total_fee)?;
 
         record.released_amount += total_released;
         update_merchant_volume_and_tier(&env, &record.seller, total_released);
@@ -9710,6 +9821,11 @@ impl EscrowContract {
         }
         record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
+
+        for (recipient, net) in transfers.iter() {
+            token_client.transfer(&env.current_contract_address(), &recipient, &net);
+        }
+        Self::distribute_fee(&env, &token_client, total_fee)?;
 
         // #45: A split release that exhausts the escrow balance is a terminal
         // payout path, so it reports the yield accrued over the holding period
@@ -13701,6 +13817,7 @@ mod error_code_allocation_tests {
     fn escrow_error_codes() -> [u32; 50] {
     fn escrow_error_codes() -> [u32; 52] {
     fn escrow_error_codes() -> [u32; 46] {
+    fn escrow_error_codes() -> [u32; 47] {
         [
             EscrowError::AlreadyInitialized as u32,
             EscrowError::NotFound as u32,
@@ -14252,6 +14369,7 @@ mod error_code_allocation_tests {
         let result = client.try_approve_emergency_rescue(&escrow_id, &not_admin);
         assert_eq!(result, Err(Ok(EscrowError::Unauthorized)));
             EscrowError::MathOverflow as u32,
+            EscrowError::ReentrancyDetected as u32,
         ]
     }
 
