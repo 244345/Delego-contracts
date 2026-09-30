@@ -793,6 +793,25 @@ pub struct UpgradeProposal {
     pub executed: bool,
 }
 
+/// Pending emergency rescue proposal for an escrow stranded by a broken token contract.
+///
+/// Created by an admin and requires multi-sig approval plus a 14-day timelock
+/// before funds can be rescued via `emergency_rescue_stalled_escrow`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyRescueProposal {
+    /// The escrow ID being rescued.
+    pub escrow_id: u64,
+    /// Destination address for recovered funds.
+    pub recovery_destination: Address,
+    /// Ledger timestamp when the proposal was created.
+    pub proposed_at: u64,
+    /// Multi-sig approvals from admin co-signers.
+    pub approvals: Vec<Address>,
+    /// Whether the rescue has been executed.
+    pub executed: bool,
+}
+
 /// Emitted when an admin proposes a contract upgrade (issue #292).
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -841,6 +860,24 @@ pub struct TokenAllowlistUpdatedEvent {
     pub token: Address,
     /// `true` when the token was added to the allowlist, `false` when removed.
     pub allowed: bool,
+/// Emitted when an escrow is rescued via emergency intervention due to a broken external token contract.
+/// This event indicates that governance has recovered stranded funds through the timelock-protected
+/// emergency rescue mechanism.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EscrowEmergencyRescuedEvent {
+    /// Unique identifier for the rescued escrow.
+    pub escrow_id: u64,
+    /// Original token contract that failed or became defunct.
+    pub original_token: Address,
+    /// Amount recovered from the stranded escrow.
+    pub amount_recovered: i128,
+    /// Address where recovered funds were sent.
+    pub recovery_destination: Address,
+    /// Admin(s) who authorized the emergency rescue.
+    pub authorized_by: Address,
+    /// Ledger timestamp when the rescue was executed.
+    pub rescued_at: u64,
 }
 
 /// Optional metadata hash stored on escrow creation for off-chain order verification.
@@ -1398,6 +1435,8 @@ pub enum DataKey {
     MerkleRoot(u64),
     /// Buyer inspection period configuration for an escrow (issue #356).
     InspectionPeriodConfig(u64),
+    /// Emergency rescue proposal for a stranded escrow (issue #365).
+    EmergencyRescueProposal(u64),
 }
 
 // `export = false` suppresses the generated `contractspecv0` entry for this
@@ -1529,6 +1568,16 @@ pub enum DataKey {
 // | 446 | InspectionConfigNotSet | next major |
 // | 447 | InspectionAutoReleaseNotReady | next major |
 // | 448+ | Reserved for new variants | next major |
+// | 407 | UpgradeProposalExists | next major |
+// | 408 | UpgradeProposalNotFound | next major |
+// | 409 | UpgradeTimelockActive | next major |
+// | 410 | UpgradeHashMismatch | next major |
+// | 411 | EmergencyRescueProposalNotFound | next major |
+// | 412 | EmergencyRescueTimelockNotElapsed | next major |
+// | 413 | EmergencyRescueThresholdNotMet | next major |
+// | 414 | EmergencyRescueAlreadyExecuted | next major |
+// | 415 | EscrowNotEligibleForRescue | next major |
+// | 416+ | Reserved for new variants | next major |
 //
 // # Allocating new variants
 //
@@ -1996,6 +2045,16 @@ impl soroban_sdk::TryFromVal<soroban_sdk::Env, EscrowError> for soroban_sdk::Val
         let error: soroban_sdk::Error = val.into();
         Ok(error.into())
     }
+    /// Emergency rescue proposal not found for the given escrow.
+    EmergencyRescueProposalNotFound = 411,
+    /// Emergency rescue timelock period has not yet elapsed.
+    EmergencyRescueTimelockNotElapsed = 412,
+    /// Multi-sig approval threshold not reached for emergency rescue.
+    EmergencyRescueThresholdNotMet = 413,
+    /// Emergency rescue has already been executed for this escrow.
+    EmergencyRescueAlreadyExecuted = 414,
+    /// Escrow is not eligible for emergency rescue (must be in Funded or Disputed status).
+    EscrowNotEligibleForRescue = 415,
 }
 
 /// Compact receipt returned to buyers after escrow creation via `get_receipt`.
@@ -2243,6 +2302,8 @@ pub const VOLUME_WINDOW_SECS: u64 = 2_592_000; // 30 days
 /// Tier updates are admin-only; the flag exists so the future "locked"
 /// lifecycle has a storage slot to write (issue #328).
 pub const TIER_LOCK_UNSET: u32 = 0;
+/// Delay between an emergency rescue proposal and its earliest execution (14 days).
+pub const EMERGENCY_RESCUE_TIMELOCK_SECS: u64 = 1_209_600;
 
 fn check_not_terminal(record: &EscrowRecord) -> Result<(), EscrowError> {
     match record.status {
@@ -9030,6 +9091,261 @@ impl EscrowContract {
     pub fn get_pending_admin(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::PendingAdmin)
     }
+
+    /// Propose an emergency rescue for an escrow stranded by a broken or paused token contract.
+    /// 
+    /// Only admins can propose rescues. The proposal triggers a 14-day timelock and requires
+    /// multi-sig approval from co-admins before funds can be recovered.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `escrow_id` - The ID of the escrow to rescue
+    /// * `recovery_destination` - Address where recovered funds should be sent
+    /// * `proposer` - Admin address proposing the rescue (must be an admin or co-admin)
+    ///
+    /// # Returns
+    ///
+    /// A `Result` that contains `true` if the proposal was created successfully, or
+    /// an `EscrowError` if validation failed.
+    ///
+    /// # Errors
+    ///
+    /// * `Unauthorized` - if caller is not an admin
+    /// * `NotFound` - if the escrow does not exist
+    /// * `EscrowNotEligibleForRescue` - if escrow is in terminal or invalid state
+    /// * `InvalidAddress` - if recovery_destination is zero/invalid
+    pub fn propose_emergency_rescue(
+        env: Env,
+        escrow_id: u64,
+        recovery_destination: Address,
+        proposer: Address,
+    ) -> Result<bool, EscrowError> {
+        proposer.require_auth();
+        if !Self::is_admin(env.clone(), proposer.clone()) {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        // Validate recovery destination
+        if is_zero_address(&env, &recovery_destination) {
+            return Err(EscrowError::InvalidAddress);
+        }
+
+        // Get the escrow record
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+
+        // Only Funded or Disputed escrows can be rescued
+        match record.status {
+            EscrowStatus::Funded | EscrowStatus::Disputed => {}
+            _ => return Err(EscrowError::EscrowNotEligibleForRescue),
+        }
+
+        // Create the proposal
+        let proposal = EmergencyRescueProposal {
+            escrow_id,
+            recovery_destination: recovery_destination.clone(),
+            proposed_at: env.ledger().timestamp(),
+            approvals: {
+                let mut vec = soroban_sdk::Vec::new(&env);
+                vec.push_back(proposer.clone());
+                vec
+            },
+            executed: false,
+        };
+
+        env.storage().persistent().set(
+            &DataKey::EmergencyRescueProposal(escrow_id),
+            &proposal,
+        );
+
+        Ok(true)
+    }
+
+    /// Approve a pending emergency rescue proposal.
+    ///
+    /// Co-admins can approve rescue proposals. Once enough approvals are collected
+    /// (meeting the upgrade threshold) and the 14-day timelock elapses, the rescue
+    /// can be executed.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `escrow_id` - The ID of the escrow with a pending rescue proposal
+    /// * `approver` - Co-admin address approving the rescue
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing the current approval count if successful.
+    ///
+    /// # Errors
+    ///
+    /// * `Unauthorized` - if caller is not an admin
+    /// * `EmergencyRescueProposalNotFound` - if no proposal exists for this escrow
+    /// * `EmergencyRescueAlreadyExecuted` - if the rescue has already been executed
+    pub fn approve_emergency_rescue(
+        env: Env,
+        escrow_id: u64,
+        approver: Address,
+    ) -> Result<u32, EscrowError> {
+        approver.require_auth();
+        if !Self::is_admin(env.clone(), approver.clone()) {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        let proposal_key = DataKey::EmergencyRescueProposal(escrow_id);
+        let mut proposal: EmergencyRescueProposal = env
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .ok_or(EscrowError::EmergencyRescueProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(EscrowError::EmergencyRescueAlreadyExecuted);
+        }
+
+        // Add approval if not already approved by this admin
+        if !proposal.approvals.contains(&approver) {
+            proposal.approvals.push_back(approver);
+        }
+
+        env.storage().persistent().set(&proposal_key, &proposal);
+        Ok(proposal.approvals.len())
+    }
+
+    /// Execute an emergency rescue for a stranded escrow.
+    ///
+    /// Rescues funds from an escrow whose underlying token contract is broken or defunct.
+    /// Requires:
+    /// 1. A valid rescue proposal to exist
+    /// 2. The 14-day timelock to have elapsed since proposal
+    /// 3. Multi-sig approval threshold to be met
+    /// 4. The escrow to still be in Funded or Disputed status
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `escrow_id` - The ID of the escrow to rescue
+    /// * `caller` - Admin authorizing the rescue execution
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing `true` if the rescue was executed successfully.
+    ///
+    /// # Errors
+    ///
+    /// * `Unauthorized` - if caller is not an admin
+    /// * `NotFound` - if the escrow does not exist
+    /// * `EmergencyRescueProposalNotFound` - if no proposal exists
+    /// * `EmergencyRescueTimelockNotElapsed` - if 14 days haven't passed
+    /// * `EmergencyRescueThresholdNotMet` - if approval count is below threshold
+    /// * `EmergencyRescueAlreadyExecuted` - if already executed
+    /// * `EscrowNotEligibleForRescue` - if escrow is no longer eligible (terminal state)
+    pub fn emergency_rescue_stalled_escrow(
+        env: Env,
+        escrow_id: u64,
+        recovery_destination: Address,
+        caller: Address,
+    ) -> Result<(), EscrowError> {
+        caller.require_auth();
+        if !Self::is_admin(env.clone(), caller.clone()) {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        // Get the escrow
+        let escrow_key = DataKey::Escrow(escrow_id);
+        let mut record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&escrow_key)
+            .ok_or(EscrowError::NotFound)?;
+
+        // Check escrow is still eligible for rescue
+        match record.status {
+            EscrowStatus::Funded | EscrowStatus::Disputed => {}
+            _ => return Err(EscrowError::EscrowNotEligibleForRescue),
+        }
+
+        // Get the proposal
+        let proposal_key = DataKey::EmergencyRescueProposal(escrow_id);
+        let mut proposal: EmergencyRescueProposal = env
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .ok_or(EscrowError::EmergencyRescueProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(EscrowError::EmergencyRescueAlreadyExecuted);
+        }
+
+        // Check timelock has elapsed (14 days = 1_209_600 seconds)
+        let current_timestamp = env.ledger().timestamp();
+        if current_timestamp < proposal.proposed_at + EMERGENCY_RESCUE_TIMELOCK_SECS {
+            return Err(EscrowError::EmergencyRescueTimelockNotElapsed);
+        }
+
+        // Check multi-sig threshold is met
+        let threshold = Self::upgrade_threshold(&env);
+        if proposal.approvals.len() < threshold {
+            return Err(EscrowError::EmergencyRescueThresholdNotMet);
+        }
+
+        // Verify recovery destination matches proposal
+        if recovery_destination != proposal.recovery_destination {
+            return Err(EscrowError::InvalidAddress);
+        }
+
+        // Calculate amount to recover
+        let amount_to_recover = record.amount - record.released_amount - record.refunded_amount;
+
+        // Mark as executed before attempting token transfer (prevent reentrancy)
+        proposal.executed = true;
+        env.storage().persistent().set(&proposal_key, &proposal);
+
+        // Update escrow status to Refunded (to prevent further operations)
+        record.status = EscrowStatus::Refunded;
+        record.refunded_amount = record.amount;
+        record.updated_at = env.ledger().timestamp();
+        env.storage().persistent().set(&escrow_key, &record);
+
+        // Transfer funds directly to recovery destination
+        let token_client = soroban_sdk::token::Client::new(&env, &record.token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &recovery_destination,
+            &amount_to_recover,
+        );
+
+        // Emit the rescue event
+        env.events().publish(
+            ("escrow", "emergency_rescued", escrow_id),
+            EscrowEmergencyRescuedEvent {
+                escrow_id,
+                original_token: record.token,
+                amount_recovered: amount_to_recover,
+                recovery_destination,
+                authorized_by: caller,
+                rescued_at: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Get the current emergency rescue proposal for an escrow, if it exists.
+    ///
+    /// Returns `None` if no proposal has been created yet.
+    pub fn get_emergency_rescue_proposal(
+        env: Env,
+        escrow_id: u64,
+    ) -> Option<EmergencyRescueProposal> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EmergencyRescueProposal(escrow_id))
+    }
 }
 
 #[cfg(test)]
@@ -12090,6 +12406,7 @@ mod error_code_allocation_tests {
         (4_000, 4_999),
     ];
     fn escrow_error_codes() -> [u32; 61] {
+    fn escrow_error_codes() -> [u32; 50] {
         [
             EscrowError::AlreadyInitialized as u32,
             EscrowError::NotFound as u32,
@@ -12152,8 +12469,489 @@ mod error_code_allocation_tests {
             EscrowError::InspectionExpired as u32,
             EscrowError::InspectionConfigNotSet as u32,
             EscrowError::InspectionAutoReleaseNotReady as u32,
+            EscrowError::EmergencyRescueProposalNotFound as u32,
+            EscrowError::EmergencyRescueTimelockNotElapsed as u32,
+            EscrowError::EmergencyRescueThresholdNotMet as u32,
+            EscrowError::EmergencyRescueAlreadyExecuted as u32,
+            EscrowError::EscrowNotEligibleForRescue as u32,
         ]
     }
+
+    /// ===== Emergency Rescue Tests =====
+
+    #[test]
+    fn propose_emergency_rescue_requires_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let not_admin = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let recovery_destination = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        let token = env.register_stellar_asset_contract(admin.clone());
+        let token_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_client.mint(&buyer, &1000i128);
+
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 0u32,
+            treasury: treasury.clone(),
+            min_amount: 1i128,
+            max_amount: 1000i128,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[0u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer,
+            &seller,
+            &token,
+            &100i128,
+            &order_id,
+            &1000u32,
+            &None::<BytesN<32>>,
+            &None::<Symbol>,
+        );
+
+        // Non-admin cannot propose rescue
+        let result = client.try_propose_emergency_rescue(
+            &escrow_id,
+            &recovery_destination,
+            &not_admin,
+        );
+        assert_eq!(result, Err(Ok(EscrowError::Unauthorized)));
+    }
+
+    #[test]
+    fn propose_emergency_rescue_rejects_invalid_destination() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        let token = env.register_stellar_asset_contract(admin.clone());
+        let token_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_client.mint(&buyer, &1000i128);
+
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 0u32,
+            treasury: treasury.clone(),
+            min_amount: 1i128,
+            max_amount: 1000i128,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[0u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer,
+            &seller,
+            &token,
+            &100i128,
+            &order_id,
+            &1000u32,
+            &None::<BytesN<32>>,
+            &None::<Symbol>,
+        );
+
+        // Zero address should be rejected
+        let zero_addr = Address::from_str(&env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF");
+        let result = client.try_propose_emergency_rescue(
+            &escrow_id,
+            &zero_addr,
+            &admin,
+        );
+        assert_eq!(result, Err(Ok(EscrowError::InvalidAddress)));
+    }
+
+    #[test]
+    fn propose_emergency_rescue_only_for_funded_or_disputed() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let recovery_destination = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        let token = env.register_stellar_asset_contract(admin.clone());
+        let token_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_client.mint(&buyer, &1000i128);
+
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 0u32,
+            treasury: treasury.clone(),
+            min_amount: 1i128,
+            max_amount: 1000i128,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[0u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer,
+            &seller,
+            &token,
+            &100i128,
+            &order_id,
+            &1000u32,
+            &None::<BytesN<32>>,
+            &None::<Symbol>,
+        );
+
+        // Release the escrow to make it terminal
+        client.release(&escrow_id, &seller);
+
+        // Cannot propose rescue for released escrow
+        let result = client.try_propose_emergency_rescue(
+            &escrow_id,
+            &recovery_destination,
+            &admin,
+        );
+        assert_eq!(result, Err(Ok(EscrowError::EscrowNotEligibleForRescue)));
+    }
+
+    #[test]
+    fn emergency_rescue_requires_timelock_elapsed() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let co_admin = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let recovery_destination = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        let token = env.register_stellar_asset_contract(admin.clone());
+        let token_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_client.mint(&buyer, &1000i128);
+
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 0u32,
+            treasury: treasury.clone(),
+            min_amount: 1i128,
+            max_amount: 1000i128,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.add_token(&admin, &token);
+        client.add_co_admin(&admin, &co_admin);
+
+        let order_id = BytesN::from_array(&env, &[0u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer,
+            &seller,
+            &token,
+            &100i128,
+            &order_id,
+            &1000u32,
+            &None::<BytesN<32>>,
+            &None::<Symbol>,
+        );
+
+        // Create proposal
+        client.propose_emergency_rescue(&escrow_id, &recovery_destination, &admin);
+
+        // Approve
+        client.approve_emergency_rescue(&escrow_id, &co_admin);
+
+        // Try to execute before timelock - should fail
+        let result = client.try_emergency_rescue_stalled_escrow(
+            &escrow_id,
+            &recovery_destination,
+            &admin,
+        );
+        assert_eq!(result, Err(Ok(EscrowError::EmergencyRescueTimelockNotElapsed)));
+    }
+
+    #[test]
+    fn emergency_rescue_requires_threshold_approvals() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let recovery_destination = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        let token = env.register_stellar_asset_contract(admin.clone());
+        let token_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_client.mint(&buyer, &1000i128);
+
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 0u32,
+            treasury: treasury.clone(),
+            min_amount: 1i128,
+            max_amount: 1000i128,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[0u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer,
+            &seller,
+            &token,
+            &100i128,
+            &order_id,
+            &1000u32,
+            &None::<BytesN<32>>,
+            &None::<Symbol>,
+        );
+
+        // Create proposal (proposer counts as first approval)
+        client.propose_emergency_rescue(&escrow_id, &recovery_destination, &admin);
+
+        // With default threshold of 2, we need at least 2 approvals
+        // Skip timelock for this test by directly advancing ledger time
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + EMERGENCY_RESCUE_TIMELOCK_SECS + 1);
+
+        // Try with only proposer approval - should fail
+        let result = client.try_emergency_rescue_stalled_escrow(
+            &escrow_id,
+            &recovery_destination,
+            &admin,
+        );
+        assert_eq!(result, Err(Ok(EscrowError::EmergencyRescueThresholdNotMet)));
+    }
+
+    #[test]
+    fn emergency_rescue_executes_successfully_with_valid_proposal() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let co_admin = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let recovery_destination = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        let token = env.register_stellar_asset_contract(admin.clone());
+        let token_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_client.mint(&buyer, &1000i128);
+
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 0u32,
+            treasury: treasury.clone(),
+            min_amount: 1i128,
+            max_amount: 1000i128,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.add_token(&admin, &token);
+        client.add_co_admin(&admin, &co_admin);
+
+        let order_id = BytesN::from_array(&env, &[0u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer,
+            &seller,
+            &token,
+            &100i128,
+            &order_id,
+            &1000u32,
+            &None::<BytesN<32>>,
+            &None::<Symbol>,
+        );
+
+        // Propose and approve
+        client.propose_emergency_rescue(&escrow_id, &recovery_destination, &admin);
+        client.approve_emergency_rescue(&escrow_id, &co_admin);
+
+        // Skip the timelock
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + EMERGENCY_RESCUE_TIMELOCK_SECS + 1);
+
+        // Execute rescue
+        let result = client.try_emergency_rescue_stalled_escrow(
+            &escrow_id,
+            &recovery_destination,
+            &admin,
+        );
+        assert!(result.is_ok());
+
+        // Verify escrow is now refunded
+        let record = client.get_escrow(&escrow_id);
+        assert_eq!(record.status, EscrowStatus::Refunded);
+        assert_eq!(record.refunded_amount, 100i128);
+
+        // Verify proposal is marked as executed
+        let proposal = client.get_emergency_rescue_proposal(&escrow_id);
+        assert!(proposal.is_some());
+        assert!(proposal.unwrap().executed);
+    }
+
+    #[test]
+    fn emergency_rescue_prevents_double_execution() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let co_admin = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let recovery_destination = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        let token = env.register_stellar_asset_contract(admin.clone());
+        let token_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_client.mint(&buyer, &1000i128);
+
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 0u32,
+            treasury: treasury.clone(),
+            min_amount: 1i128,
+            max_amount: 1000i128,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.add_token(&admin, &token);
+        client.add_co_admin(&admin, &co_admin);
+
+        let order_id = BytesN::from_array(&env, &[0u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer,
+            &seller,
+            &token,
+            &100i128,
+            &order_id,
+            &1000u32,
+            &None::<BytesN<32>>,
+            &None::<Symbol>,
+        );
+
+        // Propose and approve
+        client.propose_emergency_rescue(&escrow_id, &recovery_destination, &admin);
+        client.approve_emergency_rescue(&escrow_id, &co_admin);
+
+        // Skip timelock
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + EMERGENCY_RESCUE_TIMELOCK_SECS + 1);
+
+        // First execution succeeds
+        assert!(client
+            .try_emergency_rescue_stalled_escrow(&escrow_id, &recovery_destination, &admin)
+            .is_ok());
+
+        // Second execution fails
+        let result = client.try_emergency_rescue_stalled_escrow(
+            &escrow_id,
+            &recovery_destination,
+            &admin,
+        );
+        assert_eq!(result, Err(Ok(EscrowError::EmergencyRescueAlreadyExecuted)));
+    }
+
+    #[test]
+    fn get_emergency_rescue_proposal_returns_none_when_not_exists() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        let token = env.register_stellar_asset_contract(admin.clone());
+        let token_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_client.mint(&buyer, &1000i128);
+
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 0u32,
+            treasury: treasury.clone(),
+            min_amount: 1i128,
+            max_amount: 1000i128,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[0u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer,
+            &seller,
+            &token,
+            &100i128,
+            &order_id,
+            &1000u32,
+            &None::<BytesN<32>>,
+            &None::<Symbol>,
+        );
+
+        // No proposal exists yet
+        let proposal = client.get_emergency_rescue_proposal(&escrow_id);
+        assert!(proposal.is_none());
+    }
+
+    #[test]
+    fn approve_emergency_rescue_requires_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let not_admin = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let recovery_destination = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        let token = env.register_stellar_asset_contract(admin.clone());
+        let token_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_client.mint(&buyer, &1000i128);
+
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 0u32,
+            treasury: treasury.clone(),
+            min_amount: 1i128,
+            max_amount: 1000i128,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[0u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer,
+            &seller,
+            &token,
+            &100i128,
+            &order_id,
+            &1000u32,
+            &None::<BytesN<32>>,
+            &None::<Symbol>,
+        );
+
+        // Create proposal
+        client.propose_emergency_rescue(&escrow_id, &recovery_destination, &admin);
+
+        // Non-admin cannot approve
+        let result = client.try_approve_emergency_rescue(&escrow_id, &not_admin);
+        assert_eq!(result, Err(Ok(EscrowError::Unauthorized)));
+    }
+
     #[test]
     fn escrow_error_codes_are_unique() {
         let mut codes = escrow_error_codes();
