@@ -108,6 +108,10 @@ pub const MAX_RELAYER_FEE_BPS: u32 = 100;
 pub const MAX_ABSOLUTE_RELAYER_STROOPS: i128 = 10_000_000;
 /// Number of ledgers a permission must be expired before it can be pruned by a keeper (issue #374).
 pub const PRUNE_EXPIRATION_THRESHOLD_LEDGERS: u32 = 100_000;
+/// Maximum depth of a parent-delegation hierarchy. A child permission's
+/// `depth_level` must be strictly less than this value to be created.
+pub const MAX_HIERARCHY_DEPTH: u32 = 3;
+
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -193,6 +197,8 @@ pub enum PermissionError {
     NotInitialized = 2500,
     /// Allowance sweep targeted a delegation that is still live
     DelegationNotExpired = 2414,
+    /// A child permission grant would exceed `MAX_HIERARCHY_DEPTH`
+    MaxHierarchyDepthExceeded = 2414,
 }
 
 #[cfg(test)]
@@ -243,6 +249,7 @@ mod error_code_tests {
         PermissionError::UnauthorizedFunction as u32,
         PermissionError::NotInitialized as u32,
         PermissionError::DelegationNotExpired as u32,
+        PermissionError::MaxHierarchyDepthExceeded as u32,
     ];
 
     #[test]
@@ -361,6 +368,20 @@ pub struct PermissionRecord {
     /// issue describes as `parent_permission`.
     pub parent_delegate: Option<Address>,
 }
+/// Metadata describing a permission's position in a delegation hierarchy.
+///
+/// `root_owner` is the top-level owner of the chain, `parent_permission_id`
+/// is reserved for callers that key permissions by id (currently `None`),
+/// and `depth_level` is the number of parent hops above this permission
+/// (top-level grants have `depth_level == 0`).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HierarchyMetadata {
+    pub root_owner: Address,
+    pub parent_permission_id: Option<u64>,
+    pub depth_level: u32,
+}
+
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1111,6 +1132,8 @@ pub fn compute_expiry_ledger(current: u32, ttl: u32) -> Result<u32, PermissionEr
     current
         .checked_add(ttl)
         .ok_or(PermissionError::InvalidExpiry)
+    /// Delegation-hierarchy metadata for a (owner, delegate) permission.
+    Hierarchy(Address, Address),
 }
 
 #[contract]
@@ -1555,6 +1578,21 @@ impl PermissionsContract {
         if limit_total > parent_remaining || limit_per_tx > parent_record.limit_per_tx {
             return Err(PermissionError::ExceedsParentLimit);
         }
+        // Enforce the maximum delegation hierarchy depth. A child's depth is
+        // one greater than its parent's; reject before any state is written
+        // so a chain can never exceed `MAX_HIERARCHY_DEPTH` levels.
+        let parent_depth = Self::hierarchy_depth(
+            &env,
+            &parent_owner,
+            &parent_delegate,
+        );
+        let child_depth = parent_depth
+            .checked_add(1)
+            .ok_or(PermissionError::MaxHierarchyDepthExceeded)?;
+        if child_depth >= MAX_HIERARCHY_DEPTH {
+            return Err(PermissionError::MaxHierarchyDepthExceeded);
+        }
+
 
         let requested_expiry = Self::grant_expiry_ledger(&env, ttl_ledgers)?;
         let expires_at_ledger = requested_expiry.min(parent_record.expires_at_ledger);
@@ -1586,6 +1624,18 @@ impl PermissionsContract {
             &DataKey::DelegatePermissions(child_delegate.clone()),
             &parent_delegate,
         );
+        // Record the child's hierarchy metadata so descendants can compute
+        // their own depth without re-walking the whole parent chain.
+        let root_owner = Self::hierarchy_root_owner(&env, &parent_owner, &parent_delegate);
+        env.storage().persistent().set(
+            &DataKey::Hierarchy(parent_delegate.clone(), child_delegate.clone()),
+            &HierarchyMetadata {
+                root_owner,
+                parent_permission_id: None,
+                depth_level: child_depth,
+            },
+        );
+
 
         let children_key = DataKey::Children(parent_owner, parent_delegate.clone());
         let mut children: Vec<Address> = env
@@ -1663,6 +1713,44 @@ impl PermissionsContract {
             Err(PermissionError::PermissionNotFound)
         }
     }
+    /// Returns the `depth_level` recorded for the permission keyed by
+    /// `(owner, delegate)`, or `0` when no hierarchy metadata exists (i.e.
+    /// the permission is a top-level grant).
+    fn hierarchy_depth(env: &Env, owner: &Address, delegate: &Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get::<DataKey, HierarchyMetadata>(&DataKey::Hierarchy(
+                owner.clone(),
+                delegate.clone(),
+            ))
+            .map(|m| m.depth_level)
+            .unwrap_or(0)
+    }
+
+    /// Returns the `root_owner` for the permission keyed by `(owner, delegate)`,
+    /// falling back to `owner` itself when no hierarchy metadata exists.
+    fn hierarchy_root_owner(env: &Env, owner: &Address, delegate: &Address) -> Address {
+        env.storage()
+            .persistent()
+            .get::<DataKey, HierarchyMetadata>(&DataKey::Hierarchy(
+                owner.clone(),
+                delegate.clone(),
+            ))
+            .map(|m| m.root_owner)
+            .unwrap_or_else(|| owner.clone())
+    }
+
+    /// Returns the recorded hierarchy metadata for a permission, if any.
+    pub fn get_hierarchy_metadata(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+    ) -> Option<HierarchyMetadata> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Hierarchy(owner, delegate))
+    }
+
 
     /// Transfer a permission from one delegate to another, preserving spending limits and history.
     ///
