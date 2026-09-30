@@ -39,6 +39,34 @@ const _PENDING_DEC: Symbol = symbol_short!("PEND_DEC");
 pub const CONTRACT_NAME: &str = "delego_perms";
 pub const CONTRACT_SEMVER: &str = "0_1_0";
 
+/// Computes the canonical, version-bound domain separator for this contract
+/// deployment.
+///
+/// The separator binds signed meta-transaction payloads to both the concrete
+/// contract address and the contract's semver string, so a signature produced
+/// against one deployment/version cannot be replayed against another after a
+/// WASM upgrade (issue: strict domain separator hash invalidation).
+///
+/// Layout: `sha256( contract_address_xdr || "PERM_V2" || semver_xdr )`.
+pub fn compute_versioned_domain_separator(env: &Env) -> BytesN<32> {
+    let mut payload = soroban_sdk::Bytes::new(env);
+    payload.append(&env.current_contract_address().to_xdr(env));
+    payload.append(&symbol_short!("PERM_V2").to_xdr(env));
+    payload.append(&Symbol::new(env, CONTRACT_SEMVER).to_xdr(env));
+    env.crypto().sha256(&payload).into()
+}
+
+/// Builds the exact byte string a delegate signs for a relayed spend: the
+/// versioned domain separator followed by the XDR-encoded message. Binding
+/// the separator into the signed payload is what makes signatures strictly
+/// version-scoped.
+fn relayed_spend_signing_payload(env: &Env, message: &RelayedSpendMessage) -> soroban_sdk::Bytes {
+    let mut payload = soroban_sdk::Bytes::new(env);
+    payload.append(&compute_versioned_domain_separator(env).into());
+    payload.append(&message.to_xdr(env));
+    payload
+}
+
 /// Maximum number of merchant addresses allowed in a permission's whitelist.
 /// Prevents overly large merchant lists from increasing storage and execution
 /// costs unexpectedly.

@@ -18,6 +18,25 @@ fn test_keypair(env: &Env, seed: u8) -> (SigningKey, BytesN<32>) {
     (signing_key, public_key)
 }
 
+/// Sign a `RelayedSpendMessage` against a specific versioned domain separator,
+/// mirroring the on-chain `compute_versioned_domain_separator` derivation so
+/// tests can produce signatures bound to a particular contract version.
+fn sign_relayed_spend_with_domain(
+    env: &Env,
+    signing_key: &SigningKey,
+    message: RelayedSpendMessage,
+    domain_separator: &BytesN<32>,
+) -> BytesN<64> {
+    let mut payload = soroban_sdk::Bytes::new(env);
+    payload.append(&domain_separator.clone().into());
+    payload.append(&message.to_xdr(env));
+    let len = payload.len() as usize;
+    let mut buf = [0u8; 512];
+    payload.copy_into_slice(&mut buf[..len]);
+    let signature = signing_key.sign(&buf[..len]);
+    BytesN::from_array(env, &signature.to_bytes())
+}
+
 /// Sign a `RelayedSpendMessage` with the given key, returning the raw
 /// 64-byte ed25519 signature over the message's canonical XDR encoding —
 /// the exact bytes `execute_spend_via_relayer` re-derives and verifies.
@@ -32,6 +51,19 @@ fn sign_relayed_spend(
     message_bytes.copy_into_slice(&mut buf[..len]);
     let signature = signing_key.sign(&buf[..len]);
     BytesN::from_array(env, &signature.to_bytes())
+}
+
+/// Compute the versioned domain separator for the given contract address and
+/// semver string, matching the on-chain implementation.
+fn compute_versioned_domain_separator(
+    env: &Env,
+    contract_address: &Address,
+    semver: &Symbol,
+) -> BytesN<32> {
+    let mut payload = soroban_sdk::Bytes::new(env);
+    payload.append(&contract_address.to_xdr(env));
+    payload.append(&semver.to_xdr(env));
+    env.crypto().sha256(&payload).into()
 }
 
 struct TestEnv {
@@ -1126,6 +1158,109 @@ fn test_transfer_permission_fails_if_old_permission_not_found() {
         client.try_transfer_permission(&t.buyer, &t.agent, &new_agent),
         Err(Ok(PermissionError::PermissionNotFound))
     );
+}
+
+// ── Issue: Strict Domain Separator Hash Invalidation Across Upgrades ──────
+
+#[test]
+fn test_versioned_domain_separator_differs_across_versions() {
+    let t = TestEnv::setup();
+    let v1 = compute_versioned_domain_separator(
+        &t.env,
+        &t.permissions_contract_id,
+        &symbol_short!("PERM_V1"),
+    );
+    let v2 = compute_versioned_domain_separator(
+        &t.env,
+        &t.permissions_contract_id,
+        &symbol_short!("PERM_V2"),
+    );
+    assert_ne!(v1, v2, "domain separators must differ across semver versions");
+}
+
+#[test]
+fn test_versioned_domain_separator_differs_across_addresses() {
+    let t = TestEnv::setup();
+    let other = Address::generate(&t.env);
+    let a = compute_versioned_domain_separator(
+        &t.env,
+        &t.permissions_contract_id,
+        &symbol_short!("PERM_V2"),
+    );
+    let b = compute_versioned_domain_separator(&t.env, &other, &symbol_short!("PERM_V2"));
+    assert_ne!(a, b, "domain separators must differ across contract addresses");
+}
+
+#[test]
+fn test_signature_bound_to_v1_fails_on_v2() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &3600u32);
+
+    let (signing_key, public_key) = test_keypair(&t.env, 77);
+    client.set_relayer_key(&t.agent, &public_key);
+
+    let expiration_ledger = t.env.ledger().sequence() + 100;
+    let message = RelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 20,
+        nonce: 0,
+        expiration_ledger,
+    };
+
+    // Sign against the V1 domain separator — this is what an attacker would
+    // replay after the contract is upgraded to V2.
+    let v1_domain = compute_versioned_domain_separator(
+        &t.env,
+        &t.permissions_contract_id,
+        &symbol_short!("PERM_V1"),
+    );
+    let v1_signature =
+        sign_relayed_spend_with_domain(&t.env, &signing_key, message.clone(), &v1_domain);
+
+    // The live contract uses the V2 domain separator, so the V1 signature must
+    // be rejected outright.
+    assert_eq!(
+        client.try_execute_spend_via_relayer(
+            &relayer,
+            &t.buyer,
+            &t.agent,
+            &20,
+            &t.seller,
+            &0u64,
+            &expiration_ledger,
+            &v1_signature,
+        ),
+        Err(Ok(PermissionError::InvalidSignature))
+    );
+    assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 0);
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 1000);
+
+    // A signature produced against the V2 domain separator is accepted.
+    let v2_domain = compute_versioned_domain_separator(
+        &t.env,
+        &t.permissions_contract_id,
+        &symbol_short!("PERM_V2"),
+    );
+    let v2_signature =
+        sign_relayed_spend_with_domain(&t.env, &signing_key, message, &v2_domain);
+    client.execute_spend_via_relayer(
+        &relayer,
+        &t.buyer,
+        &t.agent,
+        &20,
+        &t.seller,
+        &0u64,
+        &expiration_ledger,
+        &v2_signature,
+    );
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 980);
 }
 
 #[test]

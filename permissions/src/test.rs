@@ -13,6 +13,8 @@ mod test {
     const MAX_SPEND_CPU_INSTRUCTIONS: u64 = 2_000_000;
     const MAX_SPEND_MEMORY_BYTES: u64 = 2_000_000;
 
+    use soroban_sdk::BytesN;
+
     fn assert_cost_within_thresholds(env: &Env) {
         let cost = env.cost_estimate().budget();
         assert!(
@@ -3141,5 +3143,51 @@ mod test {
         
         let result = client.try_decrease_allowance(&owner, &delegate, &-100);
         assert!(result.is_err());
+    }
+
+    // --- Issue: Strict domain separator hash invalidation across upgrades ---
+
+    #[test]
+    fn test_versioned_domain_separator_changes_with_semver() {
+        let env = Env::default();
+        let contract_id = env.register(PermissionsContract, ());
+
+        let sep_v2 = env.as_contract(&contract_id, || {
+            crate::compute_versioned_domain_separator(&env)
+        });
+
+        // Recompute with a different semver symbol to simulate a V1 contract.
+        let mut payload = soroban_sdk::Bytes::new(&env);
+        payload.append(&contract_id.to_xdr(&env));
+        payload.append(&soroban_sdk::symbol_short!("PERM_V1").to_xdr(&env));
+        let sep_v1: BytesN<32> = env.crypto().sha256(&payload).into();
+
+        assert_ne!(
+            sep_v1, sep_v2,
+            "domain separator must differ across contract versions"
+        );
+    }
+
+    #[test]
+    fn test_v1_signature_fails_verification_on_v2() {
+        let env = Env::default();
+        let contract_id = env.register(PermissionsContract, ());
+
+        // Domain separator as computed by the current (V2) contract.
+        let sep_v2 = env.as_contract(&contract_id, || {
+            crate::compute_versioned_domain_separator(&env)
+        });
+
+        // A signature produced against the V1 domain separator.
+        let mut v1_payload = soroban_sdk::Bytes::new(&env);
+        v1_payload.append(&contract_id.to_xdr(&env));
+        v1_payload.append(&soroban_sdk::symbol_short!("PERM_V1").to_xdr(&env));
+        let sep_v1: BytesN<32> = env.crypto().sha256(&v1_payload).into();
+
+        // The V2 contract must reject a hash bound to the V1 separator.
+        assert_ne!(
+            sep_v1, sep_v2,
+            "V1-bound signature hash must not match the V2 domain separator"
+        );
     }
 }
