@@ -2706,6 +2706,43 @@ impl MarketplaceContract {
         )
     }
 
+    /// Returns the merchant status for a given seller address, or `None` if
+    /// the address is not registered as a merchant owner.
+    ///
+    /// Used by the escrow contract to determine whether a seller has been
+    /// administratively suspended or banned by governance, which triggers the
+    /// selective buyer withdrawal (fraud restitution) path.
+    pub fn get_merchant_status_by_owner(
+        env: Env,
+        seller: Address,
+    ) -> Option<MerchantStatus> {
+        let merchant_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantOwner(seller))?;
+        let merchant: Merchant = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Merchant(merchant_id))?;
+        Some(merchant.status)
+    }
+
+    /// Returns `true` when the seller is a registered merchant whose status is
+    /// `Suspended` or `Banned`.
+    ///
+    /// The escrow contract calls this to allow buyers to bypass the remaining
+    /// timeout ledger and claim an immediate 100% refund of unreleased escrow
+    /// funds when the merchant has been administratively suspended or banned
+    /// for confirmed fraudulent activity. Addresses that are not registered
+    /// merchants return `false`, so honest active merchants and non-marketplace
+    /// sellers are unaffected.
+    pub fn is_merchant_suspended_or_banned(env: Env, seller: Address) -> bool {
+        match Self::get_merchant_status_by_owner(env, seller) {
+            Some(MerchantStatus::Suspended) | Some(MerchantStatus::Banned) => true,
+            _ => false,
+        }
+    }
+
     pub fn get_verifiers(env: Env) -> Vec<Verifier> {
         env.storage()
             .instance()
