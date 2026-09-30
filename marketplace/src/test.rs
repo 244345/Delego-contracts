@@ -3437,6 +3437,57 @@ fn test_ranked_discovery_orders_by_reputation_desc() {
                 description: String::from_str(&f.env, "Desc"),
                 category: symbol_short!("tech"),
                 image_url: String::from_str(&f.env, "url"),
+// ---------------------------------------------------------------------------
+// Appeal bond tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod appeal_bond_tests {
+    use crate::{
+        AppealResolution, MarketplaceContract, MarketplaceContractClient, MarketplaceError,
+        MerchantAppealBond, MerchantStatus, RegisterParams,
+    };
+    use soroban_sdk::{
+        symbol_short,
+        testutils::{Address as _, MockAuth, MockAuthInvoke},
+        token, Address, Env, String,
+    };
+
+    // -----------------------------------------------------------------------
+    // Helper: deploy a simple SAC-compatible token using the built-in test
+    // token contract and return its address together with a convenience client.
+    // -----------------------------------------------------------------------
+    fn deploy_token(env: &Env, admin: &Address) -> (Address, token::Client) {
+        let token_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let client = token::Client::new(env, &token_id);
+        (token_id, client)
+    }
+
+    fn configure_bond_token(
+        client: &MarketplaceContractClient,
+        admin: &Address,
+        token_id: &Address,
+    ) {
+        client.set_appeal_bond_token(admin, token_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper: register a merchant and immediately suspend it, returning the id.
+    // -----------------------------------------------------------------------
+    fn register_and_suspend(
+        env: &Env,
+        client: &MarketplaceContractClient,
+        admin: &Address,
+        name: &str,
+    ) -> (u64, Address) {
+        let owner = Address::generate(env);
+        let id = client.register_merchant(
+            &owner,
+            &RegisterParams {
+                name: String::from_str(env, name),
+                description: String::from_str(env, "Desc"),
+                category: symbol_short!("goods"),
+                image_url: String::from_str(env, "https://example.com/img.png"),
                 metadata: None,
                 metadata_uri: None,
                 required_verifications: 1,
@@ -3497,6 +3548,135 @@ fn test_ranked_discovery_stable_pagination_with_ties() {
                 description: String::from_str(&f.env, "Desc"),
                 category: symbol_short!("tech"),
                 image_url: String::from_str(&f.env, "url"),
+        client.suspend_merchant(admin, &id);
+        (id, owner)
+    }
+
+    // -----------------------------------------------------------------------
+    // Outcome A: appeal upheld → bond refunded, merchant reinstated
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_appeal_upheld_refunds_bond_and_reinstates_merchant() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register(MarketplaceContract, (admin.clone(),));
+        let client = MarketplaceContractClient::new(&env, &contract_id);
+
+        let (merchant_id, owner) = register_and_suspend(&env, &client, &admin, "Appeal Store A");
+
+        // Mint bond tokens to the owner.
+        let bond_amount: i128 = 1_000_000;
+        let (token_id, token_client) = deploy_token(&env, &admin);
+        configure_bond_token(&client, &admin, &token_id);
+        token_client.mint(&owner, &bond_amount);
+
+        // File the appeal.
+        client.file_merchant_suspension_appeal(&merchant_id, &bond_amount);
+
+        // Verify bond record created with Pending status.
+        let bond = client
+            .get_appeal_bond(&merchant_id)
+            .expect("appeal bond must exist after filing");
+        assert_eq!(bond.merchant_id, merchant_id);
+        assert_eq!(bond.bond_amount, bond_amount);
+        assert_eq!(bond.bond_token, token_id);
+        assert_eq!(bond.resolution_status, AppealResolution::Pending);
+
+        // Verify tokens left the owner's account.
+        assert_eq!(token_client.balance(&owner), 0);
+        assert_eq!(token_client.balance(&contract_id), bond_amount);
+
+        // Resolve: upheld → bond refunded, merchant reinstated.
+        client.resolve_merchant_appeal(
+            &admin,
+            &merchant_id,
+            &AppealResolution::UpheldAndReinstated,
+        );
+
+        // Bond record must reflect resolved status.
+        let resolved = client
+            .get_appeal_bond(&merchant_id)
+            .expect("bond record must persist after resolution");
+        assert_eq!(resolved.resolution_status, AppealResolution::UpheldAndReinstated);
+
+        // Owner gets their tokens back.
+        assert_eq!(token_client.balance(&owner), bond_amount);
+        assert_eq!(token_client.balance(&contract_id), 0);
+
+        // Merchant status must be Registered (was not verified before suspension).
+        let merchant = client.get_merchant(&merchant_id);
+        assert_eq!(merchant.status, MerchantStatus::Registered);
+    }
+
+    // -----------------------------------------------------------------------
+    // Outcome B: appeal rejected → bond slashed to treasury
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_appeal_rejected_slashes_bond_to_treasury() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register(MarketplaceContract, (admin.clone(),));
+        let client = MarketplaceContractClient::new(&env, &contract_id);
+
+        // Configure the appeal treasury (customer restitution pool).
+        let treasury = Address::generate(&env);
+        client.set_appeal_treasury(&admin, &treasury);
+
+        let (merchant_id, owner) = register_and_suspend(&env, &client, &admin, "Appeal Store B");
+
+        let bond_amount: i128 = 500_000;
+        let (token_id, token_client) = deploy_token(&env, &admin);
+        configure_bond_token(&client, &admin, &token_id);
+        token_client.mint(&owner, &bond_amount);
+
+        client.file_merchant_suspension_appeal(&merchant_id, &bond_amount);
+
+        // Resolve: rejected → bond slashed.
+        client.resolve_merchant_appeal(
+            &admin,
+            &merchant_id,
+            &AppealResolution::RejectedAndSlashed,
+        );
+
+        let resolved = client
+            .get_appeal_bond(&merchant_id)
+            .expect("bond record must persist after resolution");
+        assert_eq!(resolved.resolution_status, AppealResolution::RejectedAndSlashed);
+
+        // Treasury receives the full bond; owner loses it.
+        assert_eq!(token_client.balance(&treasury), bond_amount);
+        assert_eq!(token_client.balance(&owner), 0);
+        assert_eq!(token_client.balance(&contract_id), 0);
+
+        // Merchant remains suspended after a failed appeal.
+        let merchant = client.get_merchant(&merchant_id);
+        assert_eq!(merchant.status, MerchantStatus::Suspended);
+    }
+
+    // -----------------------------------------------------------------------
+    // Guard: cannot file an appeal for a non-suspended merchant
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_appeal_rejected_when_merchant_not_suspended() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register(MarketplaceContract, (admin.clone(),));
+        let client = MarketplaceContractClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let id = client.register_merchant(
+            &owner,
+            &RegisterParams {
+                name: String::from_str(&env, "Active Store"),
+                description: String::from_str(&env, "Desc"),
+                category: symbol_short!("tech"),
+                image_url: String::from_str(&env, "https://example.com/img.png"),
                 metadata: None,
                 metadata_uri: None,
                 required_verifications: 1,
@@ -3550,4 +3730,246 @@ fn test_ranked_discovery_cost_stays_within_thresholds() {
     );
     let _ = f.client.get_ranked_merchants(&None, &20);
     assert_discovery_cost_within_thresholds(&f.env);
+        // Not suspended — appeal must be rejected.
+        let (_, token_client) = deploy_token(&env, &admin);
+        token_client.mint(&owner, &1_000);
+
+        let err = client.try_file_merchant_suspension_appeal(&id, &1_000);
+        assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::MerchantNotSuspended);
+    }
+
+    #[test]
+    fn test_appeal_rejected_when_bond_token_is_not_configured() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register(MarketplaceContract, (admin.clone(),));
+        let client = MarketplaceContractClient::new(&env, &contract_id);
+        let (merchant_id, owner) =
+            register_and_suspend(&env, &client, &admin, "Unconfigured Bond Store");
+        let (_, token_client) = deploy_token(&env, &admin);
+        token_client.mint(&owner, &1_000);
+
+        let err = client.try_file_merchant_suspension_appeal(&merchant_id, &1_000);
+        assert_eq!(
+            err.unwrap_err().unwrap(),
+            MarketplaceError::AppealBondTokenNotSet
+        );
+        assert_eq!(token_client.balance(&owner), 1_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Guard: zero bond amount is rejected
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_appeal_rejects_zero_bond_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register(MarketplaceContract, (admin.clone(),));
+        let client = MarketplaceContractClient::new(&env, &contract_id);
+
+        let (id, _owner) = register_and_suspend(&env, &client, &admin, "Zero Bond Store");
+        let (token_id, _) = deploy_token(&env, &admin);
+
+        let err = client.try_file_merchant_suspension_appeal(&id, &0);
+        assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::ZeroBondAmount);
+    }
+
+    // -----------------------------------------------------------------------
+    // Guard: only one pending appeal allowed per merchant
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_duplicate_pending_appeal_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register(MarketplaceContract, (admin.clone(),));
+        let client = MarketplaceContractClient::new(&env, &contract_id);
+
+        let (id, owner) = register_and_suspend(&env, &client, &admin, "Dup Appeal Store");
+
+        let bond_amount: i128 = 200_000;
+        let (token_id, token_client) = deploy_token(&env, &admin);
+        configure_bond_token(&client, &admin, &token_id);
+        // Mint enough for two appeal attempts so the token check doesn't fire first.
+        token_client.mint(&owner, &(bond_amount * 2));
+
+        client.file_merchant_suspension_appeal(&id, &bond_amount);
+
+        let err = client.try_file_merchant_suspension_appeal(&id, &bond_amount);
+        assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::AppealAlreadyPending);
+    }
+
+    // -----------------------------------------------------------------------
+    // Guard: resolve without treasury configured → TreasuryNotSet on slash
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_slash_without_treasury_returns_treasury_not_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register(MarketplaceContract, (admin.clone(),));
+        let client = MarketplaceContractClient::new(&env, &contract_id);
+
+        // No treasury configured.
+        let (id, owner) = register_and_suspend(&env, &client, &admin, "No Treasury Store");
+
+        let bond_amount: i128 = 100_000;
+        let (token_id, token_client) = deploy_token(&env, &admin);
+        configure_bond_token(&client, &admin, &token_id);
+        token_client.mint(&owner, &bond_amount);
+
+        client.file_merchant_suspension_appeal(&id, &bond_amount);
+
+        let err = client.try_resolve_merchant_appeal(
+            &admin,
+            &id,
+            &AppealResolution::RejectedAndSlashed,
+        );
+        assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::TreasuryNotSet);
+    }
+
+    // -----------------------------------------------------------------------
+    // Guard: cannot resolve an already-resolved appeal
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_double_resolve_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register(MarketplaceContract, (admin.clone(),));
+        let client = MarketplaceContractClient::new(&env, &contract_id);
+
+        let treasury = Address::generate(&env);
+        client.set_appeal_treasury(&admin, &treasury);
+
+        let (id, owner) = register_and_suspend(&env, &client, &admin, "Double Resolve Store");
+
+        let bond_amount: i128 = 300_000;
+        let (token_id, token_client) = deploy_token(&env, &admin);
+        configure_bond_token(&client, &admin, &token_id);
+        token_client.mint(&owner, &bond_amount);
+
+        client.file_merchant_suspension_appeal(&id, &bond_amount);
+        client.resolve_merchant_appeal(&admin, &id, &AppealResolution::UpheldAndReinstated);
+
+        let err = client.try_resolve_merchant_appeal(
+            &admin,
+            &id,
+            &AppealResolution::UpheldAndReinstated,
+        );
+        assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::AppealAlreadyResolved);
+    }
+
+    // -----------------------------------------------------------------------
+    // Guard: passing Pending as resolution is rejected
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_resolve_with_pending_status_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register(MarketplaceContract, (admin.clone(),));
+        let client = MarketplaceContractClient::new(&env, &contract_id);
+
+        let (id, owner) = register_and_suspend(&env, &client, &admin, "Bad Resolve Store");
+
+        let (token_id, token_client) = deploy_token(&env, &admin);
+        configure_bond_token(&client, &admin, &token_id);
+        token_client.mint(&owner, &50_000);
+        client.file_merchant_suspension_appeal(&id, &50_000);
+
+        let err =
+            client.try_resolve_merchant_appeal(&admin, &id, &AppealResolution::Pending);
+        assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::InvalidParam);
+    }
+
+    // -----------------------------------------------------------------------
+    // Guard: non-admin cannot resolve an appeal
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_non_admin_cannot_resolve_appeal() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register(MarketplaceContract, (admin.clone(),));
+        let client = MarketplaceContractClient::new(&env, &contract_id);
+
+        let (id, owner) = register_and_suspend(&env, &client, &admin, "Auth Check Store");
+
+        let (token_id, token_client) = deploy_token(&env, &admin);
+        configure_bond_token(&client, &admin, &token_id);
+        token_client.mint(&owner, &100_000);
+        client.file_merchant_suspension_appeal(&id, &100_000);
+
+        let stranger = Address::generate(&env);
+        let err = client.try_resolve_merchant_appeal(
+            &stranger,
+            &id,
+            &AppealResolution::UpheldAndReinstated,
+        );
+        assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::Unauthorized);
+    }
+
+    // -----------------------------------------------------------------------
+    // Upheld: verified merchant is reinstated to Verified (not Registered)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_upheld_appeal_reinstates_verified_merchant_to_verified_status() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register(MarketplaceContract, (admin.clone(),));
+        let client = MarketplaceContractClient::new(&env, &contract_id);
+
+        // Register, verify, then suspend.
+        let owner = Address::generate(&env);
+        let id = client.register_merchant(
+            &owner,
+            &RegisterParams {
+                name: String::from_str(&env, "Verified Appeal Store"),
+                description: String::from_str(&env, "Desc"),
+                category: symbol_short!("tech"),
+                image_url: String::from_str(&env, "https://example.com/img.png"),
+                metadata: None,
+                metadata_uri: None,
+                required_verifications: 1,
+            },
+        );
+        let verifier = Address::generate(&env);
+        client.add_verifier(
+            &admin,
+            &crate::Verifier {
+                address: verifier.clone(),
+                label: symbol_short!("kyc"),
+                registered_at: 0,
+            },
+        );
+        client.verify_merchant(&id, &verifier);
+        assert_eq!(client.get_merchant(&id).status, MerchantStatus::Verified);
+
+        client.suspend_merchant(&admin, &id);
+        assert_eq!(client.get_merchant(&id).status, MerchantStatus::Suspended);
+
+        let bond_amount: i128 = 750_000;
+        let (token_id, token_client) = deploy_token(&env, &admin);
+        configure_bond_token(&client, &admin, &token_id);
+        token_client.mint(&owner, &bond_amount);
+
+        client.file_merchant_suspension_appeal(&id, &bond_amount);
+        client.resolve_merchant_appeal(&admin, &id, &AppealResolution::UpheldAndReinstated);
+
+        // Must be restored to Verified (not Registered) because verified == true.
+        assert_eq!(client.get_merchant(&id).status, MerchantStatus::Verified);
+        assert_eq!(token_client.balance(&owner), bond_amount);
+    }
 }
