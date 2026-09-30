@@ -396,6 +396,30 @@ fn test_release_with_wrong_recipient_fails() {
 }
 
 #[test]
+fn test_oracle_invocation_failure_returns_structured_error() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+
+    // Simulate a reverted/panicking oracle call by invoking evaluate_and_release
+    // against an oracle address that has no contract deployed.
+    let missing_oracle = Address::generate(&t.env);
+    let condition = symbol_short!("delivered");
+
+    assert_eq!(
+        escrow_client.try_evaluate_and_release(&escrow_id, &missing_oracle, &condition),
+        Err(Ok(EscrowError::OracleInvocationFailed))
+    );
+
+    // Contract must remain usable: escrow is still Funded and can be retried.
+    assert_eq!(
+        escrow_client.get_escrow(&escrow_id).status,
+        EscrowStatus::Funded
+    );
+}
+
+#[test]
 fn test_double_release_prevention() {
     let t = TestEnv::setup();
     let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
