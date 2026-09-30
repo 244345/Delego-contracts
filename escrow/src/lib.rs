@@ -1187,6 +1187,27 @@ pub struct BatchEscrowItem {
     pub timeout_ledger: u32,
 }
 
+/// One item for an atomic batch deposit that funds an existing escrow
+/// (issue #317). The buyer and token are supplied once for the whole batch.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchDepositItem {
+    /// Escrow to fund.
+    pub escrow_id: u64,
+    /// Positive amount to deposit into the escrow.
+    pub amount: i128,
+}
+
+/// Aggregate result returned by `batch_deposit`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchDepositResult {
+    /// Number of escrows funded by the batch.
+    pub funded_count: u32,
+    /// Sum of all item amounts transferred from the buyer.
+    pub total_deposited: i128,
+}
+
 /// One escrow's release request for `batch_release` (issue #317).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
