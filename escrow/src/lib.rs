@@ -30,6 +30,14 @@ use delego_interfaces::LendingPoolClient;
 // Formal verification specifications for escrow lifecycle invariants
 pub mod invariants;
 
+mod admin_actions;
+#[cfg(test)]
+mod admin_actions_test;
+pub use admin_actions::{
+    AdminAction, PendingAdminAction, QueuedAdminAction, ADMIN_ACTION_DELAY_LEDGERS,
+    ADMIN_ACTION_DELAY_SECONDS,
+};
+
 /// Lifecycle state of an escrow.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1747,6 +1755,14 @@ pub enum DataKey {
 // | 413 | MilestoneAlreadyReleased | next major |
 // | 414 | MilestoneReleaseRequired | next major |
 // | 415+ | Reserved for new variants | next major |
+// | 411 | GuardianNotSet | next major |
+// | 412 | GuardianAlreadySet | next major |
+// | 413 | AdminActionNotFound | next major |
+// | 414 | AdminActionLocked | next major |
+// | 415 | AdminActionVetoed | next major |
+// | 416 | AdminActionAlreadyQueued | next major |
+// | 417 | AdminActionOverflow | next major |
+// | 418+ | Reserved for new variants | next major |
 //
 // # Allocating new variants
 //
@@ -2262,6 +2278,20 @@ pub enum MultiOracleError {
     MilestoneAlreadyReleased = 413,
     /// Milestone escrows must be paid out through `release_milestone`.
     MilestoneReleaseRequired = 414,
+    /// Configure a guardian before proposing critical changes.
+    GuardianNotSet = 411,
+    /// Guardian bootstrap may only run once.
+    GuardianAlreadySet = 412,
+    /// No live proposal matches the requested action.
+    AdminActionNotFound = 413,
+    /// Both review thresholds must elapse before execution.
+    AdminActionLocked = 414,
+    /// The security guardian vetoed this proposal.
+    AdminActionVetoed = 415,
+    /// An identical proposal is already pending.
+    AdminActionAlreadyQueued = 416,
+    /// Proposal ID or review deadline would overflow.
+    AdminActionOverflow = 417,
 }
 
 /// Compact receipt returned to buyers after escrow creation via `get_receipt`.
@@ -2468,8 +2498,6 @@ const BUMP_RATE_LIMIT_LEDGERS: u32 = 100;
 const BUMP_BOUNTY_THRESHOLD_LEDGERS: u32 = 17_280; // ~1 day
 /// Keeper bounty amount instroked (small amount to incentivize maintenance).
 const KEEPER_BOUNTY_AMOUNT: i128 = 1_000_000; // 1 XLM equivalent (assuming 7 decimal tokens)
-/// Minimum ledgers of notice required before fee changes take effect.
-const FEE_NOTICE_WINDOW_LEDGERS: u32 = 10_000;
 /// Delay between an upgrade proposal and its earliest execution (48 hours).
 pub const UPGRADE_TIMELOCK_SECS: u64 = 172_800;
 /// Minimum (and default) number of admin approvals required to upgrade, so a
@@ -3746,6 +3774,7 @@ impl EscrowContract {
         if new_fee_bps > 1000 {
             return Err(EscrowError::InvalidFeeBps);
         }
+        admin_actions::consume(&env, AdminAction::Fee(new_fee_bps))?;
         let mut fee_config: FeeConfig = Self::get_fee_config(env.clone())?;
         fee_config.fee_bps = new_fee_bps;
         env.storage()
@@ -3760,29 +3789,6 @@ impl EscrowContract {
     /// Returns [`EscrowError::FeeConfigNotSet`] when the contract has not
     /// been initialized with fee configuration yet.
     pub fn get_fee_config(env: Env) -> Result<FeeConfig, EscrowError> {
-        // Check for pending scheduled update that is now effective
-        let current_ledger = env.ledger().sequence();
-        if let Some(scheduled) = env
-            .storage()
-            .instance()
-            .get::<_, ScheduledFeeUpdate>(&DataKey::ScheduledFeeUpdate)
-        {
-            if current_ledger >= scheduled.effective_ledger {
-                // Apply the scheduled update
-                let mut fee_config: FeeConfig = Self::get_fee_config(env.clone())?;
-                fee_config.fee_bps = scheduled.fee_bps;
-                fee_config.treasury = scheduled.treasury.clone();
-                env.storage()
-                    .instance()
-                    .set(&DataKey::FeeConfig, &fee_config);
-                // Clear the scheduled update
-                env.storage()
-                    .instance()
-                    .remove(&DataKey::ScheduledFeeUpdate);
-                return Ok(fee_config);
-            }
-        }
-
         env.storage()
             .instance()
             .get(&DataKey::FeeConfig)
@@ -3792,51 +3798,20 @@ impl EscrowContract {
     /// Schedule a fee update to take effect after the minimum notice window.
     ///
     /// Requires admin authentication and enforces a minimum notice period
-    /// of 10,000 ledgers before the new fee takes effect.
-    /// Emits [`ConfigChangeScheduledEvent`] when scheduled.
+    /// of 24 hours and 17,280 ledgers, subject to guardian veto.
+    /// Emits an `admin/queued` event with the proposal ID; execute that ID
+    /// explicitly with `execute_admin_action`. Getters never apply changes.
     pub fn schedule_fee_update(
         env: Env,
         admin: Address,
         new_fee_bps: u32,
         new_treasury: Address,
     ) -> Result<bool, EscrowError> {
-        admin.require_auth();
-        if !Self::is_admin(env.clone(), admin.clone()) {
-            return Err(EscrowError::Unauthorized);
-        }
-        if new_fee_bps > 1000 {
-            return Err(EscrowError::InvalidFeeBps);
-        }
-        if is_zero_address(&env, &new_treasury) {
-            return Err(EscrowError::InvalidAddress);
-        }
-
-        let current_ledger = env.ledger().sequence();
-        let effective_ledger = current_ledger
-            .checked_add(FEE_NOTICE_WINDOW_LEDGERS)
-            .ok_or(EscrowError::InvalidExtension)?;
-
-        let scheduled = ScheduledFeeUpdate {
-            fee_bps: new_fee_bps,
-            treasury: new_treasury.clone(),
-            effective_ledger,
-            scheduled_at_ledger: current_ledger,
-        };
-        env.storage()
-            .instance()
-            .set(&DataKey::ScheduledFeeUpdate, &scheduled);
-
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("fee_sched")),
-            ConfigChangeScheduledEvent {
-                fee_bps: new_fee_bps,
-                treasury: new_treasury,
-                effective_ledger,
-                scheduled_at_ledger: current_ledger,
-                scheduled_by: admin,
-            },
-        );
-
+        Self::queue_admin_action(
+            env,
+            admin,
+            AdminAction::FeeConfig(new_fee_bps, new_treasury),
+        )?;
         Ok(true)
     }
 
@@ -4062,6 +4037,7 @@ impl EscrowContract {
             return Err(EscrowError::InvalidFeeBps);
         }
 
+        admin_actions::consume(&env, AdminAction::FeeDistribution(shares.clone()))?;
         env.storage()
             .instance()
             .set(&DataKey::FeeDistribution, &shares);
@@ -4351,6 +4327,7 @@ impl EscrowContract {
         if !Self::is_admin(env.clone(), admin.clone()) {
             return Err(EscrowError::Unauthorized);
         }
+        admin_actions::consume(&env, AdminAction::AddToken(token_address.clone()))?;
 
         if Self::is_token_allowed(env.clone(), token_address.clone()) {
             return Ok(true);
@@ -4396,6 +4373,7 @@ impl EscrowContract {
         if !Self::is_admin(env.clone(), admin.clone()) {
             return Err(EscrowError::Unauthorized);
         }
+        admin_actions::consume(&env, AdminAction::RemoveToken(token_address.clone()))?;
 
         let index_opt: Option<u32> = env
             .storage()
@@ -10335,6 +10313,9 @@ mod escrow_feature_tests {
         Address,
         Address,
     ) {
+        soroban_sdk::testutils::Ledger::with_mut(&env.ledger(), |l| {
+            l.min_persistent_entry_ttl = PERSISTENT_BUMP_AMOUNT;
+        });
         env.mock_all_auths();
         let admin = Address::generate(env);
         let treasury = Address::generate(env);
@@ -10353,7 +10334,7 @@ mod escrow_feature_tests {
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(env, &contract_id);
         StellarAssetClient::new(env, &token).mint(&buyer, &10_000);
-        client.add_token(&admin, &token);
+        admin_actions_test::approve(&env, &client, &admin, AdminAction::AddToken(token.clone()));
         (client, admin, buyer, seller, token, contract_id)
     }
 
@@ -10515,7 +10496,12 @@ mod escrow_feature_tests {
             .address();
         let second_admin = soroban_sdk::token::StellarAssetClient::new(&env, &second_token);
         second_admin.mint(&buyer, &10_000);
-        client.add_token(&admin, &second_token);
+        admin_actions_test::approve(
+            &env,
+            &client,
+            &admin,
+            AdminAction::AddToken(second_token.clone()),
+        );
 
         let token_client = soroban_sdk::token::Client::new(&env, &token);
         let second_client = soroban_sdk::token::Client::new(&env, &second_token);
@@ -10642,6 +10628,9 @@ mod fee_distribution_tests {
     use soroban_sdk::testutils::Address as _;
 
     fn setup(env: &Env) -> (EscrowContractClient<'_>, Address, Address) {
+        soroban_sdk::testutils::Ledger::with_mut(&env.ledger(), |l| {
+            l.min_persistent_entry_ttl = PERSISTENT_BUMP_AMOUNT;
+        });
         let admin = Address::generate(env);
         let treasury = Address::generate(env);
         let config = EscrowConfig {
@@ -10718,7 +10707,12 @@ mod fee_distribution_tests {
             },
         ];
 
-        assert!(client.set_fee_distribution(&admin, &shares.clone()));
+        admin_actions_test::approve(
+            &env,
+            &client,
+            &admin,
+            AdminAction::FeeDistribution(shares.clone()),
+        );
         assert_eq!(client.get_fee_distribution(), shares);
     }
 }
@@ -11067,6 +11061,9 @@ mod metadata_tests {
     use soroban_sdk::testutils::Address as _;
 
     fn setup(env: &Env) -> (EscrowContractClient<'_>, Address, Address) {
+        soroban_sdk::testutils::Ledger::with_mut(&env.ledger(), |l| {
+            l.min_persistent_entry_ttl = PERSISTENT_BUMP_AMOUNT;
+        });
         let admin = Address::generate(env);
         let treasury = Address::generate(env);
         let config = EscrowConfig {
@@ -11088,7 +11085,7 @@ mod metadata_tests {
         let token = env
             .register_stellar_asset_contract_v2(token_admin)
             .address();
-        client.add_token(&admin, &token);
+        admin_actions_test::approve(&env, &client, &admin, AdminAction::AddToken(token.clone()));
         (client, admin, contract_id, token)
     }
 
@@ -13131,6 +13128,9 @@ mod quorum_cleanup_tests {
     #[test]
     fn dispute_votes_removed_after_quorum_resolution() {
         let env = Env::default();
+        soroban_sdk::testutils::Ledger::with_mut(&env.ledger(), |l| {
+            l.min_persistent_entry_ttl = PERSISTENT_BUMP_AMOUNT;
+        });
         env.mock_all_auths();
 
         let admin = Address::generate(&env);
@@ -13153,7 +13153,7 @@ mod quorum_cleanup_tests {
         };
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(&env, &contract_id);
-        client.add_token(&admin, &token);
+        admin_actions_test::approve(&env, &client, &admin, AdminAction::AddToken(token.clone()));
 
         let arbiters = soroban_sdk::vec![&env, arbiter1.clone(), arbiter2.clone()];
         client.set_quorum_config(&admin, &arbiters, &2u32);
@@ -13648,6 +13648,7 @@ mod error_code_allocation_tests {
     ];
     fn escrow_error_codes() -> [u32; 61] {
     fn escrow_error_codes() -> [u32; 50] {
+    fn escrow_error_codes() -> [u32; 52] {
         [
             EscrowError::AlreadyInitialized as u32,
             EscrowError::NotFound as u32,
@@ -13715,6 +13716,13 @@ mod error_code_allocation_tests {
             EscrowError::EmergencyRescueThresholdNotMet as u32,
             EscrowError::EmergencyRescueAlreadyExecuted as u32,
             EscrowError::EscrowNotEligibleForRescue as u32,
+            EscrowError::GuardianNotSet as u32,
+            EscrowError::GuardianAlreadySet as u32,
+            EscrowError::AdminActionNotFound as u32,
+            EscrowError::AdminActionLocked as u32,
+            EscrowError::AdminActionVetoed as u32,
+            EscrowError::AdminActionAlreadyQueued as u32,
+            EscrowError::AdminActionOverflow as u32,
         ]
     }
 

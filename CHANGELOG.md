@@ -30,6 +30,8 @@ will reject the change.
   multi-sig upgrade and merchant-category validation paths, add the missing `DataKey::MerkleRoot`
   storage key, correct an `into_val` call in merchant-category validation, and skip the XDR spec
   export for `EscrowError` (the spec format caps error enums at 50 cases).
+- Require a 24-hour vetoable review for escrow fee and token-whitelist changes, with authenticated guardian setup/rotation and explicit single-use execution (#329).
+
 - Add immutable daily delivery Merkle roots and order-bound inclusion-proof escrow release.
 - Add atomic batch escrow creation with per-token aggregate allowance transfers.
 - Add admin split dispute settlements with buyer, seller, and mediator payouts.

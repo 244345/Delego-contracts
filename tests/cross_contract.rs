@@ -57,6 +57,8 @@ struct TestEnv {
 impl TestEnv {
     fn setup() -> Self {
         let env = Env::default();
+        env.ledger()
+            .with_mut(|l| l.min_persistent_entry_ttl = 518_400);
         env.mock_all_auths_allowing_non_root_auth();
 
         let admin = Address::generate(&env);
@@ -86,7 +88,15 @@ impl TestEnv {
         let permissions_contract_id = env.register(PermissionsContract, ());
 
         let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
-        escrow_client.add_token(&admin, &token_contract_id);
+        escrow_client.set_security_guardian(&admin, &Address::generate(&env));
+        let action = delego_escrow::AdminAction::AddToken(token_contract_id.clone());
+        let id = escrow_client.queue_admin_action(&admin, &action);
+        let proposal = escrow_client.get_admin_action(&id).unwrap();
+        env.ledger().with_mut(|ledger| {
+            ledger.sequence_number = proposal.pending.unlock_ledger;
+            ledger.timestamp = proposal.unlock_timestamp;
+        });
+        escrow_client.execute_admin_action(&admin, &id);
 
         TestEnv {
             env,

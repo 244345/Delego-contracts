@@ -1130,3 +1130,13 @@ Before mainnet deployment, verify:
 ---
 
 **Last Updated**: September 2026
+### Escrow administrative review
+
+Escrow fee and token whitelist changes use typed `AdminAction` proposals.
+`PendingAdminAction` records the operation, payload commitment, unlock ledger,
+and veto flag; `QueuedAdminAction` also stores the typed arguments and a timestamp
+deadline. Both a 17,280-ledger delay and 24 hours must elapse before a current
+admin can execute. The independently authenticated guardian can veto until
+execution. All existing setters for these settings share the same atomic
+consume gate; the fee getter is read-only. See the escrow README for migration,
+guardian setup/rotation, events, and proposal lifecycle details.
