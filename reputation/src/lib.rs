@@ -14,8 +14,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String,
-    Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    IntoVal, InvokeError, String, Symbol, Vec,
 };
 
 #[contracttype]
@@ -94,6 +94,69 @@ pub enum TransactionOutcome {
     Disputed,
     ResolvedSeller,
     ResolvedBuyer,
+}
+
+/// Structural mirror of the escrow contract's `EscrowStatus` wire shape,
+/// used only to decode `get_escrow` responses when independently verifying a
+/// settlement before accepting a review (issue #286). Variant names must be
+/// kept in sync with `delego-escrow`'s `EscrowStatus`; the two contracts are
+/// deployed and versioned separately, so this is a deliberate ABI-level
+/// mirror rather than a shared Rust dependency (consistent with how this
+/// workspace's other cross-contract calls, e.g. the marketplace merchant
+/// check in `delego-escrow`, decode a minimal typed shape over
+/// `try_invoke_contract` instead of depending on the other contract's crate).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EscrowStatusMirror {
+    Created,
+    Funded,
+    Released,
+    Refunded,
+    Disputed,
+    Cancelled,
+}
+
+/// Structural mirror of the escrow contract's `EscrowRecord` wire shape
+/// (issue #286); see [`EscrowStatusMirror`] for why this mirrors rather than
+/// imports the type. Field names and types must stay in sync with
+/// `delego-escrow`'s `EscrowRecord` — Soroban decodes cross-contract struct
+/// values by field name, so any drift here makes verification calls fail
+/// closed (surfaced as `ReputationError::UnverifiedOrder`) rather than
+/// silently misinterpreting the response.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowRecordMirror {
+    pub escrow_id: u64,
+    pub buyer: Address,
+    pub seller: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub released_amount: i128,
+    pub refunded_amount: i128,
+    pub status: EscrowStatusMirror,
+    pub order_id: BytesN<32>,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub timeout_ledger: u32,
+}
+
+/// Proof binding a review to a specific, independently verifiable escrow
+/// settlement (issue #286). Submitted to
+/// [`ReputationContract::submit_verified_review`], which calls back into
+/// `escrow_contract` to confirm the escrow really reached `Released` status
+/// before accepting the review — closing the Sybil-inflation gap where an
+/// address with no real settled order could otherwise submit a rating.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedReviewProof {
+    /// Escrow identifier on `escrow_contract`.
+    pub escrow_id: u64,
+    /// Escrow contract instance to verify settlement against.
+    pub escrow_contract: Address,
+    /// Expected value of the escrow's `order_id`, binding the proof to a
+    /// specific order rather than just any released escrow between the two
+    /// parties.
+    pub order_hash: BytesN<32>,
 }
 
 #[contracttype]
@@ -177,6 +240,12 @@ pub enum ReputationError {
     NoActiveFlag = 0x0003_000A,
     /// Reporter did not flag the entity.
     NotFlagReporter = 0x0003_000B,
+    /// `submit_verified_review`'s `VerifiedReviewProof` did not check out:
+    /// the referenced escrow could not be read from `escrow_contract`, is
+    /// not in `Released` status, its `order_id` did not match
+    /// `order_hash`, or `rater`/`entity` are not its buyer/seller pair
+    /// (issue #286).
+    UnverifiedOrder = 0x0003_000C,
 }
 
 #[cfg(test)]
@@ -211,6 +280,7 @@ mod error_code_allocation {
             ReputationError::InvalidParam as u32,
             ReputationError::NoActiveFlag as u32,
             ReputationError::NotFlagReporter as u32,
+            ReputationError::UnverifiedOrder as u32,
         ];
         for code in codes {
             assert!(
@@ -318,6 +388,11 @@ pub enum DataKey {
     /// Cached composite score for an entity, recomputed on each
     /// `record_transaction`/`rate_entity`.
     CompositeScore(Address),
+
+    /// Marks an escrow id as already used for a `submit_verified_review`
+    /// call, so the same settled escrow cannot back more than one verified
+    /// review (issue #286).
+    VerifiedEscrowReview(u64),
 }
 
 /// Maximum basis points value (100.00%), used both for ratings/scores and
@@ -651,6 +726,179 @@ impl ReputationContract {
                 entity,
                 rating,
                 escrow_id,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Rate the entity on the other side of an escrow using an
+    /// independently verified settlement proof, rather than relying on the
+    /// admin having already called `record_transaction` for that escrow
+    /// (issue #286).
+    ///
+    /// `rater` must require auth, must not equal `entity`, and — per
+    /// `proof.escrow_contract.get_escrow(proof.escrow_id)` — must be either
+    /// the escrow's `buyer` or `seller`, with `entity` as the other party.
+    /// The escrow must report `EscrowStatus::Released` and its `order_id`
+    /// must match `proof.order_hash`; any mismatch, failed lookup, or
+    /// non-released status is rejected as [`ReputationError::UnverifiedOrder`].
+    /// Each `escrow_id` can back at most one verified review, regardless of
+    /// caller, so the same real settlement cannot be replayed into multiple
+    /// ratings.
+    ///
+    /// On success this behaves like `record_transaction` (outcome
+    /// `Released`) immediately followed by `rate_entity`, feeding the same
+    /// time-decayed scoring pipeline, so verified reviews and admin-relayed
+    /// transactions contribute to `ReputationScore` consistently.
+    pub fn submit_verified_review(
+        env: Env,
+        rater: Address,
+        entity: Address,
+        proof: VerifiedReviewProof,
+        rating: u32,
+    ) -> Result<(), ReputationError> {
+        rater.require_auth();
+
+        if rating as i128 > BPS_SCALE {
+            return Err(ReputationError::InvalidRating);
+        }
+        if rater == entity {
+            return Err(ReputationError::InvalidParam);
+        }
+        if Self::is_frozen(env.clone(), entity.clone()) {
+            return Err(ReputationError::EntityFrozen);
+        }
+
+        let reviewed_key = DataKey::VerifiedEscrowReview(proof.escrow_id);
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&reviewed_key)
+            .unwrap_or(false)
+        {
+            return Err(ReputationError::DuplicateRating);
+        }
+
+        let args = soroban_sdk::vec![&env, proof.escrow_id.into_val(&env)];
+        let call_result = env.try_invoke_contract::<EscrowRecordMirror, InvokeError>(
+            &proof.escrow_contract,
+            &Symbol::new(&env, "get_escrow"),
+            args,
+        );
+        let escrow: EscrowRecordMirror = match call_result {
+            Ok(Ok(record)) => record,
+            _ => return Err(ReputationError::UnverifiedOrder),
+        };
+
+        if escrow.status != EscrowStatusMirror::Released {
+            return Err(ReputationError::UnverifiedOrder);
+        }
+        if escrow.order_id != proof.order_hash {
+            return Err(ReputationError::UnverifiedOrder);
+        }
+        let counterparty_ok = (rater == escrow.buyer && entity == escrow.seller)
+            || (rater == escrow.seller && entity == escrow.buyer);
+        if !counterparty_ok {
+            return Err(ReputationError::UnverifiedOrder);
+        }
+
+        env.storage().persistent().set(&reviewed_key, &true);
+        env.storage().persistent().extend_ttl(
+            &reviewed_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let record_key = DataKey::TransactionRecord(proof.escrow_id);
+        let existing: Option<TransactionRecord> = env.storage().persistent().get(&record_key);
+        if let Some(prior) = &existing {
+            if prior.rating.is_some() {
+                return Err(ReputationError::DuplicateRating);
+            }
+        }
+
+        let tx_record = TransactionRecord {
+            escrow_id: proof.escrow_id,
+            entity: entity.clone(),
+            counterparty: rater.clone(),
+            amount: escrow.amount,
+            outcome: TransactionOutcome::Released,
+            rating: Some(rating),
+            recorded_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&record_key, &tx_record);
+        env.storage().persistent().extend_ttl(
+            &record_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        let history_len_before = if existing.is_none() {
+            let hist_key = DataKey::TransactionHistory(entity.clone());
+            let mut history: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&hist_key)
+                .unwrap_or_else(|| Vec::new(&env));
+            let len_before = history.len();
+            history.push_back(proof.escrow_id);
+            env.storage().persistent().set(&hist_key, &history);
+            env.storage().persistent().extend_ttl(
+                &hist_key,
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::Transacted(entity.clone(), rater.clone()), &true);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Transacted(entity.clone(), rater.clone()),
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+            env.storage()
+                .persistent()
+                .set(&DataKey::Transacted(rater.clone(), entity.clone()), &true);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Transacted(rater.clone(), entity.clone()),
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+
+            Self::apply_new_transaction_counts(&env, &entity, &TransactionOutcome::Released);
+            Some(len_before)
+        } else {
+            None
+        };
+
+        let rated_key = DataKey::RatedEscrows(rater.clone());
+        let mut rated: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&rated_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !rated.contains(proof.escrow_id) {
+            rated.push_back(proof.escrow_id);
+            env.storage().persistent().set(&rated_key, &rated);
+        }
+
+        match history_len_before {
+            Some(len_before) => Self::apply_incremental_score_update(&env, &entity, len_before)?,
+            None => Self::recompute_score(&env, &entity)?,
+        };
+
+        env.events().publish(
+            (symbol_short!("reput"), symbol_short!("verrated")),
+            EntityRatedEvent {
+                rater,
+                entity,
+                rating,
+                escrow_id: proof.escrow_id,
             },
         );
 

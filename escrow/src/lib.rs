@@ -21,7 +21,7 @@
 #![warn(missing_docs)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
-    InvokeError, Map, Symbol, Vec,
+    IntoVal, InvokeError, Map, Symbol, Vec,
 };
 
 /// Lifecycle state of an escrow.
@@ -115,6 +115,35 @@ impl EscrowFlags {
     pub fn clear_flag(&mut self, flag: u32) {
         self.0 &= !flag;
     }
+
+/// Basis-point ceiling on `CrossCurrencySwapConfig::max_slippage_bps` (50%).
+/// Configs above this are rejected outright as misconfigured rather than
+/// merely risky (issue #318).
+pub const MAX_SWAP_SLIPPAGE_BPS: u32 = 5_000;
+
+/// Optional cross-currency settlement configuration for an escrow (issue
+/// #318). When set on an escrow, `release_with_swap` atomically swaps the
+/// seller-bound remainder from `deposit_token` (which must match the
+/// escrow's own `record.token`) into `payout_token` through
+/// `router_contract` at release time, instead of paying the seller directly
+/// in the buyer's deposit token.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossCurrencySwapConfig {
+    /// Token the buyer funded the escrow with; must equal `record.token`.
+    pub deposit_token: Address,
+    /// Token the seller is paid out in after the atomic swap.
+    pub payout_token: Address,
+    /// Maximum slippage, in basis points, tolerated between the caller's
+    /// expected payout quote and the router's actual output before the
+    /// release reverts.
+    pub max_slippage_bps: u32,
+    /// Soroban DEX/AMM router contract used to execute the swap. Must
+    /// implement `swap_exact_tokens_for_tokens(env, from_token: Address,
+    /// to_token: Address, amount_in: i128, min_amount_out: i128, to: Address)
+    /// -> i128`, delivering `to_token` directly to `to` and returning the
+    /// actual amount delivered.
+    pub router_contract: Address,
 }
 
 /// Full on-chain record for a single escrow.
@@ -185,6 +214,15 @@ pub struct MerchantTierUpdatedEvent {
     /// Total settled volume at the time of the update.
     pub total_settled_volume: i128,
 }
+
+/// Basis-point gas-fee compensation paid to the oracle relayer that submits a
+/// valid signed delivery proof via `verify_delivery_and_release` (issue
+/// #317). Delivery oracles front the transaction fee for that call out of
+/// pocket; this rebate reimburses them directly from the escrowed deposit
+/// before the remaining balance is split between the platform fee and the
+/// seller, so the buyer's total deposit still fully accounts for the
+/// release.
+pub const ORACLE_REBATE_BPS: u32 = 10; // 0.10% of the released amount
 
 /// Finance approval state for a high-value escrow.
 #[contracttype]
@@ -309,6 +347,58 @@ pub struct EscrowReleasedEvent {
     pub seller: Address,
     /// Amount released to the seller.
     pub amount: i128,
+    /// Address that triggered the release.
+    pub released_by: Address,
+}
+
+/// Emitted when an oracle relayer is reimbursed for the transaction cost of
+/// submitting a signed delivery proof via `verify_delivery_and_release`
+/// (issue #317).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct OracleRebateDisbursedEvent {
+    /// Unique identifier for the escrow.
+    pub escrow_id: u64,
+    /// Oracle relayer address that received the rebate.
+    pub oracle: Address,
+    /// Amount of `token` transferred to the oracle as compensation.
+    pub rebate_amount: i128,
+    /// Token the rebate was paid in (the escrow's deposit token).
+    pub token: Address,
+}
+
+/// Emitted when an escrow's cross-currency swap settlement is configured or
+/// updated via `set_cross_currency_swap_config` (issue #318).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CrossCurrencySwapConfiguredEvent {
+    /// Unique identifier for the escrow.
+    pub escrow_id: u64,
+    /// Token the buyer funded the escrow with.
+    pub deposit_token: Address,
+    /// Token the seller will be paid out in.
+    pub payout_token: Address,
+    /// Maximum tolerated slippage, in basis points.
+    pub max_slippage_bps: u32,
+    /// Router contract that will execute the swap.
+    pub router_contract: Address,
+}
+
+/// Emitted when `release_with_swap` completes an atomic cross-currency
+/// release (issue #318).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CrossCurrencySwapReleasedEvent {
+    /// Unique identifier for the escrow.
+    pub escrow_id: u64,
+    /// Seller's address.
+    pub seller: Address,
+    /// Amount of the escrow's deposit token swapped away.
+    pub deposit_amount: i128,
+    /// Token the seller was actually paid out in.
+    pub payout_token: Address,
+    /// Actual amount of `payout_token` delivered to the seller.
+    pub payout_amount: i128,
     /// Address that triggered the release.
     pub released_by: Address,
 }
@@ -921,6 +1011,9 @@ pub enum DataKey {
     UpgradeProposal,
     /// M-of-N admin approvals required to execute an upgrade (issue #292).
     UpgradeThreshold,
+    /// Optional cross-currency swap settlement configuration for an escrow
+    /// (issue #318).
+    CrossCurrencySwapConfig(u64),
 }
 
 #[contracterror]
@@ -997,7 +1090,11 @@ pub enum DataKey {
 // | 408 | UpgradeProposalNotFound | next major |
 // | 409 | UpgradeTimelockActive | next major |
 // | 410 | UpgradeHashMismatch | next major |
-// | 411+ | Reserved for new variants | next major |
+// | 411 | InvalidSwapConfig | next major |
+// | 412 | SwapConfigNotSet | next major |
+// | 413 | SlippageExceeded | next major |
+// | 414 | SwapRouterCallFailed | next major |
+// | 415+ | Reserved for new variants | next major |
 //
 // # Allocating new variants
 //
@@ -1155,6 +1252,18 @@ pub enum EscrowError {
     BatchLimitExceeded = 409,
     /// Dispute award amounts are negative or do not sum to the escrow balance.
     InvalidDisputeAward = 410,
+    /// Cross-currency swap configuration is missing required fields, reuses
+    /// the escrow's deposit token as the payout token, or sets a slippage
+    /// bound above `MAX_SWAP_SLIPPAGE_BPS` (issue #318).
+    InvalidSwapConfig = 411,
+    /// `release_with_swap` was called on an escrow with no
+    /// `CrossCurrencySwapConfig` set via `set_cross_currency_swap_config`.
+    SwapConfigNotSet = 412,
+    /// The router returned (or would have returned) less than the
+    /// slippage-bounded minimum acceptable payout amount.
+    SlippageExceeded = 413,
+    /// The configured swap router contract call failed or trapped.
+    SwapRouterCallFailed = 414,
 }
 
 /// Compact receipt returned to buyers after escrow creation via `get_receipt`.
@@ -3005,6 +3114,7 @@ impl EscrowContract {
             record.clone(),
             buyer,
             record.amount - record.released_amount - record.refunded_amount,
+            0,
         )?;
         Ok(true)
     }
@@ -3707,11 +3817,11 @@ impl EscrowContract {
             return Err(EscrowError::ConditionNotMet);
         }
 
-        Self::execute_release(&env, escrow_id, &key, record, caller, release_amount)
+        Self::execute_release(&env, escrow_id, &key, record, caller, release_amount, 0)
     }
 
-    /// Shared release logic used by both `partial_release` and
-    /// `evaluate_and_release`. Callers are responsible for their own
+    /// Shared release logic used by `partial_release`, `verify_delivery_and_release`,
+    /// and `release_with_merkle_proof`. Callers are responsible for their own
     /// authorization checks before invoking this.
     ///
     /// The platform fee (per `FeeConfig` or the multi-treasury
@@ -3719,6 +3829,14 @@ impl EscrowContract {
     /// the treasury(ies); the seller receives the remainder (issue #27).
     /// `released_amount` tracks the full escrow-amount released, not the net
     /// seller payout.
+    ///
+    /// `pre_deducted` is an amount already transferred out of the escrow's
+    /// balance by the caller before this function runs (currently only the
+    /// oracle relayer rebate paid in `verify_delivery_and_release`, issue
+    /// #317). It is folded into `released_amount`/`remaining` bookkeeping so
+    /// the escrow still reaches zero remaining and transitions to `Released`,
+    /// but it is excluded from the fee/seller-payout computation, which is
+    /// still based only on `release_amount`.
     fn execute_release(
         env: &Env,
         escrow_id: u64,
@@ -3726,13 +3844,15 @@ impl EscrowContract {
         mut record: EscrowRecord,
         caller: Address,
         release_amount: i128,
+        pre_deducted: i128,
     ) -> Result<PartialReleaseResult, EscrowError> {
         if release_amount <= 0 {
             return Err(EscrowError::ZeroAmount);
         }
 
         let remaining = record.amount - record.released_amount - record.refunded_amount;
-        if release_amount > remaining {
+        let total_drawn = release_amount + pre_deducted;
+        if total_drawn > remaining {
             return Err(EscrowError::InsufficientEscrowBalance);
         }
 
@@ -3746,7 +3866,7 @@ impl EscrowContract {
             &payout.seller_net,
         );
 
-        record.released_amount += release_amount;
+        record.released_amount += total_drawn;
         let new_remaining = record.amount - record.released_amount - record.refunded_amount;
         let fully_released = new_remaining == 0;
         if fully_released {
@@ -4090,7 +4210,268 @@ impl EscrowContract {
             .ed25519_verify(&configured_key, &payload, &proof.signature);
 
         let remaining = record.amount - record.released_amount - record.refunded_amount;
-        Self::execute_release(&env, escrow_id, &key, record, caller, remaining)
+        let token_client = soroban_sdk::token::Client::new(&env, &record.token);
+        let rebate = Self::disburse_oracle_rebate(&env, &token_client, &caller, remaining);
+        if rebate > 0 {
+            env.events().publish(
+                (
+                    symbol_short!("escrow"),
+                    symbol_short!("orcrebate"),
+                    escrow_id,
+                ),
+                OracleRebateDisbursedEvent {
+                    escrow_id,
+                    oracle: caller.clone(),
+                    rebate_amount: rebate,
+                    token: record.token.clone(),
+                },
+            );
+        }
+        let seller_bound_amount = remaining - rebate;
+        Self::execute_release(
+            &env,
+            escrow_id,
+            &key,
+            record,
+            caller,
+            seller_bound_amount,
+            rebate,
+        )
+    }
+
+    /// Computes and transfers the oracle relayer gas-fee rebate (issue #317)
+    /// out of the escrow's own token balance, reimbursing the caller that
+    /// submitted the signed delivery proof for the transaction cost it fronted.
+    /// Returns the rebate amount actually transferred (zero when `amount` is
+    /// too small for `ORACLE_REBATE_BPS` to round to a positive amount, in
+    /// which case no transfer is made).
+    fn disburse_oracle_rebate(
+        env: &Env,
+        token_client: &soroban_sdk::token::Client,
+        oracle: &Address,
+        amount: i128,
+    ) -> i128 {
+        if amount <= 0 {
+            return 0;
+        }
+        let rebate = (amount * ORACLE_REBATE_BPS as i128) / 10_000i128;
+        if rebate > 0 {
+            token_client.transfer(&env.current_contract_address(), oracle, &rebate);
+        }
+        rebate
+    }
+
+    /// Configure (or update) cross-currency settlement for an escrow (issue
+    /// #318), letting a buyer fund in `deposit_token` while the seller is
+    /// paid out in a different `payout_token` via `release_with_swap`.
+    ///
+    /// Only the escrow's buyer or an admin may call. `config.deposit_token`
+    /// must equal the escrow's own `record.token`, `config.payout_token` must
+    /// differ from it (otherwise there is nothing to swap), and
+    /// `config.max_slippage_bps` must be nonzero and no greater than
+    /// `MAX_SWAP_SLIPPAGE_BPS`.
+    pub fn set_cross_currency_swap_config(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        config: CrossCurrencySwapConfig,
+    ) -> Result<bool, EscrowError> {
+        caller.require_auth();
+
+        let key = DataKey::Escrow(escrow_id);
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+
+        if caller != record.buyer && !Self::is_admin(env.clone(), caller.clone()) {
+            return Err(EscrowError::Unauthorized);
+        }
+        check_not_terminal(&record)?;
+
+        if is_zero_address(&env, &config.router_contract)
+            || is_zero_address(&env, &config.payout_token)
+        {
+            return Err(EscrowError::InvalidSwapConfig);
+        }
+        if config.deposit_token != record.token {
+            return Err(EscrowError::InvalidSwapConfig);
+        }
+        if config.payout_token == config.deposit_token {
+            return Err(EscrowError::InvalidSwapConfig);
+        }
+        if config.max_slippage_bps == 0 || config.max_slippage_bps > MAX_SWAP_SLIPPAGE_BPS {
+            return Err(EscrowError::InvalidSwapConfig);
+        }
+
+        let swap_key = DataKey::CrossCurrencySwapConfig(escrow_id);
+        env.storage().persistent().set(&swap_key, &config);
+        env.storage().persistent().extend_ttl(
+            &swap_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("swapcfg"), escrow_id),
+            CrossCurrencySwapConfiguredEvent {
+                escrow_id,
+                deposit_token: config.deposit_token,
+                payout_token: config.payout_token,
+                max_slippage_bps: config.max_slippage_bps,
+                router_contract: config.router_contract,
+            },
+        );
+
+        Ok(true)
+    }
+
+    /// Read-only getter for an escrow's cross-currency swap configuration, if
+    /// any (issue #318).
+    pub fn get_cross_currency_swap_config(
+        env: Env,
+        escrow_id: u64,
+    ) -> Option<CrossCurrencySwapConfig> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CrossCurrencySwapConfig(escrow_id))
+    }
+
+    /// Release an escrow's full remaining balance to its seller, atomically
+    /// swapping it from the escrow's deposit token into the seller's payout
+    /// token through the router configured via
+    /// `set_cross_currency_swap_config` (issue #318).
+    ///
+    /// The platform fee is computed and collected in the deposit token first
+    /// (matching `release`/`partial_release`, issue #27); only the
+    /// seller-bound net remainder is swapped. `expected_payout_amount` is the
+    /// caller's off-chain price quote for that swap; the router's actual
+    /// output must be at least `expected_payout_amount` reduced by the
+    /// escrow's configured `max_slippage_bps`, or the whole release reverts
+    /// (`EscrowError::SlippageExceeded`), protecting the seller's payout from
+    /// excessive slippage. The buyer's deposit is never at risk beyond the
+    /// amount already escrowed, since the swap input is capped at the
+    /// escrow's own remaining balance.
+    pub fn release_with_swap(
+        env: Env,
+        escrow_id: u64,
+        caller: Address,
+        recipient: Address,
+        expected_payout_amount: i128,
+    ) -> Result<i128, EscrowError> {
+        caller.require_auth();
+
+        let key = DataKey::Escrow(escrow_id);
+        let mut record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+
+        if recipient != record.seller {
+            return Err(EscrowError::InvalidReleaseRecipient);
+        }
+        if caller != record.buyer && !Self::is_admin(env.clone(), caller.clone()) {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        Self::validate_seller_category(&env, &record.seller)?;
+        check_not_terminal(&record)?;
+        Self::validate_release_status(&record)?;
+
+        if expected_payout_amount <= 0 {
+            return Err(EscrowError::InvalidAmount);
+        }
+
+        if record.amount > DUAL_CONTROL_THRESHOLD {
+            let dual_control: DualControlConfig = env
+                .storage()
+                .persistent()
+                .get(&DataKey::DualControlConfig(escrow_id))
+                .ok_or(EscrowError::DualControlNotConfigured)?;
+            if !dual_control.is_secondary_approved {
+                return Err(EscrowError::SecondaryApprovalRequired);
+            }
+        }
+
+        let swap_config: CrossCurrencySwapConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CrossCurrencySwapConfig(escrow_id))
+            .ok_or(EscrowError::SwapConfigNotSet)?;
+        if swap_config.deposit_token != record.token {
+            return Err(EscrowError::InvalidSwapConfig);
+        }
+
+        let remaining = record.amount - record.released_amount - record.refunded_amount;
+        if remaining <= 0 {
+            return Err(EscrowError::ZeroAmount);
+        }
+
+        let token_client = soroban_sdk::token::Client::new(&env, &record.token);
+        let payout = Self::compute_payout(&env, remaining)?;
+        Self::distribute_fee(&env, &token_client, payout.fee)?;
+
+        // Floor the router's acceptable output at the caller's quoted price
+        // minus the escrow's configured slippage tolerance, so a bad quote or
+        // a manipulated pool cannot shortchange the seller beyond what the
+        // escrow was configured to tolerate.
+        let min_amount_out = payout.seller_net.min(
+            expected_payout_amount
+                - (expected_payout_amount * swap_config.max_slippage_bps as i128) / 10_000i128,
+        );
+
+        // Hand the seller-bound remainder to the router, then invoke it to
+        // perform the swap and deliver the payout token directly to the
+        // seller. If the router call fails or traps, this whole invocation
+        // returns an error and the Soroban host reverts every state change
+        // made during it, including the transfer just made here — so no
+        // funds can be stranded in the router.
+        token_client.transfer(
+            &env.current_contract_address(),
+            &swap_config.router_contract,
+            &payout.seller_net,
+        );
+
+        let args = soroban_sdk::vec![
+            &env,
+            record.token.to_val(),
+            swap_config.payout_token.to_val(),
+            payout.seller_net.into_val(&env),
+            min_amount_out.into_val(&env),
+            record.seller.to_val(),
+        ];
+        let swap_result = env.try_invoke_contract::<i128, InvokeError>(
+            &swap_config.router_contract,
+            &Symbol::new(&env, "swap_exact_tokens_for_tokens"),
+            args,
+        );
+
+        let amount_out = match swap_result {
+            Ok(Ok(out)) if out >= min_amount_out => out,
+            Ok(Ok(_)) => return Err(EscrowError::SlippageExceeded),
+            _ => return Err(EscrowError::SwapRouterCallFailed),
+        };
+
+        record.released_amount += remaining;
+        record.status = EscrowStatus::Released;
+        record.updated_at = env.ledger().timestamp();
+        env.storage().persistent().set(&key, &record);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("swaprel"), escrow_id),
+            CrossCurrencySwapReleasedEvent {
+                escrow_id,
+                seller: record.seller.clone(),
+                deposit_amount: remaining,
+                payout_token: swap_config.payout_token.clone(),
+                payout_amount: amount_out,
+                released_by: caller,
+            },
+        );
+
+        Ok(amount_out)
     }
 
     /// Mark the escrow as disputed. Only the buyer or seller may call.
