@@ -12,6 +12,7 @@ mod test {
         testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
         Address, Env, IntoVal, Symbol, TryIntoVal, Vec,
     };
+    use soroban_sdk::testutils::LedgerInfo;
 
     const MAX_SPEND_CPU_INSTRUCTIONS: u64 = 2_000_000;
     const MAX_SPEND_MEMORY_BYTES: u64 = 2_000_000;
@@ -3436,6 +3437,13 @@ mod test {
         let owner = Address::generate(&env);
         let delegate = Address::generate(&env);
         let keeper = Address::generate(&env);
+    // --- Issue: Handle Verification Policy Threshold Increases ---
+
+    #[test]
+    fn test_recheck_merchant_verification_under_old_policy() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let merchant_id: u64 = 1;
 
         let contract_id = env.register(PermissionsContract, ());
         let client = PermissionsContractClient::new(&env, &contract_id);
@@ -3935,6 +3943,17 @@ mod test {
         env.mock_all_auths();
         let owner = Address::generate(&env);
         let delegate = Address::generate(&env);
+        // Merchant verified under a policy requiring 1 verification.
+        let old_policy = crate::VerificationPolicy { required: 1 };
+        client.set_merchant_verifications(&merchant_id, &1);
+        assert!(client.recheck_merchant_verification(&merchant_id, &old_policy));
+    }
+
+    #[test]
+    fn test_recheck_merchant_verification_after_policy_increase() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let merchant_id: u64 = 2;
 
         let contract_id = env.register(PermissionsContract, ());
         let client = PermissionsContractClient::new(&env, &contract_id);
@@ -5058,6 +5077,74 @@ mod expiry_and_allowance_sweep_tests {
         assert_eq!(
             compute_expiry_ledger(u32::MAX, u32::MAX),
             Err(PermissionError::InvalidExpiry)
+        // Merchant verified under old policy (1 verification).
+        client.set_merchant_verifications(&merchant_id, &1);
+
+        // Governance raises the required verifications to 2.
+        let new_policy = crate::VerificationPolicy { required: 2 };
+        assert!(
+            !client.recheck_merchant_verification(&merchant_id, &new_policy),
+            "merchant must not be considered verified once policy threshold increases"
+        );
+    }
+
+    #[test]
+    fn test_revalidate_merchant_status_grants_grace_period() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let merchant_id: u64 = 3;
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        // Merchant verified under old policy (1 verification).
+        client.set_merchant_verifications(&merchant_id, &1);
+
+        // Governance raises the required verifications to 2.
+        let new_policy = crate::VerificationPolicy { required: 2 };
+        client.set_verification_policy(&new_policy);
+
+        // Immediately after the policy change, the merchant is still within
+        // the 30-day grace period and remains valid.
+        let status = client.revalidate_merchant_status(&merchant_id);
+        assert!(
+            status.valid,
+            "merchant must remain valid during the 30-day grace period"
+        );
+        assert!(
+            status.grace_period_active,
+            "grace period must be reported as active"
+        );
+        assert_eq!(status.required, 2);
+        assert_eq!(status.current, 1);
+    }
+
+    #[test]
+    fn test_revalidate_merchant_status_expires_after_grace_period() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let merchant_id: u64 = 4;
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        client.set_merchant_verifications(&merchant_id, &1);
+        let new_policy = crate::VerificationPolicy { required: 2 };
+        client.set_verification_policy(&new_policy);
+
+        // Advance the ledger timestamp past the 30-day grace period.
+        env.ledger().with_mut(|li: &mut LedgerInfo| {
+            li.timestamp += 30 * 24 * 60 * 60 + 1;
+        });
+
+        let status = client.revalidate_merchant_status(&merchant_id);
+        assert!(
+            !status.valid,
+            "merchant must transition gracefully once the grace period expires"
+        );
+        assert!(
+            !status.grace_period_active,
+            "grace period must no longer be active"
         );
     }
 
@@ -5188,6 +5275,10 @@ mod expiry_and_allowance_sweep_tests {
         let child_delegate = Address::generate(&env);
         let grandchild_delegate = Address::generate(&env);
         let merchants = Vec::<Address>::new(&env);
+    fn test_revalidate_merchant_status_meets_new_policy() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let merchant_id: u64 = 5;
 
         let contract_id = env.register(PermissionsContract, ());
         let client = PermissionsContractClient::new(&env, &contract_id);
@@ -5234,6 +5325,26 @@ mod expiry_and_allowance_sweep_tests {
         let d3 = Address::generate(&env);
         let d4 = Address::generate(&env);
         let merchants = Vec::<Address>::new(&env);
+        // Merchant acquires the additional attestation.
+        client.set_merchant_verifications(&merchant_id, &2);
+        let new_policy = crate::VerificationPolicy { required: 2 };
+        client.set_verification_policy(&new_policy);
+
+        let status = client.revalidate_merchant_status(&merchant_id);
+        assert!(status.valid, "merchant meeting the new policy must be valid");
+        assert!(
+            !status.grace_period_active,
+            "no grace period needed when policy is met"
+        );
+        assert_eq!(status.required, 2);
+        assert_eq!(status.current, 2);
+    }
+
+    #[test]
+    fn test_revalidate_merchant_status_unknown_merchant() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let merchant_id: u64 = 999;
 
         let contract_id = env.register(PermissionsContract, ());
         let client = PermissionsContractClient::new(&env, &contract_id);
@@ -5257,5 +5368,57 @@ mod expiry_and_allowance_sweep_tests {
             ),
             Err(Ok(PermissionError::MaxHierarchyDepthExceeded))
         );
+        let new_policy = crate::VerificationPolicy { required: 1 };
+        client.set_verification_policy(&new_policy);
+
+        let status = client.revalidate_merchant_status(&merchant_id);
+        assert!(!status.valid, "unknown merchant must not be valid");
+        assert_eq!(status.current, 0);
+    }
+
+    #[test]
+    fn test_policy_transition_behavior_end_to_end() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let merchant_id: u64 = 42;
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        // 1. Merchant verified under old policy (1 verification).
+        let old_policy = crate::VerificationPolicy { required: 1 };
+        client.set_verification_policy(&old_policy);
+        client.set_merchant_verifications(&merchant_id, &1);
+        assert!(client.recheck_merchant_verification(&merchant_id, &old_policy));
+        assert!(client.revalidate_merchant_status(&merchant_id).valid);
+
+        // 2. Governance raises the policy to 2 verifications.
+        let new_policy = crate::VerificationPolicy { required: 2 };
+        client.set_verification_policy(&new_policy);
+
+        // 3. Merchant is no longer statically verified.
+        assert!(!client.recheck_merchant_verification(&merchant_id, &new_policy));
+
+        // 4. But the grace period keeps them valid temporarily.
+        let grace_status = client.revalidate_merchant_status(&merchant_id);
+        assert!(grace_status.valid);
+        assert!(grace_status.grace_period_active);
+
+        // 5. Merchant acquires the second attestation before the deadline.
+        client.set_merchant_verifications(&merchant_id, &2);
+        let met_status = client.revalidate_merchant_status(&merchant_id);
+        assert!(met_status.valid);
+        assert!(!met_status.grace_period_active);
+
+        // 6. A different merchant that never acquires the attestation
+        //    transitions gracefully after the grace period.
+        let lagging_id: u64 = 43;
+        client.set_merchant_verifications(&lagging_id, &1);
+        env.ledger().with_mut(|li: &mut LedgerInfo| {
+            li.timestamp += 30 * 24 * 60 * 60 + 1;
+        });
+        let lagging_status = client.revalidate_merchant_status(&lagging_id);
+        assert!(!lagging_status.valid);
+        assert!(!lagging_status.grace_period_active);
     }
 }

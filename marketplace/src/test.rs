@@ -24,6 +24,11 @@ use crate::{
     CategoryChange, CategoryEntry, DataKey, Merchant, MerchantCategoryChangedEvent,
     MerchantCursor, MerchantOperationalView, MerchantStats, MerchantValidationError,
     VerificationPolicy, normalize_symbol, MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN,
+    normalize_symbol, AdminAcceptedEvent, AdminProposedEvent, CategoryChange, CategoryEntry,
+    DataKey, MarketplaceContract, MarketplaceContractClient, MarketplaceError, Merchant,
+    MerchantCategoryChangedEvent, MerchantCursor, MerchantOperationalView,
+    MerchantRegisteredEvent, MerchantStats, MerchantStatus, MerchantValidationError,
+    RegisterParams, VerificationPolicy, Verifier, MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN,
     MAX_METADATA_LEN, MAX_NAME_LEN,
     CommissionTier, MerchantVolumeRecord,
     ReputationCursor, RankedMerchantPage,
@@ -38,6 +43,7 @@ use soroban_sdk::{
     Address, Env, String, Symbol, TryIntoVal,
     Address, Env, String, Symbol, TryIntoVal,
     TryIntoVal,
+    Address, Env, IntoVal, String, Symbol, TryFromVal, TryIntoVal, Val,
 };
 
 const MAX_DISCOVERY_CPU_INSTRUCTIONS: u64 = 2_000_000;
