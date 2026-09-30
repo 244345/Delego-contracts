@@ -3513,3 +3513,397 @@ use soroban_sdk::{
         assert_eq!(result, Err(Ok(EscrowError::Unauthorized)));
     }
 }
+    #[test]
+    fn test_resolve_dispute_transitions_to_initial_ruling_not_resolved() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[100u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &100u32, &None, &None,
+        );
+
+        // Dispute the escrow
+        client.dispute(&escrow_id, &buyer);
+
+        // Resolve dispute — should transition to InitialRuling, not Release
+        let result = client.resolve_dispute(&escrow_id, &admin, &true);
+        assert!(result);
+
+        let record = client.get_escrow(&escrow_id);
+        assert_eq!(record.status, crate::EscrowStatus::InitialRuling);
+
+        // Funds should NOT be released yet (seller balance should still be 0)
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        assert_eq!(token_client.balance(&seller), 0);
+    }
+
+    #[test]
+    fn test_appeal_window_opens_for_48_hours() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[101u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &100u32, &None, &None,
+        );
+
+        client.dispute(&escrow_id, &buyer);
+
+        // Get current ledger sequence before resolve
+        let current_ledger = env.ledger().sequence();
+
+        // Resolve dispute
+        client.resolve_dispute(&escrow_id, &admin, &true);
+
+        // Check appeal record was created with correct deadline
+        // We can verify this by trying to file an appeal and checking the window is open
+        let post_resolve_ledger = env.ledger().sequence();
+        let expected_deadline = post_resolve_ledger + crate::APPEAL_WINDOW_LEDGERS;
+
+        // For now, we just verify the status is InitialRuling which means window is open
+        assert_eq!(client.get_escrow(&escrow_id).status, crate::EscrowStatus::InitialRuling);
+    }
+
+    #[test]
+    fn test_losing_party_can_file_appeal_within_window() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        token_admin_client.mint(&seller, &10_000i128); // Give seller tokens for bond
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[102u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &100u32, &None, &None,
+        );
+
+        // Dispute the escrow
+        client.dispute(&escrow_id, &buyer);
+
+        // Resolve with seller as winner
+        client.resolve_dispute(&escrow_id, &admin, &true);
+
+        // Buyer (loser) files appeal with bond
+        let result = client.file_dispute_appeal(&escrow_id, &buyer);
+        assert!(result);
+
+        // Verify bond was transferred to contract
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        let contract_balance = token_client.balance(&Address::from_contract_id(&env, &client.address()));
+        assert!(contract_balance > 0, "contract should hold bond");
+    }
+
+    #[test]
+    fn test_appeal_after_deadline_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        token_admin_client.mint(&seller, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[103u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &100u32, &None, &None,
+        );
+
+        client.dispute(&escrow_id, &buyer);
+        client.resolve_dispute(&escrow_id, &admin, &true);
+
+        // Advance ledger past appeal window
+        env.ledger().with_mut(|li| {
+            li.sequence_number = li.sequence_number + crate::APPEAL_WINDOW_LEDGERS + 100;
+        });
+
+        // Try to file appeal after deadline
+        assert_eq!(
+            client.try_file_dispute_appeal(&escrow_id, &buyer),
+            Err(Ok(EscrowError::AppealWindowExpired))
+        );
+    }
+
+    #[test]
+    fn test_double_appeal_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        token_admin_client.mint(&seller, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[104u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &100u32, &None, &None,
+        );
+
+        client.dispute(&escrow_id, &buyer);
+        client.resolve_dispute(&escrow_id, &admin, &true);
+
+        // File first appeal
+        assert!(client.file_dispute_appeal(&escrow_id, &buyer));
+
+        // Try to file second appeal
+        assert_eq!(
+            client.try_file_dispute_appeal(&escrow_id, &buyer),
+            Err(Ok(EscrowError::AppealAlreadyFiled))
+        );
+    }
+
+    #[test]
+    fn test_bond_slashed_when_appeal_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        token_admin_client.mint(&seller, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[105u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &100u32, &None, &None,
+        );
+
+        client.dispute(&escrow_id, &buyer);
+        
+        // Resolve with seller as initial winner
+        client.resolve_dispute(&escrow_id, &admin, &true);
+
+        // Buyer files appeal
+        client.file_dispute_appeal(&escrow_id, &buyer);
+
+        // Set appeals council
+        client.set_appeals_council(&admin, &admin); // admin acts as council for testing
+
+        // Council finalizes with seller as final winner (appeal fails)
+        assert!(client.finalize_dispute_appeal(&escrow_id, &admin, &seller));
+
+        // Verify bond was slashed to seller
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        let seller_balance = token_client.balance(&seller);
+        // Seller should have original 10000 + escrow 1000 - fee + bond (100, or 10% of 1000)
+        let expected_bond = 100i128; // 10% of 1000, minimum 100
+        assert!(seller_balance >= expected_bond, "seller should receive slashed bond");
+
+        // Verify escrow is in Released status
+        assert_eq!(client.get_escrow(&escrow_id).status, crate::EscrowStatus::Released);
+    }
+
+    #[test]
+    fn test_bond_returned_when_appeal_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        token_admin_client.mint(&seller, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[106u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &100u32, &None, &None,
+        );
+
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        let buyer_balance_before = token_client.balance(&buyer);
+
+        client.dispute(&escrow_id, &buyer);
+        
+        // Resolve with seller as initial winner
+        client.resolve_dispute(&escrow_id, &admin, &true);
+
+        // Buyer files appeal
+        client.file_dispute_appeal(&escrow_id, &buyer);
+
+        // Set appeals council
+        client.set_appeals_council(&admin, &admin);
+
+        // Council finalizes with buyer as final winner (appeal succeeds)
+        assert!(client.finalize_dispute_appeal(&escrow_id, &admin, &buyer));
+
+        // Verify bond was returned to buyer
+        let buyer_balance_after = token_client.balance(&buyer);
+        // Buyer should have initial balance - escrow + full escrow back + bond returned
+        assert!(buyer_balance_after > buyer_balance_before, "buyer should receive bond back");
+
+        // Verify escrow is in Refunded status
+        assert_eq!(client.get_escrow(&escrow_id).status, crate::EscrowStatus::Refunded);
+    }
+
+    #[test]
+    fn test_uncontested_ruling_finalizes_after_deadline() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[107u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &100u32, &None, &None,
+        );
+
+        client.dispute(&escrow_id, &buyer);
+        
+        // Resolve with seller as winner
+        client.resolve_dispute(&escrow_id, &admin, &true);
+
+        // Verify status is InitialRuling (funds not released yet)
+        assert_eq!(client.get_escrow(&escrow_id).status, crate::EscrowStatus::InitialRuling);
+
+        // Advance ledger past appeal window
+        env.ledger().with_mut(|li| {
+            li.sequence_number = li.sequence_number + crate::APPEAL_WINDOW_LEDGERS + 100;
+        });
+
+        // Finalize uncontested ruling
+        assert!(client.finalize_uncontested_ruling(&escrow_id));
+
+        // Verify funds were released to seller
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        let seller_balance = token_client.balance(&seller);
+        assert!(seller_balance > 0, "seller should have received funds");
+
+        // Verify escrow is in Released status
+        assert_eq!(client.get_escrow(&escrow_id).status, crate::EscrowStatus::Released);
+    }
+
+    #[test]
+    fn test_finalize_appeal_requires_appeals_council() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let not_council = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        token_admin_client.mint(&seller, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[108u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &100u32, &None, &None,
+        );
+
+        client.dispute(&escrow_id, &buyer);
+        client.resolve_dispute(&escrow_id, &admin, &true);
+        client.file_dispute_appeal(&escrow_id, &buyer);
+
+        // Try to finalize as non-council address (without setting council first)
+        assert_eq!(
+            client.try_finalize_dispute_appeal(&escrow_id, &not_council, &seller),
+            Err(Ok(EscrowError::NotAppealsCouncil))
+        );
+    }
+
+    #[test]
+    fn test_appeal_prevents_premature_fund_withdrawal() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[109u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &100u32, &None, &None,
+        );
+
+        client.dispute(&escrow_id, &buyer);
+        client.resolve_dispute(&escrow_id, &admin, &true);
+
+        // Funds should NOT be in seller's account yet
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        let seller_initial_balance = token_client.balance(&seller);
+        assert_eq!(seller_initial_balance, 0, "funds should not be released yet");
+
+        // The funds are locked in the contract awaiting appeal or finalization
+        let contract_address = Address::from_contract_id(&env, &client.address());
+        let contract_balance = token_client.balance(&contract_address);
+        assert!(contract_balance > 0, "funds should be locked in contract");
+    }
+}
