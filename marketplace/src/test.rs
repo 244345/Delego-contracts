@@ -1,5 +1,6 @@
 use crate::AffiliateConfig;
 use crate::{
+    VerifierRevocationRecord,
     AdminAcceptedEvent, AdminProposedEvent, MarketplaceContract, MarketplaceContractClient,
     MarketplaceError, MerchantRegisteredEvent, MerchantStatus, RegisterParams, Verifier,
     DataKey, MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantStatus,
@@ -872,6 +873,101 @@ fn test_multi_verifier_verification_and_revocation() {
     let revoked_state = f.client.get_merchant(&id);
     assert!(!revoked_state.verified);
     assert_eq!(revoked_state.status, MerchantStatus::Registered);
+}
+
+#[test]
+fn test_revoke_verifier_downgrades_merchants() {
+    let f = TestFixture::setup();
+    let owner1 = Address::generate(&f.env);
+    let owner2 = Address::generate(&f.env);
+    let v1 = Address::generate(&f.env);
+    let v2 = Address::generate(&f.env);
+
+    f.client.add_verifier(
+        &f.admin,
+        &Verifier {
+            address: v1.clone(),
+            label: symbol_short!("kyc"),
+            registered_at: 1,
+        },
+    );
+    f.client.add_verifier(
+        &f.admin,
+        &Verifier {
+            address: v2.clone(),
+            label: symbol_short!("audit"),
+            registered_at: 1,
+        },
+    );
+
+    // Merchant requiring 2 verifications, verified by both v1 and v2.
+    let id1 = f.client.register_merchant(
+        &owner1,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Two Verifier Store"),
+            description: String::from_str(&f.env, "Needs two"),
+            category: symbol_short!("tech"),
+            image_url: String::from_str(&f.env, "tech.png"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 2,
+        },
+    );
+    f.client.verify_merchant(&id1, &v1);
+    f.client.verify_merchant(&id1, &v2);
+    assert!(f.client.get_merchant(&id1).verified);
+    assert_eq!(
+        f.client.get_merchant(&id1).status,
+        MerchantStatus::Verified
+    );
+
+    // Merchant requiring only 1 verification, verified by v1 alone.
+    let id2 = f.client.register_merchant(
+        &owner2,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Single Verifier Store"),
+            description: String::from_str(&f.env, "Needs one"),
+            category: symbol_short!("tech"),
+            image_url: String::from_str(&f.env, "tech.png"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 1,
+        },
+    );
+    f.client.verify_merchant(&id2, &v1);
+    assert!(f.client.get_merchant(&id2).verified);
+
+    // Unauthorized revocation is rejected.
+    let unauth = f
+        .client
+        .try_revoke_verifier(&Address::generate(&f.env), &v1, &symbol_short!("comprom"));
+    assert_eq!(unauth.unwrap_err().unwrap(), MarketplaceError::Unauthorized);
+
+    // Admin revokes v1.
+    f.client
+        .revoke_verifier(&f.admin, &v1, &symbol_short!("comprom"));
+
+    // v1 is removed from the verifier set.
+    let verifiers = f.client.get_verifiers();
+    assert_eq!(verifiers.len(), 1);
+    assert_eq!(verifiers.get(0).unwrap().address, v2);
+
+    // Merchant 1 drops below threshold -> downgraded.
+    let m1 = f.client.get_merchant(&id1);
+    assert!(!m1.verified);
+    assert_eq!(m1.status, MerchantStatus::Registered);
+
+    // Merchant 2 drops below threshold -> downgraded.
+    let m2 = f.client.get_merchant(&id2);
+    assert!(!m2.verified);
+    assert_eq!(m2.status, MerchantStatus::Registered);
+
+    // Revoked verifier can no longer verify.
+    let revoked_err = f.client.try_verify_merchant(&id1, &v1);
+    assert_eq!(
+        revoked_err.unwrap_err().unwrap(),
+        MarketplaceError::Unauthorized
+    );
 }
 
 #[test]
