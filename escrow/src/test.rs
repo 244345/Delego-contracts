@@ -3512,7 +3512,96 @@ use soroban_sdk::{
         let result = client.try_set_authorized_categories(&non_admin, &categories);
         assert_eq!(result, Err(Ok(EscrowError::Unauthorized)));
     }
-}
+
+    // ─── Feature: Arbiter Staking and Slashing ──────────────────────────────
+
+    #[test]
+    fn test_register_arbiter_with_stake() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _contract_id) = setup_client(&env);
+        let arbiter = Address::generate(&env);
+        
+        let result = client.register_arbiter_with_stake(&arbiter, &5_000i128);
+        assert!(result, "register_arbiter_with_stake should succeed");
+    }
+
+    #[test]
+    fn test_slash_delinquent_arbiter() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+        
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let arbiter = Address::generate(&env);
+        
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        
+        // Mint enough tokens for the contract to pay the penalty. Normally arbiters would stake the token directly.
+        token_admin_client.mint(&buyer, &10_000i128);
+        token_admin_client.mint(&client.address, &10_000i128);
+        client.add_token(&admin, &token);
+        
+        client.register_arbiter_with_stake(&arbiter, &2_000i128);
+        
+        // Setup Quorum Config
+        let mut arbiters = soroban_sdk::Vec::new(&env);
+        arbiters.push_back(arbiter.clone());
+        let quorum_config = crate::QuorumConfig {
+            arbiters,
+            threshold: 1,
+        };
+        client.set_quorum_config(&admin, &quorum_config);
+
+        let order_id = BytesN::from_array(&env, &[1u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
+        );
+        
+        client.dispute(&escrow_id, &buyer);
+        
+        let dispute_deadline = env.ledger().timestamp() + 604800;
+        
+        // Try slashing before deadline, should fail
+        let result = client.try_slash_delinquent_arbiter(&escrow_id, &buyer);
+        assert_eq!(result, Err(Ok(EscrowError::DisputeNotExpired)));
+        
+        // Fast forward ledger beyond the deadline
+        env.ledger().set(soroban_sdk::testutils::LedgerInfo {
+            timestamp: dispute_deadline + 1,
+            protocol_version: 20,
+            sequence_number: env.ledger().sequence() + 10,
+            network_id: [0; 32],
+            base_reserve: 10,
+            min_temp_entry_ttl: 1,
+            min_persistent_entry_ttl: 1,
+            max_entry_ttl: 1,
+        });
+        
+        let initial_buyer_bal = soroban_sdk::token::Client::new(&env, &token).balance(&buyer);
+        let initial_seller_bal = soroban_sdk::token::Client::new(&env, &token).balance(&seller);
+        
+        // Slash the arbiter
+        let slash_result = client.slash_delinquent_arbiter(&escrow_id, &buyer);
+        assert!(slash_result, "slash_delinquent_arbiter should succeed");
+        
+        // Verify balances - each party receives half the stake penalty (1000)
+        let final_buyer_bal = soroban_sdk::token::Client::new(&env, &token).balance(&buyer);
+        let final_seller_bal = soroban_sdk::token::Client::new(&env, &token).balance(&seller);
+        
+        assert_eq!(final_buyer_bal, initial_buyer_bal + 1000);
+        assert_eq!(final_seller_bal, initial_seller_bal + 1000);
+        
+        // Try slashing again, should fail with NotFound (already slashed)
+        let result = client.try_slash_delinquent_arbiter(&escrow_id, &buyer);
+        assert_eq!(result, Err(Ok(EscrowError::NotFound)));
+    }
+
     #[test]
     fn test_resolve_dispute_transitions_to_initial_ruling_not_resolved() {
         let env = Env::default();
