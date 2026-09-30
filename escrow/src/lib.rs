@@ -282,6 +282,12 @@ pub const ORACLE_REBATE_BPS: u32 = 10; // 0.10% of the released amount
 pub const APPEAL_WINDOW_LEDGERS: u32 = 17_280;
 /// Maximum number of line items a multi-item escrow may register (issue #363).
 pub const MAX_SUB_ORDER_ITEMS: u32 = 64;
+/// Ledger window within which multi-oracle attestations must be submitted
+/// (issue #352), measured from the first recorded vote.
+pub const MULTI_ORACLE_CONSENSUS_WINDOW_LEDGERS: u32 = 17_280; // ~1 day of ledgers
+
+/// Maximum number of authorized oracles in a multi-oracle configuration (issue #352).
+pub const MAX_ORACLES: u32 = 32;
 
 /// Finance approval state for a high-value escrow.
 #[contracttype]
@@ -691,6 +697,46 @@ pub struct SubItemResolvedEvent {
     pub remaining: i128,
     /// Admin that resolved the item.
     pub resolved_by: Address,
+/// k-of-n oracle consensus configuration for an escrow (issue #352).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiOracleConfig {
+    /// Number of affirmative attestations required to release the escrow.
+    pub required_oracle_count: u32,
+    /// Authorized oracle addresses.
+    pub oracle_addresses: Vec<Address>,
+    /// Condition identifier the oracles attest to.
+    pub condition_symbol: Symbol,
+}
+
+/// A single oracle's recorded attestation (issue #352).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OracleVoteRecord {
+    /// Oracle that cast the attestation.
+    pub oracle: Address,
+    /// Whether the oracle attested that the condition is met.
+    pub condition_met: bool,
+    /// Ledger sequence at which the attestation was recorded.
+    pub voted_at_ledger: u32,
+}
+
+/// Emitted after a multi-oracle attestation is recorded (issue #352).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OracleConsensusEvent {
+    /// Unique identifier for the escrow.
+    pub escrow_id: u64,
+    /// Oracle that cast the attestation.
+    pub oracle: Address,
+    /// Whether the oracle attested that the condition is met.
+    pub condition_met: bool,
+    /// Number of distinct affirmative attestations recorded so far.
+    pub affirmative_votes: u32,
+    /// Number of affirmative attestations required to release.
+    pub required_oracle_count: u32,
+    /// Whether this attestation triggered the release.
+    pub released: bool,
 }
 
 /// Emitted after a disputed escrow is paid to the buyer, seller, and mediator.
@@ -1504,6 +1550,14 @@ pub enum DataKey {
     SubItemResolution(u64, Symbol),
 }
 
+    /// Published delivery Merkle root for a UTC epoch day.
+    MerkleRoot(u64),
+    /// Multi-oracle consensus configuration for an escrow (issue #352).
+    MultiOracleConfig(u64),
+    /// Recorded oracle attestations for an escrow (issue #352).
+    EscrowOracleVotes(u64),
+}
+
 // NOTE: `EscrowError` intentionally does not use the `#[contracterror]` derive.
 // The Soroban XDR spec for a contract error enum is capped at 50 cases
 // (`VecM<ScSpecUdtErrorEnumCaseV0, 50>`), but this ABI carries more than that.
@@ -2110,6 +2164,32 @@ impl soroban_sdk::TryFromVal<soroban_sdk::Env, EscrowError> for soroban_sdk::Val
     EmergencyRescueAlreadyExecuted = 414,
     /// Escrow is not eligible for emergency rescue (must be in Funded or Disputed status).
     EscrowNotEligibleForRescue = 415,
+}
+
+/// Errors returned by the multi-oracle consensus path (issue #352).
+///
+/// Codes follow the issue specification (1051+). Because this is a separate
+/// contract-error enum it does not consume the escrow `EscrowError` code space.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum MultiOracleError {
+    /// Not enough distinct affirmative attestations to release the escrow.
+    ThresholdNotMet = 1051,
+    /// The oracle has already attested for this escrow.
+    DuplicateOracleVote = 1052,
+    /// The caller is not an authorized oracle for this escrow.
+    UnauthorizedOracle = 1053,
+    /// The consensus window has elapsed; no further attestations are accepted.
+    ConsensusWindowExpired = 1054,
+    /// The escrow could not be found.
+    EscrowNotFound = 1055,
+    /// No multi-oracle configuration has been set for this escrow.
+    ConfigNotSet = 1056,
+    /// The escrow is not in a state that allows consensus release.
+    InvalidStatus = 1057,
+    /// The release triggered by consensus failed.
+    ReleaseFailed = 1058,
 }
 
 /// Compact receipt returned to buyers after escrow creation via `get_receipt`.
@@ -5718,6 +5798,36 @@ impl EscrowContract {
         Ok(())
     }
 
+    /// Enforce the conservation-of-value invariant for an escrow.
+    ///
+    /// Verifies that the escrow's cumulative `released_amount + refunded_amount`,
+    /// after applying `additional_release` and `additional_refund`, can never
+    /// exceed the escrowed principal `escrow.amount`. All arithmetic is checked
+    /// so a corrupted counter surfaces as [`EscrowError::MathOverflow`] instead
+    /// of silently wrapping; a disbursement overrun returns
+    /// [`EscrowError::ExceedsTotalEscrowAmount`].
+    fn assert_value_conservation_invariant(
+        escrow: &EscrowRecord,
+        additional_release: i128,
+        additional_refund: i128,
+    ) -> Result<(), EscrowError> {
+        let new_released = escrow
+            .released_amount
+            .checked_add(additional_release)
+            .ok_or(EscrowError::MathOverflow)?;
+        let new_refunded = escrow
+            .refunded_amount
+            .checked_add(additional_refund)
+            .ok_or(EscrowError::MathOverflow)?;
+        let total_disbursed = new_released
+            .checked_add(new_refunded)
+            .ok_or(EscrowError::MathOverflow)?;
+        if total_disbursed > escrow.amount {
+            return Err(EscrowError::ExceedsTotalEscrowAmount);
+        }
+        Ok(())
+    }
+
     /// Shared release logic used by both `partial_release` and
     /// `evaluate_and_release`. Callers are responsible for their own
     /// authorization checks before invoking this.
@@ -6606,6 +6716,242 @@ impl EscrowContract {
         );
 
         Ok(amount_out)
+    }
+
+    /// Configure k-of-n oracle consensus for an escrow (issue #352).
+    ///
+    /// Buyer, seller, or admin may configure while the escrow is not terminal.
+    /// `required_oracle_count` must be between 1 and the number of oracles;
+    /// oracle addresses must be non-empty, unique, non-zero, and bounded by
+    /// [`MAX_ORACLES`]. Configuring resets any previously recorded votes.
+    pub fn set_multi_oracle_config(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        config: MultiOracleConfig,
+    ) -> Result<bool, EscrowError> {
+        caller.require_auth();
+
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+        if caller != record.buyer
+            && caller != record.seller
+            && !Self::is_admin(env.clone(), caller.clone())
+        {
+            return Err(EscrowError::Unauthorized);
+        }
+        check_not_terminal(&record)?;
+
+        let oracle_count = config.oracle_addresses.len();
+        if oracle_count == 0
+            || oracle_count > MAX_ORACLES
+            || config.required_oracle_count == 0
+            || config.required_oracle_count > oracle_count
+        {
+            return Err(EscrowError::InvalidQuorum);
+        }
+        for i in 0..oracle_count {
+            let oracle = config
+                .oracle_addresses
+                .get(i)
+                .ok_or(EscrowError::InvalidAddress)?;
+            if is_zero_address(&env, &oracle) {
+                return Err(EscrowError::InvalidAddress);
+            }
+            for j in (i + 1)..oracle_count {
+                let other = config
+                    .oracle_addresses
+                    .get(j)
+                    .ok_or(EscrowError::InvalidAddress)?;
+                if other == oracle {
+                    return Err(EscrowError::InvalidQuorum);
+                }
+            }
+        }
+
+        let config_key = DataKey::MultiOracleConfig(escrow_id);
+        let votes_key = DataKey::EscrowOracleVotes(escrow_id);
+        env.storage().persistent().set(&config_key, &config);
+        env.storage().persistent().extend_ttl(
+            &config_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage()
+            .persistent()
+            .set(&votes_key, &soroban_sdk::Vec::<OracleVoteRecord>::new(&env));
+        env.storage().persistent().extend_ttl(
+            &votes_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("oraset"), escrow_id),
+            config.required_oracle_count,
+        );
+        Ok(true)
+    }
+
+    /// Read-only getter for an escrow's multi-oracle configuration (issue #352).
+    pub fn get_multi_oracle_config(env: Env, escrow_id: u64) -> Option<MultiOracleConfig> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MultiOracleConfig(escrow_id))
+    }
+
+    /// Read-only getter for the attestations recorded on an escrow (issue #352).
+    pub fn get_oracle_votes(env: Env, escrow_id: u64) -> soroban_sdk::Vec<OracleVoteRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EscrowOracleVotes(escrow_id))
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
+    }
+
+    /// Submit a multi-oracle attestation for an escrow (issue #352).
+    ///
+    /// The caller must be one of the escrow's authorized oracles and may attest
+    /// at most once. Attestations must arrive within
+    /// [`MULTI_ORACLE_CONSENSUS_WINDOW_LEDGERS`] of the first vote. Once
+    /// `required_oracle_count` distinct affirmative attestations are recorded
+    /// the escrow is released to the seller immediately.
+    ///
+    /// Returns `true` when this attestation triggered the release, `false` when
+    /// it was recorded and consensus is still pending.
+    pub fn submit_oracle_attestation(
+        env: Env,
+        escrow_id: u64,
+        caller: Address,
+        condition_met: bool,
+    ) -> Result<bool, MultiOracleError> {
+        caller.require_auth();
+
+        let key = DataKey::Escrow(escrow_id);
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(MultiOracleError::EscrowNotFound)?;
+        let config: MultiOracleConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultiOracleConfig(escrow_id))
+            .ok_or(MultiOracleError::ConfigNotSet)?;
+        if record.status != EscrowStatus::Funded {
+            return Err(MultiOracleError::InvalidStatus);
+        }
+        if !config.oracle_addresses.contains(&caller) {
+            return Err(MultiOracleError::UnauthorizedOracle);
+        }
+
+        let mut votes: soroban_sdk::Vec<OracleVoteRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowOracleVotes(escrow_id))
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+
+        for i in 0..votes.len() {
+            if let Some(existing) = votes.get(i) {
+                if existing.oracle == caller {
+                    return Err(MultiOracleError::DuplicateOracleVote);
+                }
+            }
+        }
+
+        let current_ledger = env.ledger().sequence();
+        if let Some(first) = votes.get(0) {
+            let expiry = first
+                .voted_at_ledger
+                .saturating_add(MULTI_ORACLE_CONSENSUS_WINDOW_LEDGERS);
+            if current_ledger > expiry {
+                return Err(MultiOracleError::ConsensusWindowExpired);
+            }
+        }
+
+        votes.push_back(OracleVoteRecord {
+            oracle: caller.clone(),
+            condition_met,
+            voted_at_ledger: current_ledger,
+        });
+
+        let mut affirmative: u32 = 0;
+        for i in 0..votes.len() {
+            if let Some(recorded) = votes.get(i) {
+                if recorded.condition_met {
+                    affirmative += 1;
+                }
+            }
+        }
+
+        let mut released = false;
+        if affirmative >= config.required_oracle_count {
+            let remaining = record
+                .amount
+                .checked_sub(record.released_amount)
+                .and_then(|balance| balance.checked_sub(record.refunded_amount))
+                .ok_or(MultiOracleError::ReleaseFailed)?;
+            if remaining <= 0 {
+                return Err(MultiOracleError::InvalidStatus);
+            }
+            Self::execute_release(&env, escrow_id, &key, record, caller.clone(), remaining)
+                .map_err(|_| MultiOracleError::ReleaseFailed)?;
+            released = true;
+        }
+
+        let votes_key = DataKey::EscrowOracleVotes(escrow_id);
+        env.storage().persistent().set(&votes_key, &votes);
+        env.storage().persistent().extend_ttl(
+            &votes_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("oracst"), escrow_id),
+            OracleConsensusEvent {
+                escrow_id,
+                oracle: caller,
+                condition_met,
+                affirmative_votes: affirmative,
+                required_oracle_count: config.required_oracle_count,
+                released,
+            },
+        );
+
+        Ok(released)
+    }
+
+    /// Check whether an escrow has reached its multi-oracle threshold (issue #352).
+    ///
+    /// Returns `Ok(true)` once enough distinct affirmative attestations are
+    /// recorded, otherwise `Err(MultiOracleError::ThresholdNotMet)`.
+    pub fn check_oracle_consensus(env: Env, escrow_id: u64) -> Result<bool, MultiOracleError> {
+        let config: MultiOracleConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultiOracleConfig(escrow_id))
+            .ok_or(MultiOracleError::ConfigNotSet)?;
+        let votes: soroban_sdk::Vec<OracleVoteRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowOracleVotes(escrow_id))
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        let mut affirmative: u32 = 0;
+        for i in 0..votes.len() {
+            if let Some(recorded) = votes.get(i) {
+                if recorded.condition_met {
+                    affirmative += 1;
+                }
+            }
+        }
+        if affirmative >= config.required_oracle_count {
+            Ok(true)
+        } else {
+            Err(MultiOracleError::ThresholdNotMet)
+        }
     }
 
     /// Mark the escrow as disputed. Only the buyer or seller may call.
@@ -10752,6 +11098,24 @@ mod sub_order_resolution_tests {
     };
 
     fn setup(env: &Env) -> (EscrowContractClient<'_>, Address, Address, Address, Address) {
+mod multi_oracle_tests {
+    use super::*;
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        token::{Client as TokenClient, StellarAssetClient},
+    };
+
+    fn base(
+        env: &Env,
+    ) -> (
+        EscrowContractClient<'_>,
+        Address,
+        Address,
+        Address,
+        Address,
+        u64,
+        [Address; 3],
+    ) {
         env.mock_all_auths();
         let admin = Address::generate(env);
         let treasury = Address::generate(env);
@@ -11423,6 +11787,68 @@ mod sub_order_resolution_tests {
         assert_eq!(
             client.try_resolve_sub_item_dispute(&escrow_id, &admin, &resolution),
             Err(Ok(EscrowError::SubItemAlreadyResolved))
+        let order_id = BytesN::from_array(env, &[51; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000, &order_id, &1_000, &None, &None,
+        );
+        let oracles = [
+            Address::generate(env),
+            Address::generate(env),
+            Address::generate(env),
+        ];
+        (client, admin, buyer, seller, token, escrow_id, oracles)
+    }
+
+    fn configured(
+        env: &Env,
+    ) -> (
+        EscrowContractClient<'_>,
+        Address,
+        Address,
+        Address,
+        Address,
+        u64,
+        [Address; 3],
+    ) {
+        let (client, admin, buyer, seller, token, escrow_id, oracles) = base(env);
+        let config = MultiOracleConfig {
+            required_oracle_count: 2,
+            oracle_addresses: soroban_sdk::Vec::from_array(
+                env,
+                [oracles[0].clone(), oracles[1].clone(), oracles[2].clone()],
+            ),
+            condition_symbol: Symbol::new(env, "delivered"),
+        };
+        client.set_multi_oracle_config(&admin, &escrow_id, &config);
+        (client, admin, buyer, seller, token, escrow_id, oracles)
+    }
+
+    #[test]
+    fn two_of_three_consensus_releases_escrow() {
+        let env = Env::default();
+        let (client, _admin, _buyer, seller, token, escrow_id, oracles) = configured(&env);
+        let token_client = TokenClient::new(&env, &token);
+
+        // First affirmative vote is recorded but does not release.
+        assert!(!client.submit_oracle_attestation(&escrow_id, &oracles[0], &true));
+        assert_eq!(client.get_escrow(&escrow_id).status, EscrowStatus::Funded);
+        assert_eq!(
+            client.try_check_oracle_consensus(&escrow_id),
+            Err(Ok(MultiOracleError::ThresholdNotMet))
+        );
+
+        // Second affirmative vote crosses the 2-of-3 threshold and auto-releases.
+        assert!(client.submit_oracle_attestation(&escrow_id, &oracles[1], &true));
+        let record = client.get_escrow(&escrow_id);
+        assert_eq!(record.status, EscrowStatus::Released);
+        assert_eq!(record.released_amount, 1_000);
+        assert_eq!(token_client.balance(&seller), 1_000);
+        assert_eq!(token_client.balance(&client.address), 0);
+
+        // Once terminal, further attestations are rejected.
+        assert_eq!(
+            client.try_submit_oracle_attestation(&escrow_id, &oracles[2], &true),
+            Err(Ok(MultiOracleError::InvalidStatus))
         );
     }
 
@@ -11554,6 +11980,19 @@ mod sub_order_resolution_tests {
                 .execute_path_payment(&f.escrow_id, &f.admin, &f.router, &route)
                 .output_amount
                 > 0
+    fn duplicate_and_unauthorized_votes_are_rejected() {
+        let env = Env::default();
+        let (client, _admin, _buyer, _seller, _token, escrow_id, oracles) = configured(&env);
+        let stranger = Address::generate(&env);
+
+        assert!(!client.submit_oracle_attestation(&escrow_id, &oracles[0], &true));
+        assert_eq!(
+            client.try_submit_oracle_attestation(&escrow_id, &oracles[0], &true),
+            Err(Ok(MultiOracleError::DuplicateOracleVote))
+        );
+        assert_eq!(
+            client.try_submit_oracle_attestation(&escrow_id, &stranger, &true),
+            Err(Ok(MultiOracleError::UnauthorizedOracle))
         );
     }
 
@@ -11574,6 +12013,18 @@ mod sub_order_resolution_tests {
             f.client
                 .try_execute_path_payment(&f.escrow_id, &f.buyer, &zero_contract, &route),
             Err(Ok(EscrowError::InvalidAddress))
+    fn attestations_after_consensus_window_are_rejected() {
+        let env = Env::default();
+        let (client, _admin, _buyer, _seller, _token, escrow_id, oracles) = configured(&env);
+
+        env.ledger().set_sequence_number(1_000);
+        assert!(!client.submit_oracle_attestation(&escrow_id, &oracles[0], &true));
+
+        env.ledger()
+            .set_sequence_number(1_000 + MULTI_ORACLE_CONSENSUS_WINDOW_LEDGERS + 1);
+        assert_eq!(
+            client.try_submit_oracle_attestation(&escrow_id, &oracles[1], &true),
+            Err(Ok(MultiOracleError::ConsensusWindowExpired))
         );
     }
 
@@ -11815,6 +12266,34 @@ mod sub_order_resolution_tests {
                 },
             ),
             Err(Ok(EscrowError::Unauthorized))
+    fn invalid_configurations_are_rejected() {
+        let env = Env::default();
+        let (client, admin, _buyer, _seller, _token, escrow_id, oracles) = base(&env);
+
+        let too_many = MultiOracleConfig {
+            required_oracle_count: 4,
+            oracle_addresses: soroban_sdk::Vec::from_array(
+                &env,
+                [oracles[0].clone(), oracles[1].clone(), oracles[2].clone()],
+            ),
+            condition_symbol: Symbol::new(&env, "delivered"),
+        };
+        assert_eq!(
+            client.try_set_multi_oracle_config(&admin, &escrow_id, &too_many),
+            Err(Ok(EscrowError::InvalidQuorum))
+        );
+
+        let duplicates = MultiOracleConfig {
+            required_oracle_count: 2,
+            oracle_addresses: soroban_sdk::Vec::from_array(
+                &env,
+                [oracles[0].clone(), oracles[0].clone()],
+            ),
+            condition_symbol: Symbol::new(&env, "delivered"),
+        };
+        assert_eq!(
+            client.try_set_multi_oracle_config(&admin, &escrow_id, &duplicates),
+            Err(Ok(EscrowError::InvalidQuorum))
         );
     }
 }
