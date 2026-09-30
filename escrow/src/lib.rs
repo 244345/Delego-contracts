@@ -1113,6 +1113,27 @@ pub struct AdminView {
     pub pending_admin: Option<Address>,
 }
 
+/// Emitted when a terminal escrow's persistent storage is reclaimed by
+/// `archive_terminal_escrow` (issue #331).
+///
+/// Published *before* the auxiliary entries are removed so an indexer replaying
+/// the ledger sees what was purged even though the state behind the event is
+/// gone by the end of the transaction.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EscrowArchivedEvent {
+    /// Unique identifier of the archived escrow.
+    pub escrow_id: u64,
+    /// Terminal state the escrow had settled into.
+    pub terminal_state: EscrowTerminalState,
+    /// Ledger timestamp of the escrow's last update (its terminal transition).
+    pub terminal_at: u64,
+    /// Ledger timestamp at which the sweep ran.
+    pub archived_at: u64,
+    /// Number of persistent entries removed by this sweep.
+    pub cleared_entries: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DisputeVotesPrunedEvent {
@@ -1446,7 +1467,8 @@ pub enum DataKey {
 // | 440 | InvalidFallbackAction | next major |
 // | 441 | DualControlTimeoutNotConfigured | next major |
 // | 442 | DualControlAlreadyApproved | next major |
-// | 443+ | Reserved for new variants | next major |
+// | 443 | ArchivalRetentionNotElapsed | next major |
+// | 444+ | Reserved for new variants | next major |
 //
 // # Allocating new variants
 //
@@ -1685,6 +1707,8 @@ pub enum EscrowError {
     DualControlTimeoutNotConfigured = 441,
     /// The secondary approver already signed, so no fallback is due.
     DualControlAlreadyApproved = 442,
+    /// A terminal escrow has not been settled for long enough to archive.
+    ArchivalRetentionNotElapsed = 443,
 }
 
 /// Runs `f` under a re-entrancy lock and returns its result unchanged.
@@ -1933,6 +1957,16 @@ pub const UPGRADE_TIMELOCK_SECS: u64 = 172_800;
 /// Minimum (and default) number of admin approvals required to upgrade, so a
 /// single compromised key can never replace contract code on its own.
 pub const MIN_UPGRADE_THRESHOLD: u32 = 2;
+/// Number of ledgers a terminal escrow's persistent entries are retained after
+/// the escrow settles, before `archive_terminal_escrow` may reclaim them
+/// (issue #331). 518_400 ledgers at the network's nominal 5s close time is
+/// ~30 days — long enough for every dispute window, refund claim, and
+/// reconciliation job to have read the record, while still bounding the rent a
+/// dead escrow can pin down.
+pub const ARCHIVAL_RETENTION_LEDGERS: u32 = 518_400;
+/// Nominal seconds between ledger closes, used to convert
+/// [`ARCHIVAL_RETENTION_LEDGERS`] into a wall-clock retention window.
+const SECONDS_PER_LEDGER: u64 = 5;
 
 /// Mandatory window after `timeout_ledger` during which a seller/admin
 /// timeout-based claim (`refund`/`partial_refund` called by the seller with a
@@ -7101,6 +7135,129 @@ impl EscrowContract {
         Ok(pruned_count)
     }
 
+    /// Reclaim the persistent storage held by a settled escrow (issue #331).
+    ///
+    /// Once an escrow reaches a terminal state (`Released`, `Refunded`,
+    /// `Cancelled`) it can never move again, so its storage is dead weight
+    /// that still pins rent. This sweep deletes the escrow record together with
+    /// every per-escrow auxiliary entry — dispute/timeout vote maps, metadata
+    /// halves, shipment proof, release condition, dual-control config, yield
+    /// config, release-condition gate, and the keeper bump marker — after the
+    /// [`ARCHIVAL_RETENTION_LEDGERS`] retention window has elapsed since the
+    /// escrow's terminal transition.
+    ///
+    /// The window is measured from `record.updated_at`, which is frozen at the
+    /// terminal transition: every mutating path calls `check_not_terminal`
+    /// (including `bump_ttl_with_bounty`), so no later call can push the
+    /// timestamp forward and extend an escrow's life.
+    ///
+    /// # Safety
+    ///
+    /// Only terminal escrows past the retention window are eligible, so the
+    /// sweep can never delete an active or disputed escrow. It is additionally
+    /// guarded by a settled-balance check: a `Released`/`Refunded` escrow whose
+    /// balance is not fully drained is rejected rather than archived. Because
+    /// the only state it can touch is already-dead state, the call takes no
+    /// `require_auth` — it is safe for any keeper (or automated rent sweeper)
+    /// to submit, and a third party gains nothing by triggering it early.
+    ///
+    /// # Indexes
+    ///
+    /// The shared `EscrowIds` and `BuyerEscrowAt` indexes are deliberately left
+    /// untouched. `list_escrows`/`list_escrows_by_buyer` already skip ids whose
+    /// record is gone, and rewriting a shared, append-only vector per escrow
+    /// would cost more rent than the sweep reclaims. An archived escrow is
+    /// therefore reported as [`EscrowError::NotFound`] by every getter.
+    ///
+    /// # Errors
+    /// - [`EscrowError::NotFound`] if `escrow_id` has no record (or was already
+    ///   archived by an earlier sweep).
+    /// - [`EscrowError::InvalidStatus`] if the escrow is not terminal
+    ///   (`Created`, `Funded`, or `Disputed`), or a payout-terminal escrow
+    ///   still has an undrained balance.
+    /// - [`EscrowError::ArchivalRetentionNotElapsed`] if the retention window
+    ///   has not yet passed since the terminal transition.
+    pub fn archive_terminal_escrow(env: Env, escrow_id: u64) -> Result<(), EscrowError> {
+        let key = DataKey::Escrow(escrow_id);
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+
+        // `EscrowTerminalState::from_status` is the single source of truth for
+        // what counts as terminal, so archiving can never disagree with
+        // `check_not_terminal` about which states are still live.
+        let terminal_state =
+            EscrowTerminalState::from_status(&record.status).ok_or(EscrowError::InvalidStatus)?;
+
+        // Defensive invariant: a payout-terminal escrow must have fully drained
+        // its balance. `Cancelled` is only reachable from `Created` (never
+        // funded), so it is exempt — there is nothing to have stranded.
+        if terminal_state != EscrowTerminalState::Cancelled
+            && record.amount - record.released_amount - record.refunded_amount != 0
+        {
+            return Err(EscrowError::InvalidStatus);
+        }
+
+        let archived_at = env.ledger().timestamp();
+        let retention_secs = ARCHIVAL_RETENTION_LEDGERS as u64 * SECONDS_PER_LEDGER;
+        if archived_at.saturating_sub(record.updated_at) < retention_secs {
+            return Err(EscrowError::ArchivalRetentionNotElapsed);
+        }
+
+        // Snapshot which entries are actually present first, so the event can
+        // report the reclaim count before any of the state is dropped. A plain
+        // array is used rather than a host `Vec` — the key set is fixed, and
+        // building it on the stack avoids the storage round-trip and the clone
+        // that materializing `DataKey` values into a `Vec` would cost.
+        let aux_keys = [
+            DataKey::DisputeVotes(escrow_id),
+            DataKey::TimeoutExtensionVotes(escrow_id),
+            DataKey::EscrowMetadataHash(escrow_id),
+            DataKey::EscrowMetadataSchema(escrow_id),
+            DataKey::ShipmentProof(escrow_id),
+            DataKey::ReleaseCondition(escrow_id),
+            DataKey::DualControlConfig(escrow_id),
+            DataKey::EscrowYieldConfig(escrow_id),
+            DataKey::RequireReleaseCondition(escrow_id),
+            DataKey::LastBumpLedger(escrow_id),
+        ];
+        let storage = env.storage().persistent();
+        let mut cleared_entries: u32 = 0;
+        for aux_key in aux_keys.iter() {
+            if storage.has(aux_key) {
+                cleared_entries += 1;
+            }
+        }
+        cleared_entries += 1; // the escrow record itself
+
+        // Emitted *before* the removals: once the sweep returns, the state this
+        // event describes no longer exists, so the record of what was purged
+        // has to be in the log ahead of the deletion.
+        env.events().publish(
+            (
+                symbol_short!("escrow"),
+                symbol_short!("archived"),
+                escrow_id,
+            ),
+            EscrowArchivedEvent {
+                escrow_id,
+                terminal_state,
+                terminal_at: record.updated_at,
+                archived_at,
+                cleared_entries,
+            },
+        );
+
+        for aux_key in aux_keys.iter() {
+            storage.remove(aux_key);
+        }
+        storage.remove(&key);
+
+        Ok(())
+    }
+
     /// Remove a co-admin. Must be called by the primary admin.
     pub fn remove_co_admin(
         env: Env,
@@ -10851,6 +11008,348 @@ mod reentrancy_tests {
 }
 
 #[cfg(test)]
+mod archival_tests {
+    use super::*;
+    use soroban_sdk::{
+        testutils::{Address as _, Events, Ledger},
+        TryIntoVal,
+    };
+
+    /// Wall-clock retention enforced by `archive_terminal_escrow`.
+    const RETENTION_SECS: u64 = ARCHIVAL_RETENTION_LEDGERS as u64 * SECONDS_PER_LEDGER;
+
+    struct Fixture<'a> {
+        env: Env,
+        client: EscrowContractClient<'a>,
+        contract_id: Address,
+        admin: Address,
+        buyer: Address,
+        seller: Address,
+        token: Address,
+    }
+
+    /// Registers a whitelisted escrow contract with zero fees so a settlement
+    /// drains the balance exactly, keeping the archive-time invariant check
+    /// honest in these tests.
+    fn setup(env: &Env) -> Fixture<'_> {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let buyer = Address::generate(env);
+        let seller = Address::generate(env);
+        let treasury = Address::generate(env);
+        let token = env.register_stellar_asset_contract(admin.clone());
+        let token_client = soroban_sdk::token::StellarAssetClient::new(env, &token);
+        token_client.mint(&buyer, &10_000i128);
+
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 0u32,
+            treasury,
+            min_amount: 1i128,
+            max_amount: 1_000_000i128,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(env, &contract_id);
+        client.add_token(&admin, &token);
+
+        Fixture {
+            env: env.clone(),
+            client,
+            contract_id,
+            admin,
+            buyer,
+            seller,
+            token,
+        }
+    }
+
+    impl Fixture<'_> {
+        fn deposit(&self, seed: u8) -> u64 {
+            self.client.deposit(
+                &self.buyer,
+                &self.seller,
+                &self.token,
+                &1_000i128,
+                &BytesN::from_array(&self.env, &[seed; 32]),
+                &1_000u32,
+                &None::<BytesN<32>>,
+                &None::<Symbol>,
+            )
+        }
+
+        /// Creates without funding, leaving the escrow in `Created` — the only
+        /// state `cancel` accepts, and the way to reach a `Cancelled` terminal
+        /// state that never held funds.
+        fn create(&self, seed: u8) -> u64 {
+            self.client.create(
+                &self.buyer,
+                &self.seller,
+                &self.token,
+                &1_000i128,
+                &BytesN::from_array(&self.env, &[seed; 32]),
+                &1_000u32,
+                &None::<BytesN<32>>,
+                &None::<Symbol>,
+            )
+        }
+
+        /// Every per-escrow entry `archive_terminal_escrow` is responsible for.
+        /// An explicit `std::vec` path is needed because the crate-level `Vec`
+        /// is the host-backed `soroban_sdk::Vec`.
+        fn aux_keys(&self, escrow_id: u64) -> std::vec::Vec<DataKey> {
+            std::vec![
+                DataKey::DisputeVotes(escrow_id),
+                DataKey::TimeoutExtensionVotes(escrow_id),
+                DataKey::EscrowMetadataHash(escrow_id),
+                DataKey::EscrowMetadataSchema(escrow_id),
+                DataKey::ShipmentProof(escrow_id),
+                DataKey::ReleaseCondition(escrow_id),
+                DataKey::DualControlConfig(escrow_id),
+                DataKey::EscrowYieldConfig(escrow_id),
+                DataKey::RequireReleaseCondition(escrow_id),
+                DataKey::LastBumpLedger(escrow_id),
+            ]
+        }
+
+        fn persisted(&self, key: &DataKey) -> bool {
+            self.env.as_contract(&self.contract_id, || {
+                self.env.storage().persistent().has(key)
+            })
+        }
+
+        /// Grows the ledger clock past the retention window.
+        fn advance_past_retention(&self) {
+            let target = self.env.ledger().timestamp() + RETENTION_SECS;
+            self.env.ledger().with_mut(|li| li.timestamp = target);
+        }
+    }
+
+    #[test]
+    fn released_escrow_is_reclaimed_after_retention() {
+        let env = Env::default();
+        let f = setup(&env);
+        let escrow_id = f.deposit(1);
+        let seller = f.seller.clone();
+        f.client.release(&escrow_id, &f.buyer, &seller);
+
+        // Aux entries exist before the sweep so the reclaim is observable.
+        let aux_keys = f.aux_keys(escrow_id);
+        assert!(f.persisted(&DataKey::Escrow(escrow_id)));
+
+        f.advance_past_retention();
+        f.client.archive_terminal_escrow(&escrow_id);
+
+        assert!(!f.persisted(&DataKey::Escrow(escrow_id)));
+        for key in aux_keys {
+            assert!(!f.persisted(&key), "auxiliary entry survived the sweep");
+        }
+        // Every getter now reports the escrow as gone.
+        assert_eq!(
+            f.client.try_get_escrow(&escrow_id),
+            Err(Ok(EscrowError::NotFound))
+        );
+    }
+
+    #[test]
+    fn archived_event_is_published_before_removal() {
+        let env = Env::default();
+        let f = setup(&env);
+        let escrow_id = f.deposit(2);
+        let seller = f.seller.clone();
+        f.client.release(&escrow_id, &f.buyer, &seller);
+
+        let terminal_at = f.client.get_escrow(&escrow_id).updated_at;
+        f.advance_past_retention();
+        let archived_at = f.env.ledger().timestamp();
+        f.client.archive_terminal_escrow(&escrow_id);
+
+        let events = f.env.events().all();
+        let archived = events.last().expect("the sweep emitted an event");
+        assert_eq!(archived.0, f.contract_id);
+        assert_eq!(archived.1.len(), 3);
+
+        let action: Symbol = archived.1.get(1).unwrap().try_into_val(&f.env).unwrap();
+        assert_eq!(action, symbol_short!("archived"));
+        let topic_id: u64 = archived.1.get(2).unwrap().try_into_val(&f.env).unwrap();
+        assert_eq!(topic_id, escrow_id);
+
+        let event: EscrowArchivedEvent = archived.2.try_into_val(&f.env).unwrap();
+        assert_eq!(event.escrow_id, escrow_id);
+        assert_eq!(event.terminal_state, EscrowTerminalState::Released);
+        assert_eq!(event.terminal_at, terminal_at);
+        assert_eq!(event.archived_at, archived_at);
+        // Only the escrow record itself is stored for this escrow — `deposit`
+        // wrote no metadata halves, so nothing else is reclaimed.
+        assert_eq!(event.cleared_entries, 1);
+
+        // The event is the last thing the sweep leaves behind: the state it
+        // describes is already gone by the time the log is read back.
+        assert!(!f.persisted(&DataKey::Escrow(escrow_id)));
+    }
+
+    #[test]
+    fn active_escrow_is_protected_from_archival() {
+        let env = Env::default();
+        let f = setup(&env);
+        let escrow_id = f.deposit(3);
+
+        // Retention is irrelevant while funds are still locked.
+        f.advance_past_retention();
+        f.advance_past_retention();
+
+        assert_eq!(
+            f.client.try_archive_terminal_escrow(&escrow_id),
+            Err(Ok(EscrowError::InvalidStatus))
+        );
+        assert!(f.persisted(&DataKey::Escrow(escrow_id)));
+    }
+
+    #[test]
+    fn disputed_escrow_is_protected_from_archival() {
+        let env = Env::default();
+        let f = setup(&env);
+        let escrow_id = f.deposit(4);
+        f.client.dispute(&escrow_id, &f.buyer);
+
+        f.advance_past_retention();
+        f.advance_past_retention();
+
+        assert_eq!(
+            f.client.try_archive_terminal_escrow(&escrow_id),
+            Err(Ok(EscrowError::InvalidStatus))
+        );
+        assert!(f.persisted(&DataKey::Escrow(escrow_id)));
+    }
+
+    #[test]
+    fn retention_window_blocks_premature_archival() {
+        let env = Env::default();
+        let f = setup(&env);
+        let escrow_id = f.deposit(5);
+        let seller = f.seller.clone();
+        f.client.release(&escrow_id, &f.buyer, &seller);
+
+        // One second short of the window.
+        let just_short = f.env.ledger().timestamp() + RETENTION_SECS - 1;
+        f.env.ledger().with_mut(|li| li.timestamp = just_short);
+        assert_eq!(
+            f.client.try_archive_terminal_escrow(&escrow_id),
+            Err(Ok(EscrowError::ArchivalRetentionNotElapsed))
+        );
+        assert!(f.persisted(&DataKey::Escrow(escrow_id)));
+
+        // Exactly at the window the escrow becomes archivable.
+        f.env.ledger().with_mut(|li| li.timestamp += 1);
+        assert!(f.client.try_archive_terminal_escrow(&escrow_id).is_ok());
+    }
+
+    #[test]
+    fn retention_window_is_measured_from_the_terminal_transition() {
+        let env = Env::default();
+        let f = setup(&env);
+        let escrow_id = f.deposit(6);
+
+        // Age the escrow well past the window *before* it settles; the sweep
+        // must still hold, because retention runs from the terminal transition
+        // and not from creation.
+        f.advance_past_retention();
+        f.advance_past_retention();
+        let settled_at = f.env.ledger().timestamp();
+        let seller = f.seller.clone();
+        f.client.release(&escrow_id, &f.buyer, &seller);
+
+        assert_eq!(
+            f.client.try_archive_terminal_escrow(&escrow_id),
+            Err(Ok(EscrowError::ArchivalRetentionNotElapsed))
+        );
+
+        f.env
+            .ledger()
+            .with_mut(|li| li.timestamp = settled_at + RETENTION_SECS);
+        assert!(f.client.try_archive_terminal_escrow(&escrow_id).is_ok());
+    }
+
+    #[test]
+    fn cancelled_escrow_is_archivable() {
+        let env = Env::default();
+        let f = setup(&env);
+        // Never funded, so the settled-balance invariant does not apply — the
+        // sweep must still reclaim it.
+        let escrow_id = f.create(7);
+        let seller = f.seller.clone();
+        f.client
+            .cancel(&escrow_id, &seller, &symbol_short!("expired"));
+
+        f.advance_past_retention();
+        f.client.archive_terminal_escrow(&escrow_id);
+        assert!(!f.persisted(&DataKey::Escrow(escrow_id)));
+    }
+
+    #[test]
+    fn refunded_escrow_is_archivable() {
+        let env = Env::default();
+        let f = setup(&env);
+        let escrow_id = f.deposit(8);
+        f.client.refund(&escrow_id, &f.seller);
+
+        f.advance_past_retention();
+        f.client.archive_terminal_escrow(&escrow_id);
+        assert!(!f.persisted(&DataKey::Escrow(escrow_id)));
+    }
+
+    #[test]
+    fn unknown_escrow_is_reported_as_not_found() {
+        let env = Env::default();
+        let f = setup(&env);
+        f.advance_past_retention();
+        assert_eq!(
+            f.client.try_archive_terminal_escrow(&999u64),
+            Err(Ok(EscrowError::NotFound))
+        );
+    }
+
+    #[test]
+    fn repeated_sweeps_are_rejected_once_the_record_is_gone() {
+        let env = Env::default();
+        let f = setup(&env);
+        let escrow_id = f.deposit(9);
+        let seller = f.seller.clone();
+        f.client.release(&escrow_id, &f.buyer, &seller);
+
+        f.advance_past_retention();
+        f.client.archive_terminal_escrow(&escrow_id);
+        assert_eq!(
+            f.client.try_archive_terminal_escrow(&escrow_id),
+            Err(Ok(EscrowError::NotFound))
+        );
+    }
+
+    #[test]
+    fn sweeping_an_escrow_leaves_its_neighbour_untouched() {
+        let env = Env::default();
+        let f = setup(&env);
+        let archived_id = f.deposit(10);
+        let kept_id = f.deposit(11);
+        let seller = f.seller.clone();
+        f.client.release(&archived_id, &f.buyer, &seller);
+        f.client.release(&kept_id, &f.buyer, &seller);
+
+        f.advance_past_retention();
+        f.client.archive_terminal_escrow(&archived_id);
+
+        assert!(!f.persisted(&DataKey::Escrow(archived_id)));
+        assert!(f.persisted(&DataKey::Escrow(kept_id)));
+    }
+
+    #[test]
+    fn retention_ledgers_is_thirty_days() {
+        // 518_400 ledgers at the nominal 5s close time.
+        assert_eq!(ARCHIVAL_RETENTION_LEDGERS, 518_400);
+        assert_eq!(RETENTION_SECS, 30 * 24 * 60 * 60);
+    }
+}
+
+#[cfg(test)]
 mod error_code_allocation_tests {
     use super::*;
     const ALLOCATED_RANGES: [(u32, u32); 5] = [
@@ -10860,7 +11359,7 @@ mod error_code_allocation_tests {
         (3_000, 3_999),
         (4_000, 4_999),
     ];
-    fn escrow_error_codes() -> [u32; 56] {
+    fn escrow_error_codes() -> [u32; 57] {
         [
             EscrowError::AlreadyInitialized as u32,
             EscrowError::NotFound as u32,
@@ -10918,6 +11417,7 @@ mod error_code_allocation_tests {
             EscrowError::InvalidFallbackAction as u32,
             EscrowError::DualControlTimeoutNotConfigured as u32,
             EscrowError::DualControlAlreadyApproved as u32,
+            EscrowError::ArchivalRetentionNotElapsed as u32,
         ]
     }
     #[test]

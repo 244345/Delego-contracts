@@ -446,6 +446,7 @@ To prevent dead state accumulation and bound storage costs on-chain, Delego cont
 | **Marketplace** | `prune_closed_merchants(admin, merchant_ids)` | Admin | ≤ 50 IDs | Prunes `Closed` merchants from `MerchantIds` and `CategoryIndex` |
 | **Reputation** | `prune_entity_history(admin, entity, max_records)` | Admin | ≤ 50 Records | Trims transaction history beyond the scoring window (`SCORE_WINDOW = 200`) |
 | **Escrow** | `prune_dispute_votes(admin, escrow_ids)` | Admin | ≤ 50 IDs | Cleans up `DisputeVotes` and `TimeoutExtensionVotes` for settled escrows |
+| **Escrow** | `archive_terminal_escrow(escrow_id)` | Public | 1 ID | Deletes the record and every auxiliary entry of a terminal escrow once `ARCHIVAL_RETENTION_LEDGERS` (~30 days) has elapsed since it settled |
 
 ## Upgrade Patterns
 
