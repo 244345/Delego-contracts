@@ -548,7 +548,11 @@ impl DelegationRegistry {
         let next_id = id.checked_add(1).ok_or(DelegationError::IdExhausted)?;
         env.storage().instance().set(&DataKey::NextId, &next_id);
 
-        let expires_at_ledger = env.ledger().sequence() + ttl_ledgers;
+        let expires_at_ledger = env
+            .ledger()
+            .sequence()
+            .checked_add(ttl_ledgers)
+            .ok_or(DelegationError::InvalidTtl)?;
         let now = env.ledger().timestamp();
 
         let record = DelegationRecord {

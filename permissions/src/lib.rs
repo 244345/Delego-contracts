@@ -191,6 +191,8 @@ pub enum PermissionError {
     UnauthorizedFunction = 2417,
     /// Admin-gated call made before `set_admin` has ever been called
     NotInitialized = 2500,
+    /// Allowance sweep targeted a delegation that is still live
+    DelegationNotExpired = 2414,
 }
 
 #[cfg(test)]
@@ -240,6 +242,7 @@ mod error_code_tests {
         PermissionError::StaleEpoch as u32,
         PermissionError::UnauthorizedFunction as u32,
         PermissionError::NotInitialized as u32,
+        PermissionError::DelegationNotExpired as u32,
     ];
 
     #[test]
@@ -464,6 +467,18 @@ pub struct MultiOwnerSpendEvent {
 pub struct SchemaRegisteredEvent {
     pub admin: Address,
     pub schema: Symbol,
+}
+
+/// Emitted when an expired delegation's token allowance is reset to zero.
+#[contracttype]
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct AllowanceReclaimedEvent {
+    pub owner: Address,
+    pub delegate: Address,
+    pub token: Address,
+    /// Allowance that was outstanding before the reset.
+    pub reclaimed_amount: i128,
 }
 
 /// Lightweight config for multi-merchant whitelisting and allowance tracking.
@@ -1087,6 +1102,17 @@ pub enum DataKey {
     DelegatePermissions(Address),
 }
 
+/// Computes `current + ttl` as an absolute expiry ledger.
+///
+/// Unchecked `u32` addition would wrap for large TTLs (e.g. `u32::MAX`),
+/// producing an expiry in the past and an instantly-expired grant. Overflow
+/// is instead reported as [`PermissionError::InvalidExpiry`] (2412).
+pub fn compute_expiry_ledger(current: u32, ttl: u32) -> Result<u32, PermissionError> {
+    current
+        .checked_add(ttl)
+        .ok_or(PermissionError::InvalidExpiry)
+}
+
 #[contract]
 pub struct PermissionsContract;
 
@@ -1313,7 +1339,6 @@ impl PermissionsContract {
             _ => {}
         }
 
-        let expires_at_ledger = env.ledger().sequence() + ttl_ledgers;
         let expires_at_ledger = Self::grant_expiry_ledger(&env, ttl_ledgers)?;
 
         let user_perms_key = DataKey::UserPermissions(owner.clone());
@@ -1949,9 +1974,7 @@ impl PermissionsContract {
     /// returning [`PermissionError::InvalidExpiry`] instead of overflow-panicking
     /// when `ttl_ledgers` is large enough to push the sum past `u32::MAX`.
     fn grant_expiry_ledger(env: &Env, ttl_ledgers: u32) -> Result<u32, PermissionError> {
-        ttl_ledgers
-            .checked_add(env.ledger().sequence())
-            .ok_or(PermissionError::InvalidExpiry)
+        compute_expiry_ledger(env.ledger().sequence(), ttl_ledgers)
     }
 
     fn add_to_address_index(env: &Env, key: &DataKey, address: &Address) {
@@ -3675,6 +3698,61 @@ impl PermissionsContract {
     }
 
     pub fn get_permission(env: Env, owner: Address, delegate: Address) -> Result<PermissionRecord, PermissionError> {
+    /// Resets the owner's SAC allowance for `delegate` on `token` to zero once
+    /// the delegation has expired, so a lapsed delegation cannot keep pulling
+    /// funds through a stale `approve`.
+    ///
+    /// Open to any caller at zero cost: there is no caller parameter and no
+    /// reward, and the call only ever lowers an allowance. Expiry uses the
+    /// effective (lineage-capped) expiry, so a child is sweepable once any
+    /// ancestor has lapsed. A zero allowance is a no-op with no event.
+    ///
+    /// Note: the SAC's `approve` itself calls `owner.require_auth()`, so the
+    /// submitting transaction must carry an owner auth entry for this
+    /// invocation (e.g. a pre-signed sweep handed to a keeper).
+    ///
+    /// # Errors
+    /// - [`PermissionError::PermissionNotFound`] if no delegation exists.
+    /// - [`PermissionError::DelegationNotExpired`] if it is still live.
+    pub fn sweep_expired_allowance(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        token: Address,
+    ) -> Result<(), PermissionError> {
+        let record: PermissionRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Permission(owner.clone(), delegate.clone()))
+            .ok_or(PermissionError::PermissionNotFound)?;
+
+        let current_ledger = env.ledger().sequence();
+        if current_ledger < Self::effective_expiry(&env, &record) {
+            return Err(PermissionError::DelegationNotExpired);
+        }
+
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        let reclaimed_amount = token_client.allowance(&owner, &delegate);
+        if reclaimed_amount == 0 {
+            return Ok(());
+        }
+        token_client.approve(&owner, &delegate, &0, &current_ledger);
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("allow_rcl")),
+            AllowanceReclaimedEvent {
+                owner,
+                delegate,
+                token,
+                reclaimed_amount,
+            },
+        );
+        Ok(())
+    }
+
+
+
+    pub fn get_remaining_allowance(env: Env, owner: Address, delegate: Address) -> Result<i128, PermissionError> {
         let key = DataKey::Permission(owner, delegate);
         env.storage()
             .persistent()

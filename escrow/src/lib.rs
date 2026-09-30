@@ -495,6 +495,60 @@ pub struct CrossCurrencySwapReleasedEvent {
     pub payout_amount: i128,
     /// Address that triggered the release.
     pub released_by: Address,
+/// Maximum number of milestones a single milestone escrow may carry. Keeps
+/// schedule validation and storage bounded.
+pub const MAX_MILESTONES: u32 = 20;
+
+/// One tranche of a staggered-release escrow (e.g. deposit, dispatch, delivery).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Milestone {
+    /// Identifier unique within the escrow's schedule.
+    pub milestone_id: u32,
+    /// Principal disbursed (before platform fee) when this milestone is released.
+    pub amount: i128,
+    /// Short human-readable label, e.g. `deposit` or `dispatch`.
+    pub description: Symbol,
+    /// Whether this milestone has been paid out.
+    pub is_completed: bool,
+    /// Ledger timestamp of the payout, or zero while pending.
+    pub completed_at: u64,
+}
+
+/// Milestone schedule attached to an escrow created via `create_milestone_escrow`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneEscrowConfig {
+    /// Ordered milestone schedule; amounts sum to the escrowed principal.
+    pub milestones: Vec<Milestone>,
+}
+
+/// Emitted on each milestone payout.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MilestoneReleasedEvent {
+    /// Escrow the milestone belongs to.
+    pub escrow_id: u64,
+    /// Milestone that was released.
+    pub milestone_id: u32,
+    /// Principal released for this milestone (before platform fee).
+    pub amount: i128,
+    /// Seller receiving the payout.
+    pub seller: Address,
+    /// Principal still held in escrow after this payout.
+    pub remaining: i128,
+}
+
+/// Emitted when an admin registers (or updates) an approved metadata schema.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SchemaRegisteredEvent {
+    /// Schema identifier, as referenced by `EscrowMetadata.schema`.
+    pub schema: Symbol,
+    /// Hash of the off-chain schema definition document.
+    pub schema_definition_uri: BytesN<32>,
+    /// Admin that registered the schema.
+    pub registered_by: Address,
 }
 
 /// Emitted alongside the release event when a fully-released escrow had a
@@ -1527,6 +1581,10 @@ pub enum DataKey {
     InspectionPeriodConfig(u64),
     /// Emergency rescue proposal for a stranded escrow (issue #365).
     EmergencyRescueProposal(u64),
+    /// Admin-approved metadata schema → hash of its definition document.
+    RegisteredSchema(Symbol),
+    /// Milestone schedule for escrows created via `create_milestone_escrow`.
+    MilestoneConfig(u64),
 }
 
 // `export = false` suppresses the generated `contractspecv0` entry for this
@@ -1684,6 +1742,11 @@ pub enum DataKey {
 // | 414 | EmergencyRescueAlreadyExecuted | next major |
 // | 415 | EscrowNotEligibleForRescue | next major |
 // | 416+ | Reserved for new variants | next major |
+// | 411 | InvalidMilestoneSchedule | next major |
+// | 412 | MilestoneNotFound | next major |
+// | 413 | MilestoneAlreadyReleased | next major |
+// | 414 | MilestoneReleaseRequired | next major |
+// | 415+ | Reserved for new variants | next major |
 //
 // # Allocating new variants
 //
@@ -2190,6 +2253,15 @@ pub enum MultiOracleError {
     InvalidStatus = 1057,
     /// The release triggered by consensus failed.
     ReleaseFailed = 1058,
+    /// Milestone schedule is empty, too long, has duplicate ids, non-positive
+    /// amounts, pre-completed entries, or an overflowing total.
+    InvalidMilestoneSchedule = 411,
+    /// Escrow has no milestone with the requested id (or is not a milestone escrow).
+    MilestoneNotFound = 412,
+    /// Milestone has already been paid out.
+    MilestoneAlreadyReleased = 413,
+    /// Milestone escrows must be paid out through `release_milestone`.
+    MilestoneReleaseRequired = 414,
 }
 
 /// Compact receipt returned to buyers after escrow creation via `get_receipt`.
@@ -5007,6 +5079,7 @@ impl EscrowContract {
             return Err(EscrowError::Unauthorized);
         }
         Self::validate_release_status(&record)?;
+        Self::ensure_not_milestone_escrow(&env, escrow_id)?;
 
         let published_root: Option<BytesN<32>> =
             env.storage().persistent().get(&DataKey::MerkleRoot(date));
@@ -5711,6 +5784,8 @@ impl EscrowContract {
 
         check_not_terminal(&record)?;
 
+        Self::ensure_not_milestone_escrow(&env, escrow_id)?;
+
         if record.status != EscrowStatus::Funded {
             return Err(EscrowError::InvalidStatus);
         }
@@ -6029,6 +6104,205 @@ impl EscrowContract {
             remaining: new_remaining,
             fully_released,
         })
+    }
+
+    /// Create and fund an escrow whose principal is paid out in staggered
+    /// milestones (e.g. 30% deposit, 40% dispatch, 30% delivery).
+    ///
+    /// The escrowed principal is the sum of the milestone amounts, so the
+    /// schedule always equals the funded balance exactly. Milestones must be
+    /// submitted pending (`is_completed == false`, `completed_at == 0`) with
+    /// unique ids and positive amounts. Funds are pulled from the buyer
+    /// immediately, as with `deposit`.
+    ///
+    /// # Errors
+    /// - [`EscrowError::InvalidMilestoneSchedule`] if the schedule is invalid.
+    /// - Any error `deposit` returns (limits, whitelist, pause, ...).
+    // Reason: mirrors the `deposit` ABI signature plus the schedule.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_milestone_escrow(
+        env: Env,
+        buyer: Address,
+        seller: Address,
+        token: Address,
+        order_id: BytesN<32>,
+        timeout_ledgers: u32,
+        milestones: Vec<Milestone>,
+    ) -> Result<u64, EscrowError> {
+        if is_zero_address(&env, &buyer)
+            || is_zero_address(&env, &seller)
+            || is_zero_address(&env, &token)
+        {
+            return Err(EscrowError::InvalidAddress);
+        }
+        if buyer == seller {
+            return Err(EscrowError::InvalidEscrowParticipants);
+        }
+        let total = Self::validate_milestones(&milestones)?;
+
+        buyer.require_auth();
+        let escrow_id = Self::deposit_internal(
+            env.clone(),
+            buyer,
+            seller,
+            token,
+            total,
+            order_id,
+            timeout_ledgers,
+            None,
+            None,
+        )?;
+
+        let key = DataKey::MilestoneConfig(escrow_id);
+        env.storage()
+            .persistent()
+            .set(&key, &MilestoneEscrowConfig { milestones });
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Ok(escrow_id)
+    }
+
+    /// Pay out a single milestone to the seller. Only the buyer may call.
+    ///
+    /// The platform fee is deducted from the milestone amount exactly as in
+    /// `partial_release`. Once every milestone is paid the escrow's remaining
+    /// balance is zero and it transitions to the terminal `Released` state.
+    ///
+    /// # Errors
+    /// - [`EscrowError::NotFound`] if the escrow does not exist.
+    /// - [`EscrowError::MilestoneNotFound`] if the escrow has no such milestone.
+    /// - [`EscrowError::MilestoneAlreadyReleased`] if it was already paid.
+    /// - [`EscrowError::AlreadyReleased`] / [`EscrowError::AlreadyRefunded`] /
+    ///   [`EscrowError::InvalidStatus`] if the escrow is not `Funded`.
+    /// - [`EscrowError::InsufficientEscrowBalance`] if a partial refund has
+    ///   left too little principal to cover the milestone.
+    pub fn release_milestone(
+        env: Env,
+        escrow_id: u64,
+        milestone_id: u32,
+    ) -> Result<PartialReleaseResult, EscrowError> {
+        let key = DataKey::Escrow(escrow_id);
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+        record.buyer.require_auth();
+
+        check_not_terminal(&record)?;
+        Self::validate_release_status(&record)?;
+
+        if record.amount > DUAL_CONTROL_THRESHOLD {
+            return Err(EscrowError::SignedProofRequired);
+        }
+        if env
+            .storage()
+            .persistent()
+            .get(&DataKey::RequireReleaseCondition(escrow_id))
+            .unwrap_or(false)
+            && Self::release_block_reason(env.clone(), &record).is_some()
+        {
+            return Err(EscrowError::ConditionNotMet);
+        }
+
+        let config_key = DataKey::MilestoneConfig(escrow_id);
+        let mut config: MilestoneEscrowConfig = env
+            .storage()
+            .persistent()
+            .get(&config_key)
+            .ok_or(EscrowError::MilestoneNotFound)?;
+        let index = config
+            .milestones
+            .iter()
+            .position(|m| m.milestone_id == milestone_id)
+            .ok_or(EscrowError::MilestoneNotFound)? as u32;
+        let mut milestone = config.milestones.get_unchecked(index);
+        if milestone.is_completed {
+            return Err(EscrowError::MilestoneAlreadyReleased);
+        }
+
+        let seller = record.seller.clone();
+        let caller = record.buyer.clone();
+        let result =
+            Self::execute_release(&env, escrow_id, &key, record, caller, milestone.amount)?;
+
+        milestone.is_completed = true;
+        milestone.completed_at = env.ledger().timestamp();
+        let amount = milestone.amount;
+        config.milestones.set(index, milestone);
+        env.storage().persistent().set(&config_key, &config);
+        env.storage().persistent().extend_ttl(
+            &config_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (
+                symbol_short!("escrow"),
+                symbol_short!("milestone"),
+                escrow_id,
+            ),
+            MilestoneReleasedEvent {
+                escrow_id,
+                milestone_id,
+                amount,
+                seller,
+                remaining: result.remaining,
+            },
+        );
+
+        Ok(result)
+    }
+
+    /// Returns the milestone schedule for a milestone escrow.
+    pub fn get_milestones(env: Env, escrow_id: u64) -> Result<MilestoneEscrowConfig, EscrowError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MilestoneConfig(escrow_id))
+            .ok_or(EscrowError::MilestoneNotFound)
+    }
+
+    /// Validates a milestone schedule and returns its total principal.
+    fn validate_milestones(milestones: &Vec<Milestone>) -> Result<i128, EscrowError> {
+        if milestones.is_empty() || milestones.len() > MAX_MILESTONES {
+            return Err(EscrowError::InvalidMilestoneSchedule);
+        }
+        let mut total: i128 = 0;
+        for (i, m) in milestones.iter().enumerate() {
+            if m.amount <= 0 || m.is_completed || m.completed_at != 0 {
+                return Err(EscrowError::InvalidMilestoneSchedule);
+            }
+            // Bounded by MAX_MILESTONES, so the quadratic scan stays cheap.
+            if milestones
+                .iter()
+                .skip(i + 1)
+                .any(|other| other.milestone_id == m.milestone_id)
+            {
+                return Err(EscrowError::InvalidMilestoneSchedule);
+            }
+            total = total
+                .checked_add(m.amount)
+                .ok_or(EscrowError::InvalidMilestoneSchedule)?;
+        }
+        Ok(total)
+    }
+
+    /// Milestone escrows may only be paid through `release_milestone`;
+    /// arbitrary-amount payouts would desync the schedule.
+    fn ensure_not_milestone_escrow(env: &Env, escrow_id: u64) -> Result<(), EscrowError> {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::MilestoneConfig(escrow_id))
+        {
+            return Err(EscrowError::MilestoneReleaseRequired);
+        }
+        Ok(())
     }
 
     /// Release escrowed funds to the seller. Only the buyer or admin may call.
@@ -6648,6 +6922,7 @@ impl EscrowContract {
             return Err(EscrowError::InvalidSwapConfig);
         }
 
+        Self::ensure_not_milestone_escrow(&env, escrow_id)?;
         let remaining = record.amount - record.released_amount - record.refunded_amount;
         if remaining <= 0 {
             return Err(EscrowError::ZeroAmount);
@@ -8779,6 +9054,57 @@ impl EscrowContract {
         }
     }
 
+    /// Register (or update) an approved metadata schema. Admin or co-admin only.
+    ///
+    /// Gating this on admin auth keeps arbitrary callers from polluting the
+    /// schema catalog with deceptive entries. `schema_definition_uri` is the
+    /// hash of the off-chain schema definition document.
+    ///
+    /// # Errors
+    /// - [`EscrowError::Unauthorized`] if `admin` is not an admin.
+    pub fn register_schema(
+        env: Env,
+        admin: Address,
+        schema: Symbol,
+        schema_definition_uri: BytesN<32>,
+    ) -> Result<(), EscrowError> {
+        Self::require_admin(&env, &admin)?;
+
+        let key = DataKey::RegisteredSchema(schema.clone());
+        env.storage().persistent().set(&key, &schema_definition_uri);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("schemreg")),
+            SchemaRegisteredEvent {
+                schema,
+                schema_definition_uri,
+                registered_by: admin,
+            },
+        );
+        Ok(())
+    }
+
+    /// Returns the definition hash of a registered schema, if any.
+    pub fn get_schema_definition(env: Env, schema: Symbol) -> Option<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RegisteredSchema(schema))
+    }
+
+    /// Requires `admin`'s auth and that it is the primary admin or a co-admin.
+    fn require_admin(env: &Env, admin: &Address) -> Result<(), EscrowError> {
+        admin.require_auth();
+        if !Self::is_admin(env.clone(), admin.clone()) {
+            return Err(EscrowError::Unauthorized);
+        }
+        Ok(())
+    }
+
     /// Configure the Ed25519 public key authorized to sign delivery proofs.
     /// Admin-only; changing this key immediately changes which proofs are valid.
     pub fn set_oracle_public_key(
@@ -9291,6 +9617,7 @@ impl EscrowContract {
         }
 
         check_not_terminal(&record)?;
+        Self::ensure_not_milestone_escrow(&env, escrow_id)?;
 
         if record.status != EscrowStatus::Funded {
             return Err(EscrowError::InvalidStatus);
