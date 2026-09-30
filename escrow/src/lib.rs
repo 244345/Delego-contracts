@@ -820,6 +820,9 @@ pub enum DataKey {
     UpgradeProposal,
     /// M-of-N admin approvals required to execute an upgrade (issue #292).
     UpgradeThreshold,
+    /// Minimum release fee floor, in the token's smallest unit, configurable by
+    /// the admin (issue #362).
+    MinFeeStroops,
 }
 
 #[contracterror]
@@ -896,7 +899,9 @@ pub enum DataKey {
 // | 408 | UpgradeProposalNotFound | next major |
 // | 409 | UpgradeTimelockActive | next major |
 // | 410 | UpgradeHashMismatch | next major |
-// | 411+ | Reserved for new variants | next major |
+// | 411 | MathOverflow | next major |
+// | 412 | InvalidMinFee | next major |
+// | 413+ | Reserved for new variants | next major |
 //
 // # Allocating new variants
 //
@@ -1054,6 +1059,11 @@ pub enum EscrowError {
     BatchLimitExceeded = 409,
     /// Dispute award amounts are negative or do not sum to the escrow balance.
     InvalidDisputeAward = 410,
+    /// A fee calculation overflowed `i128` (issue #362).
+    MathOverflow = 411,
+    /// The requested minimum fee floor is negative or above
+    /// [`MAX_MIN_FEE_STROOPS`] (issue #362).
+    InvalidMinFee = 412,
 }
 
 /// Compact receipt returned to buyers after escrow creation via `get_receipt`.
@@ -1236,6 +1246,85 @@ pub const UPGRADE_TIMELOCK_SECS: u64 = 172_800;
 /// Minimum (and default) number of admin approvals required to upgrade, so a
 /// single compromised key can never replace contract code on its own.
 pub const MIN_UPGRADE_THRESHOLD: u32 = 2;
+
+/// Denominator for every basis-points fee computation in this contract.
+pub const BPS_DENOMINATOR: i128 = 10_000;
+
+/// Default minimum release fee, in the token's smallest unit (stroop), used
+/// when no admin override is configured (issue #362).
+///
+/// One stroop is the smallest fee the contract can charge, and it is the
+/// smallest floor that still makes the fee non-zero: integer division
+/// truncates `amount * fee_bps / 10_000` to `0` for every `amount` below
+/// `10_000 / fee_bps` stroops, so without a floor a seller can fragment a large
+/// payment into dust escrows and pay no platform fee at all. The floor is always
+/// clamped to the amount being charged, so a settlement is never over-charged
+/// either, and it is never applied when the platform charges no fee at all
+/// (`fee_bps == 0`).
+pub const DEFAULT_MIN_FEE_STROOPS: i128 = 1;
+
+/// Upper bound for the admin-configurable minimum fee floor (issue #362).
+///
+/// The floor is clamped to the released amount, so this is purely a guard rail
+/// against a mis-configuration that would swallow most of a small settlement.
+/// `0` is allowed and restores the pure pro-rata behaviour.
+pub const MAX_MIN_FEE_STROOPS: i128 = 1_000_000;
+
+/// Applies the minimum fee floor to an already computed fee (issue #362).
+///
+/// Returns `min_fee_stroops.min(amount)` when the pro-rata fee came out below
+/// the floor, so the fee is never zero and never larger than the amount it is
+/// deducted from. The floor is skipped for non-positive amounts and for a `0`
+/// bps configuration, which is an explicit "the platform charges no fee"
+/// setting rather than a fee that truncation erased.
+fn apply_fee_floor(amount: i128, fee_bps: u32, fee: i128, min_fee_stroops: i128) -> i128 {
+    if fee_bps > 0 && amount > 0 && fee < min_fee_stroops {
+        min_fee_stroops.min(amount)
+    } else {
+        fee
+    }
+}
+
+/// Overflow-free `amount * bps / BPS_DENOMINATOR`.
+///
+/// Splits the amount into whole and fractional basis-point units so the
+/// intermediate products cannot exceed `i128`, which keeps large escrows
+/// feeable instead of overflowing into [`EscrowError::MathOverflow`].
+fn bps_fee(amount: i128, bps: u32) -> i128 {
+    (amount / BPS_DENOMINATOR) * bps as i128
+        + ((amount % BPS_DENOMINATOR) * bps as i128) / BPS_DENOMINATOR
+}
+
+/// Computes the release fee for `amount` at `fee_bps`, floored at
+/// `min_fee_stroops` (issue #362).
+///
+/// Without the floor, `(amount * fee_bps) / 10_000` truncates to zero for every
+/// `amount` below `10_000 / fee_bps` stroops, so an attacker could split a
+/// single payment into arbitrarily many dust escrows and evade the platform fee
+/// entirely. With the floor, every release pays at least `min_fee_stroops`
+/// (clamped to `amount`), which makes fragmentation strictly more expensive than
+/// settling in one go. A `fee_bps` of `0` is charged as `0` regardless of the
+/// floor.
+///
+/// # Errors
+/// Returns [`EscrowError::MathOverflow`] when `amount * fee_bps` does not fit
+/// in an `i128`.
+pub fn calculate_fee_with_minimum(
+    amount: i128,
+    fee_bps: u32,
+    min_fee_stroops: i128,
+) -> Result<i128, EscrowError> {
+    let calculated = amount
+        .checked_mul(fee_bps as i128)
+        .ok_or(EscrowError::MathOverflow)?
+        / BPS_DENOMINATOR;
+    Ok(apply_fee_floor(
+        amount,
+        fee_bps,
+        calculated,
+        min_fee_stroops,
+    ))
+}
 
 fn check_not_terminal(record: &EscrowRecord) -> Result<(), EscrowError> {
     match record.status {
@@ -2021,6 +2110,51 @@ impl EscrowContract {
         Ok(true)
     }
 
+    /// Configure the minimum release fee floor, in the token's smallest unit
+    /// (stroop). Admin-only (issue #362).
+    ///
+    /// Integer division truncates `amount * fee_bps / 10_000` to zero for every
+    /// `amount` below `10_000 / fee_bps` stroops, so without a floor a seller
+    /// can fragment a large payment into dust escrows and pay no platform fee
+    /// at all. The floor is applied to the total fee of every payout path
+    /// (release, partial release, split release and dispute resolution) and is
+    /// always clamped to the released amount, so it can never over-charge a
+    /// settlement. `0` restores the pure pro-rata behaviour. A platform fee of
+    /// `0` bps is never floored: it is an explicit "no platform fee" setting
+    /// rather than a fee that truncation erased.
+    ///
+    /// # Errors
+    /// Returns [`EscrowError::Unauthorized`] when the caller is not an admin,
+    /// and [`EscrowError::InvalidMinFee`] when `min_fee_stroops` is negative or
+    /// above [`MAX_MIN_FEE_STROOPS`].
+    pub fn set_min_fee_stroops(
+        env: Env,
+        admin: Address,
+        min_fee_stroops: i128,
+    ) -> Result<bool, EscrowError> {
+        admin.require_auth();
+        if !Self::is_admin(env.clone(), admin) {
+            return Err(EscrowError::Unauthorized);
+        }
+        if !(0..=MAX_MIN_FEE_STROOPS).contains(&min_fee_stroops) {
+            return Err(EscrowError::InvalidMinFee);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MinFeeStroops, &min_fee_stroops);
+        Ok(true)
+    }
+
+    /// Current minimum release fee floor, in stroops (issue #362).
+    ///
+    /// Returns [`DEFAULT_MIN_FEE_STROOPS`] when no admin override is configured.
+    pub fn get_min_fee_stroops(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinFeeStroops)
+            .unwrap_or(DEFAULT_MIN_FEE_STROOPS)
+    }
+
     /// Get the current fee configuration.
     ///
     /// # Errors
@@ -2425,26 +2559,31 @@ impl EscrowContract {
     /// falling back to the single-treasury `FeeConfig` otherwise. Never
     /// transfers tokens and never panics on a missing config: returns
     /// `FeeConfigNotSet` when no config exists.
+    ///
+    /// The total is floored at the configured minimum fee (issue #362) so that
+    /// integer truncation can never make the fee of a small release zero.
     fn compute_fee_amount(env: &Env, amount: i128) -> Result<i128, EscrowError> {
+        let min_fee = Self::get_min_fee_stroops(env.clone());
         let shares: soroban_sdk::Vec<TreasuryShare> = env
             .storage()
             .instance()
             .get(&DataKey::FeeDistribution)
             .unwrap_or_else(|| soroban_sdk::Vec::new(env));
 
-        if !shares.is_empty() {
+        let (pro_rata_fee, total_bps): (i128, u32) = if !shares.is_empty() {
             let mut total_fee: i128 = 0;
+            let mut total_bps: u32 = 0;
             for share in shares.iter() {
-                let bps = share.bps as i128;
-                total_fee +=
-                    (amount / 10_000i128) * bps + ((amount % 10_000i128) * bps) / 10_000i128;
+                total_fee += bps_fee(amount, share.bps);
+                total_bps += share.bps;
             }
-            Ok(total_fee)
+            (total_fee, total_bps)
         } else {
             let fee_config: FeeConfig = Self::get_fee_config(env.clone())?;
-            let fee_bps = fee_config.fee_bps as i128;
-            Ok((amount / 10_000i128) * fee_bps + ((amount % 10_000i128) * fee_bps) / 10_000i128)
-        }
+            (bps_fee(amount, fee_config.fee_bps), fee_config.fee_bps)
+        };
+
+        Ok(apply_fee_floor(amount, total_bps, pro_rata_fee, min_fee))
     }
 
     /// Computes the net seller payout and platform fee for `amount` (issue #27).
@@ -6180,7 +6319,7 @@ mod error_code_allocation_tests {
         (3_000, 3_999),
         (4_000, 4_999),
     ];
-    fn escrow_error_codes() -> [u32; 45] {
+    fn escrow_error_codes() -> [u32; 47] {
         [
             EscrowError::AlreadyInitialized as u32,
             EscrowError::NotFound as u32,
@@ -6227,6 +6366,8 @@ mod error_code_allocation_tests {
             EscrowError::SignedProofRequired as u32,
             EscrowError::InvalidSignedDeliveryProof as u32,
             EscrowError::OraclePublicKeyNotSet as u32,
+            EscrowError::MathOverflow as u32,
+            EscrowError::InvalidMinFee as u32,
         ]
     }
     #[test]
@@ -6272,5 +6413,356 @@ mod error_code_allocation_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod min_fee_floor_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    const FEE_BPS: u32 = 250;
+
+    struct Fixture<'a> {
+        client: EscrowContractClient<'a>,
+        admin: Address,
+        treasury: Address,
+        buyer: Address,
+        seller: Address,
+        token: Address,
+        token_client: soroban_sdk::token::TokenClient<'a>,
+    }
+
+    /// Deploys the contract with `fee_bps` and funds `buyer` with
+    /// `buyer_funds` of a whitelisted test token.
+    fn setup<'a>(env: &'a Env, fee_bps: u32, buyer_funds: i128) -> Fixture<'a> {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let buyer = Address::generate(env);
+        let seller = Address::generate(env);
+        let token = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        soroban_sdk::token::StellarAssetClient::new(env, &token).mint(&buyer, &buyer_funds);
+        let token_client = soroban_sdk::token::TokenClient::new(env, &token);
+
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps,
+            treasury: treasury.clone(),
+            min_amount: 1i128,
+            max_amount: 1_000_000i128,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(env, &contract_id);
+        client.add_token(&admin, &token);
+
+        Fixture {
+            client,
+            admin,
+            treasury,
+            buyer,
+            seller,
+            token,
+            token_client,
+        }
+    }
+
+    impl Fixture<'_> {
+        fn balance(&self, who: &Address) -> i128 {
+            self.token_client.balance(who)
+        }
+
+        /// Funds a fresh escrow of `amount` and returns its id.
+        fn fund(&self, env: &Env, amount: i128, seed: u8) -> u64 {
+            let order_id = BytesN::from_array(env, &[seed; 32]);
+            self.client.deposit(
+                &self.buyer,
+                &self.seller,
+                &self.token,
+                &amount,
+                &order_id,
+                &1000u32,
+                &None::<BytesN<32>>,
+                &None::<Symbol>,
+            )
+        }
+    }
+
+    #[test]
+    fn micro_amount_pays_the_floor_instead_of_zero() {
+        // 10 * 250 / 10_000 truncates to 0, which is what the attack relied on.
+        assert_eq!(calculate_fee_with_minimum(10, FEE_BPS, 0), Ok(0));
+        assert_eq!(
+            calculate_fee_with_minimum(10, FEE_BPS, DEFAULT_MIN_FEE_STROOPS),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn pro_rata_fee_above_the_floor_is_unchanged() {
+        assert_eq!(
+            calculate_fee_with_minimum(1_000_000, FEE_BPS, DEFAULT_MIN_FEE_STROOPS),
+            Ok(25_000)
+        );
+        assert_eq!(
+            calculate_fee_with_minimum(1_000_000, FEE_BPS, 0),
+            Ok(25_000)
+        );
+    }
+
+    #[test]
+    fn a_zero_fee_configuration_is_never_floored() {
+        // A 0 bps platform fee is an explicit "charge nothing" setting, not a
+        // fee that truncation erased, so the floor must not invent a charge.
+        assert_eq!(
+            calculate_fee_with_minimum(10, 0, DEFAULT_MIN_FEE_STROOPS),
+            Ok(0)
+        );
+        assert_eq!(
+            calculate_fee_with_minimum(10, 0, MAX_MIN_FEE_STROOPS),
+            Ok(0)
+        );
+        assert_eq!(
+            calculate_fee_with_minimum(1_000_000, 0, MAX_MIN_FEE_STROOPS),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn floor_lifts_a_truncated_but_non_zero_fee() {
+        // 100 * 250 / 10_000 == 2, below a 50 stroop floor.
+        assert_eq!(calculate_fee_with_minimum(100, FEE_BPS, 50), Ok(50));
+        assert_eq!(calculate_fee_with_minimum(100, FEE_BPS, 2), Ok(2));
+    }
+
+    #[test]
+    fn floor_is_clamped_to_the_amount() {
+        // A 5 stroop escrow can never be charged more than 5 stroops.
+        assert_eq!(calculate_fee_with_minimum(5, FEE_BPS, 1_000), Ok(5));
+        assert_eq!(calculate_fee_with_minimum(5, FEE_BPS, 5), Ok(5));
+    }
+
+    #[test]
+    fn zero_amount_is_never_floored() {
+        assert_eq!(calculate_fee_with_minimum(0, FEE_BPS, 1_000), Ok(0));
+    }
+
+    #[test]
+    fn fragmenting_a_payment_cannot_reduce_the_fee() {
+        // One 10_000 stroop payment settles for 250.
+        let single = calculate_fee_with_minimum(10_000, FEE_BPS, DEFAULT_MIN_FEE_STROOPS).unwrap();
+        // The same value split into 1_000 dust escrows truncates to zero per
+        // escrow without the floor; with the floor every leg pays 1.
+        let fragmented: i128 = (0..1_000)
+            .map(|_| calculate_fee_with_minimum(10, FEE_BPS, DEFAULT_MIN_FEE_STROOPS).unwrap())
+            .sum();
+        assert_eq!(single, 250);
+        assert_eq!(fragmented, 1_000);
+        assert!(fragmented > single);
+    }
+
+    #[test]
+    fn fee_never_exceeds_the_amount_it_is_deducted_from() {
+        for amount in 1..500i128 {
+            for min_fee in [0i128, 1, 7, 250, 10_000] {
+                let fee = calculate_fee_with_minimum(amount, FEE_BPS, min_fee).unwrap();
+                assert!(fee >= 0, "negative fee for amount {amount}");
+                assert!(fee <= amount, "fee {fee} exceeds amount {amount}");
+            }
+        }
+    }
+
+    #[test]
+    fn overflow_is_reported_instead_of_wrapping() {
+        assert_eq!(
+            calculate_fee_with_minimum(i128::MAX, 1000, DEFAULT_MIN_FEE_STROOPS),
+            Err(EscrowError::MathOverflow)
+        );
+    }
+
+    #[test]
+    fn overflow_free_helper_matches_the_checked_multiplication() {
+        for amount in [1i128, 39, 40, 41, 9_999, 10_000, 12_345_678] {
+            for bps in [0u32, 1, 25, 250, 1000] {
+                assert_eq!(bps_fee(amount, bps), amount * bps as i128 / 10_000);
+            }
+        }
+    }
+
+    #[test]
+    fn default_floor_is_one_stroop() {
+        let env = Env::default();
+        let f = setup(&env, FEE_BPS, 10);
+        assert_eq!(f.client.get_min_fee_stroops(), DEFAULT_MIN_FEE_STROOPS);
+    }
+
+    #[test]
+    fn admin_can_configure_the_floor_including_zero() {
+        let env = Env::default();
+        let f = setup(&env, FEE_BPS, 10);
+
+        assert!(f.client.set_min_fee_stroops(&f.admin, &250));
+        assert_eq!(f.client.get_min_fee_stroops(), 250);
+
+        assert!(f.client.set_min_fee_stroops(&f.admin, &MAX_MIN_FEE_STROOPS));
+        assert_eq!(f.client.get_min_fee_stroops(), MAX_MIN_FEE_STROOPS);
+
+        // Opting out of the floor restores the pre-#362 pro-rata behaviour.
+        assert!(f.client.set_min_fee_stroops(&f.admin, &0));
+        assert_eq!(f.client.get_min_fee_stroops(), 0);
+    }
+
+    #[test]
+    fn floor_config_rejects_non_admin_and_out_of_range_values() {
+        let env = Env::default();
+        let f = setup(&env, FEE_BPS, 10);
+        let stranger = Address::generate(&env);
+
+        assert_eq!(
+            f.client.try_set_min_fee_stroops(&stranger, &100),
+            Err(Ok(EscrowError::Unauthorized))
+        );
+        assert_eq!(
+            f.client.try_set_min_fee_stroops(&f.admin, &-1),
+            Err(Ok(EscrowError::InvalidMinFee))
+        );
+        assert_eq!(
+            f.client
+                .try_set_min_fee_stroops(&f.admin, &(MAX_MIN_FEE_STROOPS + 1)),
+            Err(Ok(EscrowError::InvalidMinFee))
+        );
+        assert_eq!(f.client.get_min_fee_stroops(), DEFAULT_MIN_FEE_STROOPS);
+    }
+
+    #[test]
+    fn micro_release_pays_the_floor_to_the_treasury() {
+        let env = Env::default();
+        let f = setup(&env, FEE_BPS, 10);
+
+        let escrow_id = f.fund(&env, 10, 1);
+        f.client.release(&escrow_id, &f.buyer, &f.seller);
+
+        // Without the floor the treasury would receive 0 and the seller 10.
+        assert_eq!(f.balance(&f.treasury), 1);
+        assert_eq!(f.balance(&f.seller), 9);
+    }
+
+    #[test]
+    fn micro_release_is_fee_free_once_the_floor_is_disabled() {
+        let env = Env::default();
+        let f = setup(&env, FEE_BPS, 10);
+        f.client.set_min_fee_stroops(&f.admin, &0);
+
+        let escrow_id = f.fund(&env, 10, 1);
+        f.client.release(&escrow_id, &f.buyer, &f.seller);
+
+        assert_eq!(f.balance(&f.treasury), 0);
+        assert_eq!(f.balance(&f.seller), 10);
+    }
+
+    #[test]
+    fn configured_floor_overrides_the_pro_rata_fee() {
+        let env = Env::default();
+        let f = setup(&env, FEE_BPS, 100);
+        // 100 * 250 / 10_000 == 2 pro rata, floored to 50.
+        f.client.set_min_fee_stroops(&f.admin, &50);
+
+        let escrow_id = f.fund(&env, 100, 1);
+        f.client.release(&escrow_id, &f.buyer, &f.seller);
+
+        assert_eq!(f.balance(&f.treasury), 50);
+        assert_eq!(f.balance(&f.seller), 50);
+    }
+
+    #[test]
+    fn fragmented_releases_are_feeed_more_than_one_settlement() {
+        let env = Env::default();
+        // 200 for the fragmented sweep + 200 for the single settlement.
+        let f = setup(&env, FEE_BPS, 400);
+
+        // 20 dust escrows of 10 stroops: 1 stroop fee per escrow.
+        for seed in 0..20u8 {
+            let escrow_id = f.fund(&env, 10, seed);
+            f.client.release(&escrow_id, &f.buyer, &f.seller);
+        }
+        let fragmented_fee = f.balance(&f.treasury);
+
+        // The same 200 stroops settled in a single escrow costs 5.
+        let single_id = f.fund(&env, 200, 200);
+        f.client.release(&single_id, &f.buyer, &f.seller);
+        let single_fee = f.balance(&f.treasury) - fragmented_fee;
+
+        assert_eq!(fragmented_fee, 20);
+        assert_eq!(single_fee, 5);
+        assert!(fragmented_fee > single_fee);
+    }
+
+    #[test]
+    fn multi_treasury_distribution_also_pays_the_floor() {
+        let env = Env::default();
+        let f = setup(&env, FEE_BPS, 10);
+        let treasury_a = Address::generate(&env);
+        let treasury_b = Address::generate(&env);
+        let shares = soroban_sdk::vec![
+            &env,
+            TreasuryShare {
+                treasury: treasury_a.clone(),
+                bps: 150,
+            },
+            TreasuryShare {
+                treasury: treasury_b.clone(),
+                bps: 150,
+            },
+        ];
+        f.client.set_fee_distribution(&f.admin, &shares);
+
+        let escrow_id = f.fund(&env, 10, 1);
+        f.client.release(&escrow_id, &f.buyer, &f.seller);
+
+        // The 1 stroop floor is distributed in full, not rounded away.
+        assert_eq!(f.balance(&treasury_a) + f.balance(&treasury_b), 1);
+        assert_eq!(f.balance(&f.seller), 9);
+    }
+
+    #[test]
+    fn dispute_resolution_pays_the_floor_on_the_full_balance() {
+        let env = Env::default();
+        let f = setup(&env, FEE_BPS, 10);
+
+        let escrow_id = f.fund(&env, 10, 1);
+        f.client.dispute(&escrow_id, &f.buyer);
+        f.client.resolve_dispute(&escrow_id, &f.admin, &true);
+
+        assert_eq!(f.balance(&f.treasury), 1);
+        assert_eq!(f.balance(&f.seller), 9);
+    }
+
+    #[test]
+    fn floor_cannot_exceed_the_escrow_balance() {
+        let env = Env::default();
+        let f = setup(&env, FEE_BPS, 5);
+        f.client.set_min_fee_stroops(&f.admin, &1_000);
+
+        let escrow_id = f.fund(&env, 5, 1);
+        f.client.release(&escrow_id, &f.buyer, &f.seller);
+
+        assert_eq!(f.balance(&f.treasury), 5);
+        assert_eq!(f.balance(&f.seller), 0);
+    }
+
+    #[test]
+    fn partial_releases_charge_the_floor_per_leg() {
+        let env = Env::default();
+        let f = setup(&env, FEE_BPS, 30);
+
+        let escrow_id = f.fund(&env, 30, 1);
+        f.client.partial_release(&escrow_id, &f.buyer, &10);
+        f.client.partial_release(&escrow_id, &f.buyer, &20);
+
+        // 10 * 250 / 10_000 == 0 -> floored to 1; 20 * 250 / 10_000 == 0 -> 1.
+        assert_eq!(f.balance(&f.treasury), 2);
+        assert_eq!(f.balance(&f.seller), 28);
     }
 }
