@@ -4395,6 +4395,308 @@ mod schema_and_milestone_tests {
                 [milestone(&env, 1, i128::MAX, "a"), milestone(&env, 2, 1, "b")]
             )),
             invalid
+    // ─── Fee-on-transfer token protection ────────────────────────────────────
+    //
+    // These tests exercise `verify_received_deposit_delta`. A custom token
+    // contract deducts a 10 % fee on every `transfer()`, so the contract's
+    // balance increases by less than the nominal deposit amount.
+    //
+    // Expected behaviour:
+    //  • `deposit` and `fund` record the actual net tokens received, not the
+    //    caller-supplied amount.
+    //  • A transfer where net received < min_amount is rejected with
+    //    `DepositUnderfunded`.
+    //  • Standard (non-fee) tokens are unaffected (regression guard).
+
+    /// A minimal in-process token that charges a flat 10 % fee-on-transfer.
+    ///
+    /// The sender's balance decreases by `amount`; the recipient receives only
+    /// `amount * 9 / 10`. The 10 % remainder is burned (not redistributed).
+    mod fee_token {
+        use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+
+        #[contracttype]
+        pub enum FeeTokenKey {
+            Balance(Address),
+        }
+
+        #[contract]
+        pub struct FeeToken;
+
+        #[contractimpl]
+        impl FeeToken {
+            /// Credit `amount` tokens to `to` (test helper, no auth required).
+            pub fn mint(env: Env, to: Address, amount: i128) {
+                let prev: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&FeeTokenKey::Balance(to.clone()))
+                    .unwrap_or(0);
+                env.storage()
+                    .persistent()
+                    .set(&FeeTokenKey::Balance(to), &(prev + amount));
+            }
+
+            /// Transfer `amount` from `from` to `to` with a 10 % fee-on-transfer.
+            ///
+            /// Sender is debited `amount`; recipient receives `amount * 9 / 10`.
+            pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+                from.require_auth();
+                let from_bal: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&FeeTokenKey::Balance(from.clone()))
+                    .unwrap_or(0);
+                // Deduct full requested amount from sender.
+                env.storage()
+                    .persistent()
+                    .set(&FeeTokenKey::Balance(from), &(from_bal - amount));
+                // Recipient gets only 90 % — 10 % is burned.
+                let net = amount * 9 / 10;
+                let to_bal: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&FeeTokenKey::Balance(to.clone()))
+                    .unwrap_or(0);
+                env.storage()
+                    .persistent()
+                    .set(&FeeTokenKey::Balance(to), &(to_bal + net));
+            }
+
+            /// Return the token balance of `id`.
+            pub fn balance(env: Env, id: Address) -> i128 {
+                env.storage()
+                    .persistent()
+                    .get(&FeeTokenKey::Balance(id))
+                    .unwrap_or(0)
+            }
+        }
+    }
+
+    /// `deposit` with a fee-on-transfer token: `escrow.amount` must reflect
+    /// the actual tokens held by the contract, not the nominal requested amount.
+    #[test]
+    fn test_deposit_fee_on_transfer_records_net_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+
+        // Deploy fee-on-transfer token and mint to buyer.
+        let fee_token_id = env.register(fee_token::FeeToken, ());
+        let fee_token_client = fee_token::FeeTokenClient::new(&env, &fee_token_id);
+        fee_token_client.mint(&buyer, &10_000i128);
+
+        // Deploy escrow and whitelist the fee token.
+        let escrow_contract_id = env.register(
+            EscrowContract,
+            (EscrowConfig {
+                admin: admin.clone(),
+                fee_bps: 0u32,
+                treasury,
+                min_amount: 100i128,
+                max_amount: 10_000i128,
+            },),
+        );
+        let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
+        escrow_client.add_token(&admin, &fee_token_id);
+
+        let order_id = BytesN::from_array(&env, &[11u8; 32]);
+        let requested = 1_000i128;
+        // 10 % fee ⟹ contract receives only 900.
+        let expected_net = 900i128;
+
+        let escrow_id = escrow_client.deposit(
+            &buyer,
+            &seller,
+            &fee_token_id,
+            &requested,
+            &order_id,
+            &100u32,
+            &None,
+            &None,
+        );
+
+        let record = escrow_client.get_escrow(&escrow_id);
+        assert_eq!(
+            record.amount, expected_net,
+            "escrow.amount must equal net tokens received, not the nominal deposit amount"
+        );
+        // Contract's real token balance must match the stored ledger amount.
+        assert_eq!(
+            fee_token_client.balance(&escrow_contract_id),
+            expected_net,
+            "contract token balance must equal the recorded escrow amount"
+        );
+    }
+
+    /// `fund` with a fee-on-transfer token also overwrites `escrow.amount`
+    /// with the net tokens actually received after the transfer.
+    #[test]
+    fn test_fund_fee_on_transfer_records_net_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+
+        let fee_token_id = env.register(fee_token::FeeToken, ());
+        let fee_token_client = fee_token::FeeTokenClient::new(&env, &fee_token_id);
+        fee_token_client.mint(&buyer, &10_000i128);
+
+        let escrow_contract_id = env.register(
+            EscrowContract,
+            (EscrowConfig {
+                admin: admin.clone(),
+                fee_bps: 0u32,
+                treasury,
+                min_amount: 100i128,
+                max_amount: 10_000i128,
+            },),
+        );
+        let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
+        escrow_client.add_token(&admin, &fee_token_id);
+
+        let order_id = BytesN::from_array(&env, &[12u8; 32]);
+        let requested = 1_000i128;
+        let expected_net = 900i128;
+
+        // `create` stores the requested amount; `fund` must overwrite it with
+        // the net amount actually received by the contract.
+        let escrow_id = escrow_client.create(
+            &buyer,
+            &seller,
+            &fee_token_id,
+            &requested,
+            &order_id,
+            &100u32,
+            &None,
+            &None,
+        );
+
+        // Before funding, the record holds the requested (nominal) amount.
+        assert_eq!(escrow_client.get_escrow(&escrow_id).amount, requested);
+
+        escrow_client.fund(&escrow_id, &buyer);
+
+        let record = escrow_client.get_escrow(&escrow_id);
+        assert_eq!(
+            record.amount, expected_net,
+            "after fund() escrow.amount must reflect actual tokens held"
+        );
+        assert_eq!(fee_token_client.balance(&escrow_contract_id), expected_net);
+    }
+
+    /// When net received < min_amount, `deposit` must abort with
+    /// `DepositUnderfunded` so the escrow is never created in an insolvent
+    /// state. Here we deposit exactly min_amount (100) through the 10 %-fee
+    /// token — net received is 90, which is below the 100 threshold.
+    #[test]
+    fn test_deposit_fee_on_transfer_underfunded_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+
+        let fee_token_id = env.register(fee_token::FeeToken, ());
+        let fee_token_client = fee_token::FeeTokenClient::new(&env, &fee_token_id);
+        fee_token_client.mint(&buyer, &10_000i128);
+
+        let escrow_contract_id = env.register(
+            EscrowContract,
+            (EscrowConfig {
+                admin: admin.clone(),
+                fee_bps: 0u32,
+                treasury,
+                min_amount: 100i128,
+                max_amount: 10_000i128,
+            },),
+        );
+        let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
+        escrow_client.add_token(&admin, &fee_token_id);
+
+        let order_id = BytesN::from_array(&env, &[13u8; 32]);
+        // Deposit exactly min_amount (100). After 10 % fee, net = 90 < 100
+        // ⟹ verify_received_deposit_delta must reject this.
+        let result = escrow_client.try_deposit(
+            &buyer,
+            &seller,
+            &fee_token_id,
+            &100i128,
+            &order_id,
+            &100u32,
+            &None,
+            &None,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(EscrowError::DepositUnderfunded)),
+            "deposit where net received < expected_amount must fail with DepositUnderfunded"
+        );
+        // No escrow should have been persisted.
+        assert_eq!(
+            escrow_client.try_get_escrow(&1u64),
+            Err(Ok(EscrowError::NotFound))
+        );
+    }
+
+    /// Standard (non-fee) tokens are unaffected: the exact nominal amount is
+    /// recorded and the existing happy-path behaviour is not regressed.
+    #[test]
+    fn test_deposit_standard_token_records_exact_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&buyer, &10_000i128);
+
+        let escrow_contract_id = env.register(
+            EscrowContract,
+            (EscrowConfig {
+                admin: admin.clone(),
+                fee_bps: 0u32,
+                treasury,
+                min_amount: 100i128,
+                max_amount: 10_000i128,
+            },),
+        );
+        let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
+        escrow_client.add_token(&admin, &token_id);
+
+        let order_id = BytesN::from_array(&env, &[14u8; 32]);
+        let amount = 1_000i128;
+
+        let escrow_id = escrow_client.deposit(
+            &buyer,
+            &seller,
+            &token_id,
+            &amount,
+            &order_id,
+            &100u32,
+            &None,
+            &None,
+        );
+
+        let record = escrow_client.get_escrow(&escrow_id);
+        assert_eq!(
+            record.amount, amount,
+            "standard token: exact nominal amount must be recorded"
         );
     }
 }
