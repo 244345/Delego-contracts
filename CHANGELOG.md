@@ -40,6 +40,9 @@ will reject the change.
 - Add buyer-committed slippage bounds for cross-currency DEX path payments, with
   tighten-only windows, route validation, and settlement that reverts on realized
   amounts outside the committed window.
+- Add secondary-approver expiration for dual-control escrows: an admin-armed
+  deadline whose fallback disputes or refunds the order when the finance
+  approver does not sign in time.
 
 ### 0.2.0 - 2026-08-29
 
