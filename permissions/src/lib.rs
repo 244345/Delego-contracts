@@ -577,6 +577,21 @@ pub struct NonceCancelledEvent {
     pub next_nonce: u64,
 }
 
+/// Emitted when an owner bulk-invalidates a range of relayer nonces for a
+/// `(owner, delegate)` pair due to a suspected key compromise (issue #335).
+#[contracttype]
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct NonceBatchInvalidatedEvent {
+    pub owner: Address,
+    pub delegate: Address,
+    /// Highest nonce that was invalidated by this call (`up_to_nonce`).
+    pub up_to_nonce: u64,
+    /// New expected nonce — the first nonce a relayed spend must use after
+    /// the invalidation (`up_to_nonce + 1`).
+    pub next_nonce: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug)]
 /// Emitted when a permission's merchant whitelist changes.
@@ -2909,6 +2924,80 @@ impl PermissionsContract {
             &delegate,
             owner.clone(),
             symbol_short!("nonce_cxl"),
+        );
+
+        Ok(())
+    }
+
+    /// Bulk-invalidate all relayer nonces up to and including `up_to_nonce`
+    /// for an `(owner, delegate)` pair whose agent private key is suspected
+    /// of being compromised (issue #335).
+    ///
+    /// Must be authorized by the owner. The stored expected nonce is advanced
+    /// to `up_to_nonce + 1`, so every signed message carrying any nonce
+    /// ≤ `up_to_nonce` is permanently rejected with
+    /// [`PermissionError::InvalidNonce`]. The delegation itself is untouched —
+    /// the owner can continue granting fresh relayer nonces for new spends.
+    ///
+    /// This is the batch companion to [`Self::cancel_nonce`]: `cancel_nonce`
+    /// targets a single stalled nonce, while `invalidate_nonce_range` is
+    /// designed for the key-compromise recovery path where potentially many
+    /// signed messages need to be voided in one call.
+    ///
+    /// # Errors
+    /// - [`PermissionError::PermissionNotFound`] if no permission exists for
+    ///   `(owner, delegate)`.
+    /// - [`PermissionError::NonceAlreadyUsed`] if `up_to_nonce` is already
+    ///   below the current expected nonce (all those nonces are already
+    ///   consumed/cancelled), or if advancing past `up_to_nonce` would
+    ///   overflow the nonce counter.
+    pub fn invalidate_nonce_range(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        up_to_nonce: u64,
+    ) -> Result<(), PermissionError> {
+        owner.require_auth();
+
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Permission(owner.clone(), delegate.clone()))
+        {
+            return Err(PermissionError::PermissionNotFound);
+        }
+
+        let nonce_key = DataKey::RelayerNonce(owner.clone(), delegate.clone());
+        let current_nonce: u64 = env.storage().persistent().get(&nonce_key).unwrap_or(0);
+
+        // Reject if up_to_nonce is already below what's expected — all nonces
+        // in that range have already been consumed or cancelled.
+        if up_to_nonce < current_nonce {
+            return Err(PermissionError::NonceAlreadyUsed);
+        }
+
+        let next_nonce = up_to_nonce
+            .checked_add(1)
+            .ok_or(PermissionError::NonceAlreadyUsed)?;
+
+        env.storage().persistent().set(&nonce_key, &next_nonce);
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("nonce_inv")),
+            NonceBatchInvalidatedEvent {
+                owner: owner.clone(),
+                delegate: delegate.clone(),
+                up_to_nonce,
+                next_nonce,
+            },
+        );
+
+        Self::append_audit_log(
+            &env,
+            &owner,
+            &delegate,
+            owner.clone(),
+            symbol_short!("nonce_inv"),
         );
 
         Ok(())

@@ -85,6 +85,7 @@ will reject the change.
 
 ### Unreleased
 
+- Add `invalidate_nonce_range` entrypoint to bulk-invalidate all relayer nonces up to and including a given nonce for a compromised agent key recovery flow (issue #335). Owner-authorized; emits `NonceBatchInvalidatedEvent` and writes an audit log entry.
 - Added function-restricted permission grants (issue #369). A new
   `ScopedPermissionConfig { target_contract, allowed_function_symbols }` limits
   a delegation to one contract and an explicit list of entrypoints, so an owner
