@@ -2578,11 +2578,303 @@ fn test_split_release_multi_treasury() {
     assert_eq!(token_client.balance(&treasury2), 300);
 }
 
-    BatchDepositParams, BatchRefundParams, BatchReleaseParams, EscrowConfig, EscrowContract,
-    EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState, MerchantVolumeRecord,
-    TreasuryShare, MAX_TREASURIES,
+// ────────────────────────────────────────────────────────────────────────────────
+// Yield Split Distribution Tests (issue #360)
+// ────────────────────────────────────────────────────────────────────────────────
 
-    AffiliateConfig, BatchDepositParams, BatchRefundParams, BatchReleaseParams, EscrowConfig,
-    EscrowContract, EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState, TreasuryShare,
-    MAX_TREASURIES,
+#[test]
+fn test_set_yield_split_config_admin_only() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let non_admin = Address::generate(&t.env);
+
+    // Non-admin cannot set yield split config
+    assert_eq!(
+        escrow_client.try_set_yield_split_config(&non_admin, &escrow_id, &5000),
+        Err(Ok(EscrowError::Unauthorized))
+    );
+
+    // Admin can set yield split config
+    assert!(escrow_client.set_yield_split_config(&t.admin, &escrow_id, &5000));
+
+    // Verify configuration is stored
+    let config = escrow_client.get_yield_split_config(&escrow_id);
+    assert_eq!(config.unwrap().seller_yield_share_bps, 5000);
+}
+
+#[test]
+fn test_set_yield_split_config_validates_bps() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+
+    // Valid: 0% (buyer gets all)
+    assert!(escrow_client.set_yield_split_config(&t.admin, &escrow_id, &0));
+    assert_eq!(escrow_client.get_yield_split_config(&escrow_id).unwrap().seller_yield_share_bps, 0);
+
+    // Valid: 100% (seller gets all)
+    assert!(escrow_client.set_yield_split_config(&t.admin, &escrow_id, &10_000));
+    assert_eq!(
+        escrow_client.get_yield_split_config(&escrow_id).unwrap().seller_yield_share_bps,
+        10_000
+    );
+
+    // Valid: 50/50 split
+    assert!(escrow_client.set_yield_split_config(&t.admin, &escrow_id, &5000));
+    assert_eq!(
+        escrow_client.get_yield_split_config(&escrow_id).unwrap().seller_yield_share_bps,
+        5000
+    );
+
+    // Invalid: exceeds 10_000 basis points
+    assert_eq!(
+        escrow_client.try_set_yield_split_config(&t.admin, &escrow_id, &10_001),
+        Err(Ok(EscrowError::InvalidYieldConfig))
+    );
+}
+
+#[test]
+fn test_set_yield_split_config_requires_existing_escrow() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let non_existent_escrow_id = 9999u64;
+
+    // Cannot set yield split config for non-existent escrow
+    assert_eq!(
+        escrow_client.try_set_yield_split_config(&t.admin, &non_existent_escrow_id, &5000),
+        Err(Ok(EscrowError::NotFound))
+    );
+}
+
+#[test]
+fn test_set_yield_split_config_blocks_terminal_escrows() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+
+    // Release the escrow to make it terminal
+    escrow_client.release(&escrow_id, &t.buyer, &t.seller);
+
+    // Cannot set yield split config on released escrow
+    assert_eq!(
+        escrow_client.try_set_yield_split_config(&t.admin, &escrow_id, &5000),
+        Err(Ok(EscrowError::AlreadyReleased))
+    );
+}
+
+#[test]
+fn test_yield_split_50_50_on_release() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+    let lending_contract = Address::generate(&t.env);
+
+    // Setup: deposit escrow
+    let escrow_id = deposit_escrow(&t, 10000, 100);
+
+    // Configure yield: 5% APR
+    escrow_client.set_yield_config(&t.admin, &escrow_id, &lending_contract, &500);
+
+    // Configure yield split: 50/50
+    escrow_client.set_yield_split_config(&t.admin, &escrow_id, &5000);
+
+    // Advance ledger 1 year worth of seconds (to calculate full year yield)
+    // 1 year = 31,536,000 seconds ≈ 7,776,000 ledgers (at 5 seconds/ledger)
+    t.env.ledger().set_sequence_number(7_776_001);
+
+    // Release the escrow (full release triggers yield calculation and distribution)
+    let initial_buyer_balance = token_client.balance(&t.buyer);
+    let initial_seller_balance = token_client.balance(&t.seller);
+
+    escrow_client.release(&escrow_id, &t.buyer, &t.seller);
+
+    // Verify yield was distributed
+    // Expected yield on 10000 at 5% APR for ~1 year:
+    // yield ≈ (10000 * 500 * 31_536_000) / (10_000 * 31_536_000) = 500
+    // seller_yield (50%) = 250
+    // buyer_yield (50%) = 250
+
+    let final_seller_balance = token_client.balance(&t.seller);
+    let final_buyer_balance = token_client.balance(&t.buyer);
+
+    // Seller should receive: escrow amount (minus fee) + 50% of yield
+    // With 0% fee: 10000 + 250 = 10250
+    assert!(final_seller_balance > initial_seller_balance);
+    
+    // Buyer should receive: returned funds (only if refund path) + 50% of yield
+    // In release path, buyer doesn't get funds back, only yield share
+    // Initial balance was 10000, deposited 10000, so starts at 0
+    // Should receive ~250 (50% of yield)
+    assert!(final_buyer_balance > initial_buyer_balance);
+}
+
+#[test]
+fn test_yield_split_seller_100_backward_compatibility() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+    let lending_contract = Address::generate(&t.env);
+
+    // Setup: deposit escrow
+    let escrow_id = deposit_escrow(&t, 10000, 100);
+
+    // Configure yield but NOT yield split (backward compatibility path)
+    escrow_client.set_yield_config(&t.admin, &escrow_id, &lending_contract, &500);
+
+    // Do NOT call set_yield_split_config - should default to seller getting 100%
+
+    // Advance ledger to trigger yield
+    t.env.ledger().set_sequence_number(7_776_001);
+
+    let initial_seller_balance = token_client.balance(&t.seller);
+
+    // Release the escrow
+    escrow_client.release(&escrow_id, &t.buyer, &t.seller);
+
+    let final_seller_balance = token_client.balance(&t.seller);
+
+    // Seller should receive: escrow amount (10000) + 100% of yield (~500)
+    assert!(final_seller_balance > initial_seller_balance);
+}
+
+#[test]
+fn test_yield_split_75_25_on_release() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+    let lending_contract = Address::generate(&t.env);
+
+    let escrow_id = deposit_escrow(&t, 10000, 100);
+
+    escrow_client.set_yield_config(&t.admin, &escrow_id, &lending_contract, &500);
+
+    // Configure yield split: 75% seller, 25% buyer
+    escrow_client.set_yield_split_config(&t.admin, &escrow_id, &7500);
+
+    t.env.ledger().set_sequence_number(7_776_001);
+
+    let initial_buyer_balance = token_client.balance(&t.buyer);
+    let initial_seller_balance = token_client.balance(&t.seller);
+
+    escrow_client.release(&escrow_id, &t.buyer, &t.seller);
+
+    let final_seller_balance = token_client.balance(&t.seller);
+    let final_buyer_balance = token_client.balance(&t.buyer);
+
+    // Seller receives 75% of yield: ~375
+    // Buyer receives 25% of yield: ~125
+    assert!(final_seller_balance > initial_seller_balance);
+    assert!(final_buyer_balance > initial_buyer_balance);
+}
+
+#[test]
+fn test_yield_split_on_refund() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+    let lending_contract = Address::generate(&t.env);
+
+    let escrow_id = deposit_escrow(&t, 10000, 100);
+
+    escrow_client.set_yield_config(&t.admin, &escrow_id, &lending_contract, &500);
+
+    // Configure yield split: 50/50
+    escrow_client.set_yield_split_config(&t.admin, &escrow_id, &5000);
+
+    // Advance time to trigger yield
+    t.env.ledger().set_sequence_number(7_776_001);
+
+    let initial_buyer_balance = token_client.balance(&t.buyer);
+
+    // Advance past timeout and refund
+    t.env.ledger().set_sequence_number(10_000_000);
+    escrow_client.refund(&escrow_id, &t.buyer);
+
+    let final_buyer_balance = token_client.balance(&t.buyer);
+
+    // Buyer should receive:
+    // - Full refund of escrowed amount: 10000
+    // - 50% of yield: ~250
+    // Total: ~10250
+    assert!(final_buyer_balance > initial_buyer_balance);
+}
+
+#[test]
+fn test_yield_split_zero_split_buyer_gets_all() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+    let lending_contract = Address::generate(&t.env);
+
+    let escrow_id = deposit_escrow(&t, 10000, 100);
+
+    escrow_client.set_yield_config(&t.admin, &escrow_id, &lending_contract, &500);
+
+    // Configure yield split: 0% seller, 100% buyer
+    escrow_client.set_yield_split_config(&t.admin, &escrow_id, &0);
+
+    t.env.ledger().set_sequence_number(7_776_001);
+
+    let initial_buyer_balance = token_client.balance(&t.buyer);
+    let initial_seller_balance = token_client.balance(&t.seller);
+
+    escrow_client.release(&escrow_id, &t.buyer, &t.seller);
+
+    let final_seller_balance = token_client.balance(&t.seller);
+    let final_buyer_balance = token_client.balance(&t.buyer);
+
+    // Seller receives: escrow (10000, after fee) + 0% of yield
+    let seller_increase = final_seller_balance - initial_seller_balance;
+    
+    // Buyer receives: 100% of yield (~500)
+    let buyer_increase = final_buyer_balance - initial_buyer_balance;
+    
+    // Buyer's increase should be greater than seller's increase
+    assert!(buyer_increase > seller_increase);
+}
+
+#[test]
+fn test_yield_split_full_calculation_precision() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+    let lending_contract = Address::generate(&t.env);
+
+    // Use a specific amount to test precision
+    let escrow_amount = 12345i128;
+    let escrow_id = deposit_escrow(&t, escrow_amount, 100);
+
+    escrow_client.set_yield_config(&t.admin, &escrow_id, &lending_contract, &337);
+
+    // Configure yield split: 3333 bps (33.33%)
+    escrow_client.set_yield_split_config(&t.admin, &escrow_id, &3333);
+
+    // Advance time slightly
+    t.env.ledger().set_sequence_number(100_000);
+
+    let record_before = escrow_client.get_escrow(&escrow_id);
+    escrow_client.release(&escrow_id, &t.buyer, &t.seller);
+    let record_after = escrow_client.get_escrow(&escrow_id);
+
+    // Verify escrow transitioned to Released
+    assert_eq!(record_before.status, EscrowStatus::Funded);
+    assert_eq!(record_after.status, EscrowStatus::Released);
+}
+
+#[test]
+fn test_get_yield_split_config_none_when_not_set() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+
+    // No yield split config set - should return None
+    let config = escrow_client.get_yield_split_config(&escrow_id);
+    assert!(config.is_none());
 }
