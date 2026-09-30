@@ -1,4 +1,4 @@
-use delego_reputation::calculate_decayed_score;
+use delego_reputation::{calculate_decayed_score, compute_fixed_point_decay};
 
 #[test]
 fn score_halves_at_each_half_life_and_converges_to_zero() {
@@ -18,4 +18,37 @@ fn score_halves_at_each_half_life_and_converges_to_zero() {
 #[test]
 fn zero_half_life_preserves_the_historical_score() {
     assert_eq!(calculate_decayed_score(u32::MAX, 100, 0), u32::MAX);
+}
+
+#[test]
+fn fixed_point_decay_halves_at_half_life() {
+    assert_eq!(compute_fixed_point_decay(10_000, 0), 10_000);
+    assert_eq!(compute_fixed_point_decay(10_000, 518_400), 5_000);
+    assert_eq!(compute_fixed_point_decay(10_000, 1_036_800), 2_500);
+}
+
+#[test]
+fn fixed_point_decay_is_monotonic_and_converges() {
+    let mut previous = 10_000;
+    for elapsed in 1..=31_536_000u32 {
+        let score = compute_fixed_point_decay(10_000, elapsed);
+        assert!(score <= previous, "score increased at ledger {elapsed}");
+        previous = score;
+    }
+    assert_eq!(previous, 0);
+}
+
+#[test]
+fn fixed_point_decay_accuracy_within_tolerance() {
+    // Reference: score * 2^(-elapsed / half_life) computed in f64.
+    for days in 0..=365u32 {
+        let elapsed = days.saturating_mul(17_280);
+        let expected = 10_000.0 * 2f64.powf(-(elapsed as f64) / 518_400.0);
+        let actual = compute_fixed_point_decay(10_000, elapsed) as f64;
+        let tolerance = (expected * 0.001).max(1.0);
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "day {days}: expected {expected}, got {actual}"
+        );
+    }
 }
