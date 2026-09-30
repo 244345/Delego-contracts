@@ -924,6 +924,89 @@ fn test_history_grows_across_transitions() {
     );
 }
 
+#[test]
+fn test_snapshot_key_does_not_overwrite_delegation_when_id_matches_version() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Snapshot_Key_Collision");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    assert_eq!(id, 1);
+
+    env.as_contract(&client.address, || {
+        let record: DelegationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(id))
+            .unwrap();
+        let snapshot: DelegationSnapshot = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Snapshot(id, 1))
+            .unwrap();
+        assert_eq!(record.status, DelegationStatus::Active);
+        assert_eq!(snapshot.record.status, DelegationStatus::Active);
+    });
+
+    client.pause_delegation(&id);
+    let record = client.get_delegation(&id);
+    assert_eq!(record.status, DelegationStatus::Paused);
+
+    env.as_contract(&client.address, || {
+        let original: DelegationSnapshot = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Snapshot(id, 1))
+            .unwrap();
+        let paused: DelegationSnapshot = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Snapshot(id, 2))
+            .unwrap();
+        assert_eq!(original.record.status, DelegationStatus::Active);
+        assert_eq!(paused.record.status, DelegationStatus::Paused);
+    });
+}
+
+#[test]
+fn test_snapshot_key_migration_preserves_legacy_history() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Legacy_Snapshot_Migration");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    env.as_contract(&client.address, || {
+        env.storage().persistent().remove(&DataKey::Snapshot(id, 1));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::SnapshotSchemaVersion(id));
+    });
+
+    client.pause_delegation(&id);
+
+    env.as_contract(&client.address, || {
+        let migrated: DelegationSnapshot = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Snapshot(id, 1))
+            .unwrap();
+        let current: DelegationSnapshot = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Snapshot(id, 2))
+            .unwrap();
+        let schema_version: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SnapshotSchemaVersion(id))
+            .unwrap();
+        assert_eq!(schema_version, 1);
+        assert_eq!(migrated.record.status, DelegationStatus::Active);
+        assert_eq!(current.record.status, DelegationStatus::Paused);
+    });
+}
+
 /// Delegation IDs must be strictly increasing even when created by
 /// different owners.
 #[test]
