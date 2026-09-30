@@ -415,6 +415,7 @@ name = "delego-cross-contract-tests"
 version = "0.0.1"
 dependencies = [
  "delego-escrow",
+ "delego-interfaces",
  "delego-permissions",
  "delego-reputation",
  "ed25519-dalek",
@@ -432,7 +433,15 @@ dependencies = [
 name = "delego-escrow"
 version = "0.0.1"
 dependencies = [
+ "delego-interfaces",
  "ed25519-dalek",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "delego-interfaces"
+version = "0.0.1"
+dependencies = [
  "soroban-sdk",
 ]
 

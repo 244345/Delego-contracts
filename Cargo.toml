@@ -2,6 +2,7 @@
 members = [
     "delegation_registry",
     "escrow",
+    "interfaces",
     "permissions",
     "reputation",
     "marketplace",

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 const CONTRACT_CRATES: &[&str] = &[
     "delegation_registry",
     "escrow",
+    "interfaces",
     "permissions",
     "reputation",
     "marketplace",

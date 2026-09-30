@@ -23,6 +23,10 @@ will reject the change.
 - Add immutable daily delivery Merkle roots and order-bound inclusion-proof escrow release.
 - Add atomic batch escrow creation with per-token aggregate allowance transfers.
 - Add admin split dispute settlements with buyer, seller, and mediator payouts.
+- Delegate accrued-yield reads to the escrow's configured external lending pool
+  via the shared `LendingPoolInterface` (`delego-interfaces`), falling back to
+  the internal APR estimate when the pool is unreachable, paused, or reports a
+  non-positive figure (issue #326).
 
 ### 0.2.0 - 2026-08-29
 
@@ -84,3 +88,13 @@ will reject the change.
 - Initial tracked release for this contract. No on-chain `version()` entry point,
   so the crate version (`0.0.1`) is tracked here: delegation records with expiry
   and versioned rollback/upgrade support.
+
+## interfaces (delego-interfaces)
+
+### Unreleased
+
+- Initial tracked release for this library (issue #326). Defines the
+  shared `LendingPoolInterface` trait and its generated `LendingPoolClient`
+  cross-contract adapter, plus the `MockLendingPool` test double (with
+  `testutils` feature) for locally simulating external yield accrual. Escrow
+  delegates `get_accrued_yield` reads to this interface.
